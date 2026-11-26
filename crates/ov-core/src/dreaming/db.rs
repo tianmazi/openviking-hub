@@ -155,6 +155,19 @@ impl DesktopDb {
                 PRIMARY KEY (profile_key, uri)
             );
 
+            CREATE TABLE IF NOT EXISTS recall_hits (
+                event_id TEXT NOT NULL,
+                memory_uri TEXT NOT NULL,
+                score REAL NOT NULL,
+                injected INTEGER NOT NULL,
+                PRIMARY KEY (event_id, memory_uri)
+            );
+            CREATE TABLE IF NOT EXISTS capture_tasks (
+                profile_key TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'accepted',
+                PRIMARY KEY(profile_key,task_id)
+            );
             CREATE TABLE IF NOT EXISTS capture_sessions (
                 profile_key TEXT NOT NULL,
                 session_key TEXT NOT NULL,
@@ -239,6 +252,16 @@ impl DesktopDb {
         Ok(())
     }
 
+    pub fn record_recall_hits(&self, event_id: &str, hits: &[(String, f64, bool)]) -> Result<(), String> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        for (uri, score, injected) in hits {
+            tx.execute("INSERT OR IGNORE INTO recall_hits(event_id,memory_uri,score,injected) VALUES (?1,?2,?3,?4)",
+                params![event_id,uri,score,*injected]).map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
     pub fn list_events_for_profile(
         &self,
         profile_key: &str,
@@ -261,7 +284,7 @@ impl DesktopDb {
         conn.query_row(
             "SELECT COUNT(*) FROM recall_events
              WHERE profile_key = ?1 AND created_at > ?2 AND blocked_by_privacy = 0
-                   AND event_type IN ('hook_stop', 'capture', 'capture_queued')",
+                   AND event_type IN ('hook_stop', 'capture')",
             params![profile_key, since],
             |row| row.get(0),
         ).map_err(|e| e.to_string())
@@ -271,10 +294,16 @@ impl DesktopDb {
         let conn = self.lock_conn()?;
         let mut stmt = conn
             .prepare(
-                "SELECT target_uri, COUNT(*), MAX(created_at), GROUP_CONCAT(DISTINCT agent_id)
-                 FROM recall_events WHERE profile_key = ?1 AND target_uri IS NOT NULL
-                 AND event_type = 'recall' AND blocked_by_privacy = 0
-                 GROUP BY target_uri",
+                "SELECT uri, COUNT(*), MAX(created_at), GROUP_CONCAT(DISTINCT agent_id)
+                 FROM (
+                    SELECT h.memory_uri AS uri, e.created_at, e.agent_id
+                    FROM recall_hits h JOIN recall_events e ON h.event_id=e.id
+                    WHERE e.profile_key=?1 AND e.event_type='recall' AND e.blocked_by_privacy=0 AND h.injected=1
+                    UNION ALL
+                    SELECT target_uri AS uri, created_at, agent_id FROM recall_events e
+                    WHERE profile_key=?1 AND target_uri IS NOT NULL AND event_type='recall' AND blocked_by_privacy=0
+                    AND NOT EXISTS (SELECT 1 FROM recall_hits h WHERE h.event_id=e.id)
+                 ) GROUP BY uri",
             )
             .map_err(|e| e.to_string())?;
         let mut map = HashMap::new();

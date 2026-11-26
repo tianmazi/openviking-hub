@@ -1,4 +1,4 @@
-use crate::mcp::{extract_top_hit, truncate_to_token_budget};
+use crate::mcp::{extract_top_hit, render_recall};
 use chrono::Utc;
 use ov_core::dreaming::db::{DesktopDb, RecallEvent};
 use ov_core::ov_client::{FindRequest, OvClient};
@@ -36,7 +36,7 @@ async fn local_hook(event: &str, agent: AgentId, payload: &Value) -> anyhow::Res
     if policy.global.capture_enabled && matches!(event, "stop" | "pre-compact" | "session-end" | "session-start") {
         // Short-lived independent worker; the desktop window need not be open.
         if let Ok(exe) = std::env::current_exe() {
-            let mut command = std::process::Command::new(exe);
+            let mut command = ov_core::platform::silent_command(&exe.to_string_lossy());
             command.args(["sync", "--profile", &client.profile_key()])
                 .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
@@ -194,16 +194,16 @@ pub(crate) async fn execute_hook(
             let Some((top_uri, _)) = extract_top_hit(&res) else {
                 return String::new();
             };
-            let text = truncate_to_token_budget(
-                &serde_json::to_string_pretty(&res).unwrap_or_default(),
-                budget.max_recall_tokens,
-            );
+            let (text, layer, hits) = render_recall(client, &res, &budget).await;
+            if let Some(db) = db {
+                let _ = db.record_recall_hits(&evt.id, &hits);
+            }
             if let (Some(db), Some(key)) = (db, &recall_key) {
                 let _ = db.set_kv(key, &digest);
             }
             evt.target_uri = Some(top_uri);
             evt.query = Some(prompt.chars().take(120).collect());
-            evt.layer = Some("l0".to_string());
+            evt.layer = Some(layer);
             evt.tokens_used = (text.len() / 4) as i64;
             text
         }

@@ -1,5 +1,5 @@
 //! Incremental, profile-scoped capture using the existing desktop SQLite database.
-use crate::dreaming::db::DesktopDb;
+use crate::dreaming::db::{DesktopDb, RecallEvent};
 use crate::fs_util::sha256_hex;
 use crate::ov_client::{OvClient, OvClientError};
 use chrono::Utc;
@@ -16,8 +16,8 @@ pub struct CapturedMessage {
 }
 
 fn text(payload: &Value, keys: &[&str]) -> Option<String> {
-    keys.iter().find_map(|key| payload.get(*key).and_then(Value::as_str))
-        .filter(|value| !value.trim().is_empty()).map(str::to_owned)
+    keys.iter().filter_map(|key| payload.get(*key).and_then(Value::as_str))
+        .find(|value| !value.trim().is_empty()).map(str::to_owned)
 }
 
 /// Strip previously injected reference blocks and omit obvious credential-bearing lines.
@@ -103,6 +103,7 @@ pub struct CaptureHealth {
     pub pending: i64,
     pub sent: i64,
     pub uncertain_sessions: i64,
+    pub extraction_tasks: Vec<(String, String)>,
     pub last_error: Option<String>,
 }
 
@@ -173,7 +174,10 @@ impl DesktopDb {
             [profile], |r| Ok((r.get(0)?,r.get(1)?))).map_err(|e| e.to_string())?;
         let uncertain_sessions = conn.query_row("SELECT COUNT(*) FROM capture_sessions WHERE profile_key=?1 AND state='unknown'", [profile], |r| r.get(0)).map_err(|e| e.to_string())?;
         let last_error = conn.query_row("SELECT last_error FROM capture_sessions WHERE profile_key=?1 AND last_error IS NOT NULL ORDER BY claimed_at DESC LIMIT 1", [profile], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
-        Ok(CaptureHealth {pending,sent,uncertain_sessions,last_error})
+        let mut stmt = conn.prepare("SELECT task_id,status FROM capture_tasks WHERE profile_key=?1 ORDER BY rowid DESC LIMIT 50").map_err(|e| e.to_string())?;
+        let tasks = stmt.query_map([profile], |r| Ok((r.get(0)?,r.get(1)?))).map_err(|e| e.to_string())?;
+        let extraction_tasks = tasks.collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())?;
+        Ok(CaptureHealth {pending,sent,uncertain_sessions,extraction_tasks,last_error})
     }
 }
 
@@ -183,13 +187,27 @@ fn retryable(error: &OvClientError) -> bool {
 
 /// Drain the active profile only. Each message acknowledged by the server is checkpointed
 /// before the next write; a failed commit does not cause message replay.
+pub async fn refresh_extraction_tasks(db: &DesktopDb, client: &OvClient) -> Result<(), String> {
+    let profile = client.profile_key();
+    for (task, status) in db.capture_health(&profile)?.extraction_tasks {
+        if matches!(status.as_str(), "completed" | "failed" | "cancelled") { continue; }
+        if let Ok(Ok(result)) = tokio::time::timeout(std::time::Duration::from_secs(3), client.get_task(&task)).await {
+            if let Some(status) = result["status"].as_str() {
+                db.lock_conn()?.execute("UPDATE capture_tasks SET status=?3 WHERE profile_key=?1 AND task_id=?2",
+                    params![profile,task,status]).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn sync_capture(db: &DesktopDb, client: &OvClient) -> Result<usize,String> {
     let profile = client.profile_key();
     let mut committed = 0;
     while let Some(session) = db.claim_capture(&profile)? {
         let remote = match session.remote_id {
             Some(id) => id,
-            None => match client.create_session(json!({"agent":session.agent,"resource_uri":session.resource_uri})).await {
+            None => match client.create_session(json!({"session_id":session.key})).await {
                 Ok(result) => {
                     let Some(id) = text(&result,&["session_id","id"]) else {
                         db.capture_state(&profile,&session.key,"unknown",Some("Session creation returned no ID"))?;
@@ -219,9 +237,20 @@ pub async fn sync_capture(db: &DesktopDb, client: &OvClient) -> Result<usize,Str
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
                 tx.execute("UPDATE capture_outbox SET state='committed',content='' WHERE profile_key=?1 AND session_key=?2 AND state='sent'",
                     params![profile,session.key]).map_err(|e| e.to_string())?;
+                if let Some(task_id) = &task {
+                    tx.execute("INSERT OR IGNORE INTO capture_tasks(profile_key,task_id) VALUES (?1,?2)",
+                        params![profile,task_id]).map_err(|e| e.to_string())?;
+                }
                 tx.execute("UPDATE capture_sessions SET state='idle',last_error=NULL,task_id=?3 WHERE profile_key=?1 AND session_key=?2",
                     params![profile,session.key,task]).map_err(|e| e.to_string())?;
                 tx.commit().map_err(|e| e.to_string())?;
+                drop(conn);
+                db.record_event_for_profile(&profile, &RecallEvent {
+                    id: uuid::Uuid::new_v4().to_string(), agent_id: session.agent.clone(),
+                    event_type: "capture".into(), query: None, target_uri: Some(session.resource_uri.clone()),
+                    layer: Some("l2".into()), tokens_used: 0, latency_ms: 0,
+                    blocked_by_privacy: false, created_at: Utc::now().timestamp()
+                })?;
                 committed += 1;
             }
             Err(error) => {

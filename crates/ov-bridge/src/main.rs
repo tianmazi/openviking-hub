@@ -64,10 +64,13 @@ async fn main() -> anyhow::Result<()> {
             let client = OvClient::from_local_config()?;
             let status = client.status().await;
             let policy = PolicyStore::load_or_init().ok();
-            let capture = ov_core::dreaming::db::DesktopDb::open_default().ok()
-                .and_then(|db| db.capture_health(&client.profile_key()).ok());
+            let capture = if let Ok(db) = ov_core::dreaming::db::DesktopDb::open_default() {
+                let _ = ov_core::capture::refresh_extraction_tasks(&db,&client).await;
+                db.capture_health(&client.profile_key()).ok()
+            } else { None };
             let out = serde_json::json!({
                 "capture_queue": capture,
+                "agents": ov_core::adapters::AdapterRegistry::new().detect_all(),
                 "server": status,
                 "capture_enabled": policy.as_ref().map(|p| p.global.capture_enabled).unwrap_or(true),
             });

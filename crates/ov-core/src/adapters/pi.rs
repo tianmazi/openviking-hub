@@ -127,19 +127,24 @@ export default function (pi) {
     transcript_path: ctx.sessionManager.getSessionFile(),
   });
 
+  let startup = "";
   pi.on("session_start", async (_event, ctx) => {
-    runHook("session-start", sessionPayload(ctx));
+    startup = runHook("session-start", sessionPayload(ctx));
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
     const recall = runHook("user-prompt-submit", { ...sessionPayload(ctx), prompt: event.prompt });
-    if (recall && typeof event.systemPrompt === "string") {
-      return { systemPrompt: event.systemPrompt + "\n\n" + recall };
+    const context = [startup, recall].filter(Boolean).join("\n\n");
+    if (context && typeof event.systemPrompt === "string") {
+      return { systemPrompt: event.systemPrompt + "\n\n" + context };
     }
   });
 
   pi.on("agent_end", async (event, ctx) => {
     runHook("stop", { ...sessionPayload(ctx), messages: event.messages });
+  });
+  pi.on("session_before_compact", async (_event, ctx) => {
+    runHook("pre-compact", sessionPayload(ctx));
   });
   pi.on("session_shutdown", async (_event, ctx) => {
     runHook("session-end", sessionPayload(ctx));

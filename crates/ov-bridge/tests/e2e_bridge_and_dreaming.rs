@@ -230,9 +230,10 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                             json!({ "status": "error", "message": "Session commit failed" })
                         } else {
                             guard.session_commits += 1;
-                            json!({ "status": "ok", "result": {} })
+                            json!({ "status": "ok", "result": {"status":"accepted","task_id":"capture-task"} })
                         }
                     }
+                    ("GET", "/api/v1/tasks/capture-task") => json!({"status":"ok","result":{"status":"completed"}}),
                     ("POST", "/api/v1/snapshot/commit") => {
                         let mut guard = st.lock().unwrap();
                         if guard.fail_snapshot {
@@ -365,6 +366,7 @@ async fn e2e_mcp_recall_and_capture_are_profile_scoped() {
     assert_eq!(other_events.len(), 1);
     assert_eq!(other_events[0].layer.as_deref(), Some("l0"));
     assert_eq!(other_events[0].target_uri.as_deref(), Some("viking://resources/projects/demo/README.md"));
+    assert!(db.hit_stats_by_uri_for_profile(&other.profile_key()).unwrap().is_empty());
     assert!(db.list_events_for_profile("", None, 10).unwrap().is_empty());
 
     policy.routing.workspace_mappings.push(WorkspaceMapping {
@@ -509,9 +511,14 @@ async fn e2e_hook_outputs_and_stop_capture() {
     assert_eq!(db.capture_health(&client.profile_key()).unwrap().pending, 2);
     assert_eq!(ov_core::capture::sync_capture(&db, &client).await.unwrap(), 1);
     assert_eq!(ov_core::capture::sync_capture(&db, &client).await.unwrap(), 0);
+    assert_eq!(db.capture_health(&client.profile_key()).unwrap().extraction_tasks,
+        vec![("capture-task".to_string(),"accepted".to_string())]);
+    ov_core::capture::refresh_extraction_tasks(&db,&client).await.unwrap();
+    assert_eq!(db.capture_health(&client.profile_key()).unwrap().extraction_tasks[0].1,"completed");
     assert_eq!(hook::hook_stdout("stop", agent, &text).as_deref(), Some("{}"));
     assert_eq!(hook::hook_stdout("stop", AgentId::Antigravity, &text).as_deref(), Some("{}"));
     assert_eq!(db.capture_health(&client.profile_key()).unwrap().pending, 0);
+    assert_eq!(db.count_sessions_since(&client.profile_key(), 0).unwrap(), 1);
     assert!(db.list_events_for_profile("", None, 10).unwrap().is_empty());
     let other = test_client(&url, "personal");
     assert!(db.list_events_for_profile(&other.profile_key(), None, 10).unwrap().is_empty());

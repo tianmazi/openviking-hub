@@ -212,40 +212,7 @@ pub(crate) async fn call_tool(
             .map_err(|e| e.to_string())?;
 
             let top_hit = extract_top_hit(&res);
-            let mut combined = serde_json::to_string_pretty(&res).unwrap_or_default();
-            let mut expansion = None;
-
-            // Progressive L0 -> L1 auto-expansion when top hit exceeds threshold
-            if let Some((top_uri, top_score)) = &top_hit {
-                if budget.default_recall_layer == ContextLayer::L0
-                    && *top_score >= budget.auto_expand_l1_threshold as f64
-                {
-                    if let Ok(l1_val) = client.read_content(top_uri, "l1").await {
-                        let l1_text = l1_val
-                            .as_str()
-                            .or_else(|| l1_val.get("content").and_then(Value::as_str))
-                            .or_else(|| l1_val.get("text").and_then(Value::as_str))
-                            .unwrap_or_default();
-                        if !l1_text.trim().is_empty() {
-                            let marker = format!(
-                                "\n\n--- Auto-Expanded L1 Overview ({top_uri} | score {top_score:.2}) ---\n"
-                            );
-                            expansion = Some(combined.len()..combined.len() + marker.len());
-                            combined.push_str(&marker);
-                            combined.push_str(l1_text);
-                        }
-                    }
-                }
-            }
-
-            let text = truncate_to_token_budget(&combined, budget.max_recall_tokens);
-            let layer = if expansion
-                .is_some_and(|marker| text.get(marker.clone()) == combined.get(marker))
-            {
-                "l1"
-            } else {
-                budget.default_recall_layer.as_str()
-            };
+            let (text, layer, hits) = render_recall(client, &res, &budget).await;
             let wrapped = wrap_ifc_readonly(
                 &text,
                 &format!("recall:{}", agent.as_str()),
@@ -260,13 +227,14 @@ pub(crate) async fn call_tool(
                     event_type: "recall".to_string(),
                     query: Some(query.to_string()),
                     target_uri: top_hit.map(|(uri, _)| uri),
-                    layer: Some(layer.to_string()),
+                    layer: Some(layer),
                     tokens_used: approx_tokens,
                     latency_ms: start.elapsed().as_millis() as i64,
                     blocked_by_privacy: false,
                     created_at: Utc::now().timestamp(),
                 };
                 let _ = db.record_event_for_profile(&client.profile_key(), &evt);
+                let _ = db.record_recall_hits(&evt.id, &hits);
             }
             Ok(wrapped)
         }
@@ -406,34 +374,67 @@ pub(crate) async fn call_tool(
     }
 }
 
-pub(crate) fn extract_top_hit(val: &Value) -> Option<(String, f64)> {
-    let mut slices: Vec<&[Value]> = Vec::new();
-    if let Some(items) = val.as_array() {
-        slices.push(items);
+fn search_items(val: &Value) -> Vec<&Value> {
+    let mut items = Vec::new();
+    if let Some(array) = val.as_array() {
+        items.extend(array);
     } else {
         for key in ["items", "results", "entries", "memories", "resources", "skills"] {
-            if let Some(items) = val.get(key).and_then(|i| i.as_array()) {
-                slices.push(items);
+            if let Some(array) = val.get(key).and_then(Value::as_array) {
+                items.extend(array);
             }
         }
     }
-    let mut best: Option<(String, f64)> = None;
-    for items in slices {
-        for item in items {
-            let Some(uri) = item.get("uri").and_then(Value::as_str).filter(|uri| !uri.is_empty()) else {
-                continue;
-            };
-            let score = item
-                .get("score")
-                .or_else(|| item.get("similarity"))
-                .and_then(|s| s.as_f64())
-                .unwrap_or(0.0);
-            if best.as_ref().map(|(_, s)| score > *s).unwrap_or(true) {
-                best = Some((uri.to_string(), score));
+    items.retain(|item| item["uri"].as_str().is_some_and(|uri| !uri.is_empty()));
+    items.sort_by(|a,b| score(b).total_cmp(&score(a)));
+    items
+}
+
+fn score(item: &Value) -> f64 {
+    item.get("score").or_else(|| item.get("similarity")).and_then(Value::as_f64).unwrap_or(0.0)
+}
+
+pub(crate) fn extract_top_hit(val: &Value) -> Option<(String, f64)> {
+    let items = search_items(val);
+    let item = items.first()?;
+    Some((item["uri"].as_str()?.to_owned(), score(item)))
+}
+
+/// Shared renderer: fit whole candidates and record whether each was injected.
+pub(crate) async fn render_recall(client: &OvClient, result: &Value,
+    budget: &ov_core::policy::model::EffectiveBudget) -> (String, String, Vec<(String,f64,bool)>) {
+    let mut text = String::new();
+    let mut layer = "l0".to_owned();
+    let mut hits: Vec<(String,f64,bool)> = Vec::new();
+    let max = budget.max_recall_tokens.saturating_mul(4);
+    for item in search_items(result) {
+        let uri = item["uri"].as_str().unwrap();
+        if hits.iter().any(|(prior,_,_)| prior == uri) { continue; }
+        let record = serde_json::to_string(item).unwrap_or_default();
+        let injected = text.len() + record.len() + 1 <= max;
+        if injected {
+            text.push_str(&record);
+            text.push('\n');
+        }
+        hits.push((uri.to_owned(),score(item),injected));
+    }
+    if let Some((uri, score, true)) = hits.first() {
+        let selected = if budget.default_recall_layer == ContextLayer::L0 && *score >= budget.auto_expand_l1_threshold as f64 {
+            ContextLayer::L1
+        } else { budget.default_recall_layer };
+        if selected != ContextLayer::L0 {
+            if let Ok(Ok(value)) = tokio::time::timeout(std::time::Duration::from_secs(2),client.read_content(uri,selected.as_str())).await {
+                let content = value.as_str().or_else(|| value["content"].as_str()).or_else(||value["text"].as_str()).unwrap_or_default();
+                let heading = if selected == ContextLayer::L1 {"Auto-Expanded L1 Overview"} else {"L2 Detail"};
+                let detail = format!("\n--- {heading} ({uri} | score {score:.2}) ---\n{content}");
+                if !content.is_empty() && text.len() + detail.len() <= max {
+                    text.push_str(&detail);
+                    layer = selected.as_str().to_owned();
+                }
             }
         }
     }
-    best
+    (text,layer,hits)
 }
 
 pub fn truncate_to_token_budget(text: &str, max_tokens: usize) -> String {
