@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -61,6 +62,42 @@ impl PlatformPaths {
             "ov-bridge"
         };
         self.openviking_dir().join("bin").join(bin_name)
+    }
+
+    /// Ensure the bundled `ov-bridge` sidecar binary is installed into `~/.openviking/bin/`
+    /// with executable permissions on Unix. Safe no-op if no bundled binary is adjacent.
+    pub fn ensure_bridge_installed(&self, explicit_source: Option<&Path>) -> Result<PathBuf, String> {
+        let dest = self.bridge_binary();
+        let source = explicit_source
+            .map(PathBuf::from)
+            .or_else(find_bundled_bridge_binary);
+
+        let Some(src) = source else {
+            return Ok(dest);
+        };
+        if !src.is_file() {
+            return Ok(dest);
+        }
+
+        let needs_copy = match (fs::metadata(&src), fs::metadata(&dest)) {
+            (Ok(sm), Ok(dm)) => sm.len() != dm.len(),
+            (Ok(_), Err(_)) => true,
+            _ => false,
+        };
+
+        if needs_copy {
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            fs::copy(&src, &dest).map_err(|e| e.to_string())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = fs::Permissions::from_mode(0o755);
+                fs::set_permissions(&dest, perms).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(dest)
     }
 
     /// Resolve a CLI executable across system PATH, Login Shell PATH (macOS/Linux GUI apps),
@@ -130,7 +167,6 @@ impl PlatformPaths {
             if !out.status.success() {
                 return Vec::new();
             }
-            // wsl.exe -l -q outputs UTF-16LE on Windows; strip NUL bytes safely
             let raw = String::from_utf8_lossy(&out.stdout).replace('\0', "");
             raw.lines()
                 .map(|l| l.trim().to_string())
@@ -150,7 +186,6 @@ impl PlatformPaths {
         }
     }
 
-    /// Expand a leading `~` in user-configured local paths.
     pub fn expand_tilde(&self, p: &Path) -> PathBuf {
         let s = p.to_string_lossy();
         if let Some(rest) = s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\")) {
@@ -161,6 +196,21 @@ impl PlatformPaths {
             p.to_path_buf()
         }
     }
+}
+
+fn find_bundled_bridge_binary() -> Option<PathBuf> {
+    let exe = env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let bin_name = if cfg!(target_os = "windows") {
+        "ov-bridge.exe"
+    } else {
+        "ov-bridge"
+    };
+    let direct = dir.join(bin_name);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    None
 }
 
 #[cfg(unix)]
@@ -194,7 +244,6 @@ fn resolve_wsl_home_unc(distro: &str) -> Option<PathBuf> {
     Some(PathBuf::from(format!("\\\\wsl$\\{}\\{}", distro, rel)))
 }
 
-/// Extract the version line of a CLI executable if available.
 pub fn probe_cli_version(binary: &Path) -> Option<String> {
     let bin_str = binary.to_string_lossy();
     let out = silent_command(&bin_str).arg("--version").output().ok()?;

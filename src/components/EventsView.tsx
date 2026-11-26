@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
-import { Activity, RefreshCw, ShieldOff } from "lucide-react";
+import { Activity, Cpu, Database, Layers, RefreshCw, ShieldOff } from "lucide-react";
 import { api } from "../lib/tauri";
-import type { RecallEvent } from "../types/openviking";
+import type { RecallEvent, ServerStatus } from "../types/openviking";
 
 const AGENT_FILTERS = [
   { id: "", label: "全部 Agent" },
@@ -14,22 +14,27 @@ const AGENT_FILTERS = [
 export function EventsView() {
   const [agentFilter, setAgentFilter] = useState("");
   const [events, setEvents] = useState<RecallEvent[]>([]);
+  const [status, setStatus] = useState<ServerStatus | null>(null);
 
   const load = () => {
-    api.listRecallEvents(agentFilter || undefined).then(setEvents);
+    void api.listRecallEvents(agentFilter || undefined).then(setEvents);
+    void api.getServerStatus().then(setStatus);
   };
 
   useEffect(() => {
     load();
   }, [agentFilter]);
 
+  const observer = (status?.observer ?? {}) as Record<string, unknown>;
+  const totalTokens = events.reduce((acc, e) => acc + e.tokens_used, 0);
+
   return (
     <div className="h-full flex flex-col p-6 space-y-4 overflow-hidden">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-lg font-semibold text-zinc-100">实时召回与捕获事件流</h1>
+          <h1 className="text-lg font-semibold text-zinc-100">实时召回事件流与远端观测</h1>
           <p className="text-xs text-zinc-400 mt-0.5">
-            追踪每个 Agent 通过 <code className="font-mono text-indigo-300">ov-bridge</code> 触发的 Recall / Capture、命中层级与 Token 消耗。
+            追踪每个 Agent 通过 <code className="font-mono text-indigo-300">ov-bridge</code> 触发的 Recall / Capture、命中层级与远端 Observer 运行状态。
           </p>
         </div>
         <button
@@ -39,6 +44,37 @@ export function EventsView() {
           <RefreshCw className="w-3.5 h-3.5" />
           刷新
         </button>
+      </div>
+
+      {/* Observer & Runtime Telemetry Cards */}
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <div className="rounded-xl bg-surface-1 border border-border-subtle p-3.5 flex items-center gap-3">
+          <Database className="w-4 h-4 text-emerald-400 shrink-0" />
+          <div className="min-w-0">
+            <div className="text-[11px] text-zinc-400">远端服务状态</div>
+            <div className="text-xs font-mono text-zinc-100 truncate">
+              {status?.reachable ? `Online · ${status.latency_ms} ms` : "Offline"}
+            </div>
+          </div>
+        </div>
+        <div className="rounded-xl bg-surface-1 border border-border-subtle p-3.5 flex items-center gap-3">
+          <Cpu className="w-4 h-4 text-indigo-400 shrink-0" />
+          <div className="min-w-0">
+            <div className="text-[11px] text-zinc-400">Observer (Queue / VikingDB)</div>
+            <div className="text-xs font-mono text-zinc-100 truncate">
+              {String(observer.queue ?? "idle")} / {String(observer.vikingdb ?? "ready")}
+            </div>
+          </div>
+        </div>
+        <div className="rounded-xl bg-surface-1 border border-border-subtle p-3.5 flex items-center gap-3">
+          <Layers className="w-4 h-4 text-sky-400 shrink-0" />
+          <div className="min-w-0">
+            <div className="text-[11px] text-zinc-400">当前列表累计 Token 消耗</div>
+            <div className="text-xs font-mono text-zinc-100">
+              {totalTokens.toLocaleString()} tokens（{events.length} 次事件）
+            </div>
+          </div>
+        </div>
       </div>
 
       <div className="flex items-center gap-1.5">

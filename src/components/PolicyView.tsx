@@ -4,6 +4,8 @@ import type {
   AgentId,
   ContextLayer,
   DreamingTrigger,
+  MemoryCategory,
+  MutabilityMode,
   PolicyConfig,
   VisibilityScope,
 } from "../types/openviking";
@@ -19,6 +21,15 @@ const AGENT_LABELS: Record<AgentId, string> = {
   pi: "pi Coding Agent",
   antigravity: "Antigravity (反重力)",
 };
+
+const CATEGORIES: Array<{ id: MemoryCategory; label: string }> = [
+  { id: "profile", label: "Profile（用户画像）" },
+  { id: "preferences", label: "Preferences（偏好习惯）" },
+  { id: "entities", label: "Entities（项目/实体）" },
+  { id: "events", label: "Events（历史事件）" },
+  { id: "cases", label: "Cases（踩坑案例）" },
+  { id: "patterns", label: "Patterns（复用模式）" },
+];
 
 export function PolicyView({ policy, onSave }: PolicyViewProps) {
   const [draft, setDraft] = useState<PolicyConfig>(policy);
@@ -79,7 +90,7 @@ export function PolicyView({ policy, onSave }: PolicyViewProps) {
         <div>
           <h1 className="text-lg font-semibold text-zinc-100">内置记忆治理策略中心</h1>
           <p className="text-xs text-zinc-400 mt-1">
-            配置作用域路由、分层 Token 预算以及 Dreaming 后台异步整理规则（落盘于{" "}
+            配置作用域路由、分层 Token 预算、六类记忆配额/可变性以及 Dreaming 后台异步整理规则（落盘于{" "}
             <code className="font-mono text-zinc-300">~/.openviking/policy.toml</code>）。
           </p>
         </div>
@@ -142,7 +153,6 @@ export function PolicyView({ policy, onSave }: PolicyViewProps) {
           />
         </div>
 
-        {/* Manual Workspace Mappings */}
         <div className="space-y-2">
           <div className="text-xs font-medium text-zinc-300">手动目录映射（优先于 Git 自动识别）</div>
           <div className="space-y-1.5">
@@ -207,7 +217,6 @@ export function PolicyView({ policy, onSave }: PolicyViewProps) {
           </div>
         </div>
 
-        {/* Protected Rule Globs */}
         <div className="space-y-2">
           <div className="text-xs font-medium text-zinc-300">人工强约束规则只读保护（protected_rule_globs）</div>
           <div className="flex flex-wrap gap-1.5">
@@ -255,8 +264,8 @@ export function PolicyView({ policy, onSave }: PolicyViewProps) {
         </div>
       </section>
 
-      {/* 2. Tiered Token Budget */}
-      <section className="rounded-xl bg-surface-1 border border-border-subtle p-5 space-y-4">
+      {/* 2. Tiered Token Budget + Six-Category Quotas & Mutability */}
+      <section className="rounded-xl bg-surface-1 border border-border-subtle p-5 space-y-5">
         <h2 className="text-sm font-semibold text-zinc-100">2. 分层注入与按 Agent Token 预算</h2>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           {(Object.keys(AGENT_LABELS) as AgentId[]).map((agentId) => {
@@ -323,6 +332,60 @@ export function PolicyView({ policy, onSave }: PolicyViewProps) {
               </div>
             );
           })}
+        </div>
+
+        <div className="space-y-2">
+          <div className="text-xs font-medium text-zinc-300">六类记忆独立配额与更新策略</div>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5 text-xs">
+            {CATEGORIES.map((cat) => (
+              <div
+                key={cat.id}
+                className="p-3 rounded-lg bg-surface-2 border border-border-subtle space-y-2"
+              >
+                <div className="text-[11px] font-medium text-zinc-200">{cat.label}</div>
+                <div className="flex items-center justify-between gap-2">
+                  <input
+                    type="number"
+                    min={50}
+                    step={50}
+                    value={draft.budget.category_quotas[cat.id] ?? 200}
+                    onChange={(e) =>
+                      setDraft({
+                        ...draft,
+                        budget: {
+                          ...draft.budget,
+                          category_quotas: {
+                            ...draft.budget.category_quotas,
+                            [cat.id]: Number(e.target.value),
+                          },
+                        },
+                      })
+                    }
+                    className="w-24 bg-surface-1 border border-border-subtle rounded px-2 py-1 font-mono text-[11px] text-zinc-200"
+                  />
+                  <select
+                    value={draft.lifecycle.category_mutability[cat.id] ?? "immutable"}
+                    onChange={(e) =>
+                      setDraft({
+                        ...draft,
+                        lifecycle: {
+                          ...draft.lifecycle,
+                          category_mutability: {
+                            ...draft.lifecycle.category_mutability,
+                            [cat.id]: e.target.value as MutabilityMode,
+                          },
+                        },
+                      })
+                    }
+                    className="bg-surface-1 border border-border-subtle rounded px-2 py-1 font-mono text-[11px] text-zinc-200"
+                  >
+                    <option value="mutable">mutable（可合并）</option>
+                    <option value="immutable">immutable（仅归档）</option>
+                  </select>
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       </section>
 

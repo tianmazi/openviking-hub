@@ -3,6 +3,7 @@ mod commands;
 use ov_core::dreaming::db::DesktopDb;
 use ov_core::dreaming::engine::run_dreaming;
 use ov_core::ov_client::OvClient;
+use ov_core::platform::PlatformPaths;
 use ov_core::policy::model::DreamingTrigger;
 use ov_core::policy::store::{normalize_cron, PolicyStore};
 use std::str::FromStr;
@@ -21,6 +22,9 @@ pub fn run() {
         .setup(|app| {
             let _ = PolicyStore::load_or_init();
             let _ = DesktopDb::open_default();
+            if let Some(paths) = PlatformPaths::detect() {
+                let _ = paths.ensure_bridge_installed(None);
+            }
 
             let open_item =
                 MenuItem::with_id(app, "open", "打开 OpenViking 控制台", true, None::<&str>)?;
@@ -105,7 +109,6 @@ pub fn run() {
             }
             let _tray = tray_builder.build(app)?;
 
-            // Background Dreaming scheduler (supports both Cron Schedule and SessionThreshold)
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 loop {
@@ -184,6 +187,7 @@ pub fn run() {
             commands::save_profiles,
             commands::detect_agents,
             commands::detect_wsl,
+            commands::connect_wsl_agent,
             commands::connect_agent,
             commands::disconnect_agent,
             commands::import_legacy_memory,

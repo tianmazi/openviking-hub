@@ -10,6 +10,7 @@ import {
   Sparkles,
   X,
 } from "lucide-react";
+import { computeLineDiff } from "../lib/diff";
 import type {
   ApplyReport,
   ChangeAction,
@@ -79,6 +80,11 @@ export function DreamingWorkbench({
     [changes],
   );
 
+  const diffLines = useMemo(() => {
+    if (!selected) return [];
+    return computeLineDiff(selected.before_content ?? "", editedText);
+  }, [selected, editedText]);
+
   useEffect(() => {
     if (selected) {
       setEditedText(selected.after_content ?? "");
@@ -86,7 +92,6 @@ export function DreamingWorkbench({
     }
   }, [selected?.id]);
 
-  // Linear / GitHub PR Review keyboard shortcuts: J/K/A/X/E/Cmd+Enter
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (
@@ -155,7 +160,6 @@ export function DreamingWorkbench({
 
   return (
     <div className="h-full flex flex-col overflow-hidden">
-      {/* Top Workbench Header */}
       <div className="px-5 py-3.5 border-b border-border-subtle bg-surface-1 flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2">
@@ -211,12 +215,12 @@ export function DreamingWorkbench({
         </div>
       </div>
 
-      {/* Filter Bar */}
       <div className="px-5 py-2 border-b border-border-subtle bg-surface-1/60 flex items-center gap-1.5 overflow-x-auto">
         {[
           { id: "all", label: `全部 (${visibleChanges.length})` },
           { id: "merge", label: "冲突合并" },
           { id: "move_from_inbox", label: "Inbox 分拣" },
+          { id: "promote_to_index", label: "热记忆晋升" },
           { id: "archive", label: "冷记忆归档" },
           { id: "wiki_compile", label: "Wiki 编译" },
         ].map((f) => (
@@ -240,7 +244,6 @@ export function DreamingWorkbench({
         </div>
       )}
 
-      {/* Optional Snapshot History & Rollback Drawer */}
       {showHistory && (
         <div className="px-5 py-3 bg-surface-2 border-b border-border-subtle space-y-2">
           <div className="text-xs font-semibold text-zinc-200">
@@ -273,7 +276,6 @@ export function DreamingWorkbench({
         </div>
       )}
 
-      {/* Split Pane: Proposal Queue (Left) + Diff/Evidence Workspace (Right) */}
       <div className="flex-1 flex overflow-hidden">
         <div className="w-80 shrink-0 border-r border-border-subtle bg-surface-1/40 overflow-y-auto p-2 space-y-1.5">
           {visibleChanges.map((item) => {
@@ -326,7 +328,6 @@ export function DreamingWorkbench({
           )}
         </div>
 
-        {/* Right Detail Workspace */}
         <div className="flex-1 flex flex-col bg-surface-0 overflow-hidden">
           {selected ? (
             <>
@@ -347,7 +348,7 @@ export function DreamingWorkbench({
                         }`}
                       >
                         {tab === "diff"
-                          ? "Diff 对比"
+                          ? "逐行 Diff"
                           : tab === "evidence"
                             ? "证据链"
                             : "L0/L1 影响预览"}
@@ -360,45 +361,57 @@ export function DreamingWorkbench({
 
               <div className="flex-1 overflow-y-auto p-5">
                 {detailTab === "diff" && (
-                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 h-full">
-                    <div className="flex flex-col rounded-xl bg-surface-1 border border-rose-500/20 overflow-hidden">
-                      <div className="px-3 py-2 bg-rose-500/10 border-b border-rose-500/20 text-[11px] font-mono text-rose-300">
-                        Before（当前远端内容）
-                      </div>
-                      <pre className="flex-1 p-4 font-mono text-xs text-zinc-300 whitespace-pre-wrap overflow-y-auto">
-                        {selected.before_content ?? "（无旧内容 / 新增操作）"}
-                      </pre>
+                  <div className="flex flex-col rounded-xl bg-surface-1 border border-border-subtle overflow-hidden h-full">
+                    <div className="px-3.5 py-2 bg-surface-2 border-b border-border-subtle flex items-center justify-between">
+                      <span className="text-[11px] font-mono text-zinc-300">
+                        {editing
+                          ? "在线编辑终稿（按 ⌘↵ 直接批准暂存）"
+                          : "Unified Line Diff（- 远端旧内容 / + 提案新内容）"}
+                      </span>
+                      <button
+                        onClick={() => setEditing((v) => !v)}
+                        className="inline-flex items-center gap-1 text-[11px] text-indigo-300 hover:underline"
+                      >
+                        <Edit3 className="w-3 h-3" />
+                        {editing ? "返回 Diff 视图" : "编辑终稿 (E)"}
+                      </button>
                     </div>
-
-                    <div className="flex flex-col rounded-xl bg-surface-1 border border-emerald-500/20 overflow-hidden">
-                      <div className="px-3 py-2 bg-emerald-500/10 border-b border-emerald-500/20 flex items-center justify-between">
-                        <span className="text-[11px] font-mono text-emerald-300">
-                          After（提案终稿 — {editing ? "编辑中" : "可按 E 直接修改"}）
-                        </span>
-                        <button
-                          onClick={() => setEditing((v) => !v)}
-                          className="inline-flex items-center gap-1 text-[11px] text-emerald-200 hover:underline"
-                        >
-                          <Edit3 className="w-3 h-3" />
-                          {editing ? "预览" : "编辑终稿"}
-                        </button>
+                    {editing ? (
+                      <textarea
+                        autoFocus
+                        value={editedText}
+                        onChange={(e) => setEditedText(e.target.value)}
+                        className="flex-1 p-4 bg-transparent font-mono text-xs text-zinc-100 focus:outline-none resize-none leading-relaxed"
+                      />
+                    ) : (
+                      <div className="flex-1 overflow-y-auto font-mono text-xs divide-y divide-white/[0.03]">
+                        {diffLines.length > 0 ? (
+                          diffLines.map((line, idx) => (
+                            <div
+                              key={idx}
+                              className={`px-4 py-1 whitespace-pre-wrap ${
+                                line.type === "add"
+                                  ? "bg-emerald-500/15 text-emerald-200"
+                                  : line.type === "remove"
+                                    ? "bg-rose-500/15 text-rose-200 line-through decoration-rose-400/50"
+                                    : "text-zinc-400"
+                              }`}
+                            >
+                              <span className="inline-block w-5 select-none opacity-70">
+                                {line.type === "add" ? "+" : line.type === "remove" ? "-" : " "}
+                              </span>
+                              {line.text}
+                            </div>
+                          ))
+                        ) : (
+                          <div className="p-4 text-zinc-500">
+                            {selected.destination_uri
+                              ? `→ 移动 / 归档至：${selected.destination_uri}`
+                              : "（无文本差异）"}
+                          </div>
+                        )}
                       </div>
-                      {editing ? (
-                        <textarea
-                          autoFocus
-                          value={editedText}
-                          onChange={(e) => setEditedText(e.target.value)}
-                          className="flex-1 p-4 bg-transparent font-mono text-xs text-zinc-100 focus:outline-none resize-none"
-                        />
-                      ) : (
-                        <pre className="flex-1 p-4 font-mono text-xs text-zinc-200 whitespace-pre-wrap overflow-y-auto">
-                          {editedText ||
-                            (selected.destination_uri
-                              ? `→ 移动/归档至: ${selected.destination_uri}`
-                              : "（无文本写入）")}
-                        </pre>
-                      )}
-                    </div>
+                    )}
                   </div>
                 )}
 
@@ -434,7 +447,6 @@ export function DreamingWorkbench({
                 )}
               </div>
 
-              {/* Bottom Action Bar */}
               <div className="px-5 py-3 border-t border-border-subtle bg-surface-1 flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <button

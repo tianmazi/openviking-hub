@@ -1,3 +1,4 @@
+use ov_core::adapters::wsl::inject_wsl_home;
 use ov_core::adapters::{AdapterRegistry, AgentStatus, ConnectOptions};
 use ov_core::dreaming::db::{DesktopDb, DreamingRun, RecallEvent};
 use ov_core::dreaming::engine::{
@@ -67,14 +68,27 @@ pub fn detect_wsl() -> Vec<WslDistroInfo> {
 }
 
 #[tauri::command]
+pub fn connect_wsl_agent(
+    distro_name: String,
+    home_unc: String,
+    linux_bridge_path: Option<String>,
+) -> Result<Vec<String>, String> {
+    let bridge = linux_bridge_path
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "~/.openviking/bin/ov-bridge".to_string());
+    inject_wsl_home(&distro_name, std::path::Path::new(&home_unc), &bridge)
+}
+
+#[tauri::command]
 pub fn connect_agent(
     agent_id: AgentId,
     write_project_rules: bool,
     project_dir: Option<String>,
 ) -> Result<AgentStatus, String> {
     let paths = PlatformPaths::detect().ok_or("Cannot resolve home directory")?;
+    let bridge_binary = paths.ensure_bridge_installed(None)?;
     let opts = ConnectOptions {
-        bridge_binary: paths.bridge_binary(),
+        bridge_binary,
         write_project_rules,
         project_dir: project_dir.map(PathBuf::from),
     };

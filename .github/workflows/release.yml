@@ -8,7 +8,7 @@ on:
 
 jobs:
   rust-and-web-ci:
-    name: Rust Core Tests & Frontend Build
+    name: Rust Unit + E2E Tests & Frontend Build + E2E
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,12 +16,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - name: Run Rust core & bridge tests
+      - name: Run Rust unit & full-stack E2E tests
         run: cargo test -p ov-core -p ov-bridge
-      - name: Build frontend
+      - name: Build frontend & run Frontend E2E smoke test
         run: |
           npm ci
           npm run build
+          npm run test:e2e
 
   tauri-release:
     name: Build Tauri v2 Bundle (${{ matrix.platform }})

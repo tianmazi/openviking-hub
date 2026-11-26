@@ -2,6 +2,7 @@ pub mod antigravity;
 pub mod claude_code;
 pub mod codex;
 pub mod pi;
+pub mod wsl;
 
 use crate::platform::PlatformPaths;
 use crate::policy::model::AgentId;
