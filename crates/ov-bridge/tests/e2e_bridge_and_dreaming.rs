@@ -29,6 +29,8 @@ struct MockState {
     fail_content_read: bool,
     fail_session_commit: bool,
     session_messages: Vec<String>,
+    session_peers: Vec<Option<String>>,
+    session_configs: Vec<Value>,
     session_commits: usize,
     scoped_searches: Vec<Value>,
     files: HashMap<String, String>,
@@ -214,13 +216,14 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                         json!({ "choices": [{ "message": { "content": content } }] })
                     }
                     ("POST", "/api/v1/sessions") => {
+                        st.lock().unwrap().session_configs.push(body_json.clone());
                         json!({ "status": "ok", "result": { "session_id": "e2e-session" } })
                     }
                     ("POST", "/api/v1/sessions/e2e-session/messages") => {
                         assert!(matches!(body_json["role"].as_str(), Some("assistant" | "user")));
-                        st.lock().unwrap().session_messages.push(
-                            body_json["content"].as_str().unwrap().to_string(),
-                        );
+                        let mut guard = st.lock().unwrap();
+                        guard.session_messages.push(body_json["content"].as_str().unwrap().to_string());
+                        guard.session_peers.push(body_json["peer_id"].as_str().map(str::to_owned));
                         json!({ "status": "ok", "result": {} })
                     }
                     ("POST", "/api/v1/sessions/e2e-session/commit") => {
@@ -381,9 +384,11 @@ async fn e2e_mcp_recall_and_capture_are_profile_scoped() {
     } });
     let text = mcp::call_tool(agent, &global, &policy, &client, None).await.unwrap();
     assert!(text.contains("viking://~/memories/preferences/git.md"));
-    assert_eq!(state.lock().unwrap().scoped_searches.last().unwrap()["target_uri"],
-        "viking://resources/projects/demo/");
-    assert_eq!(state.lock().unwrap().scoped_searches.len(), 2);
+    assert!(state.lock().unwrap().scoped_searches.iter().any(|req| req["target_uri"] ==
+        "viking://resources/projects/demo/"));
+    assert!(state.lock().unwrap().scoped_searches.iter().any(|req|
+        req["target_uri"].as_str().is_some_and(|uri|uri.starts_with("viking://~/peers/project-"))));
+    assert_eq!(state.lock().unwrap().scoped_searches.len(), 3);
     policy.routing.workspace_mappings.clear();
 
     let protected = json!({ "name": "remember", "arguments": {
@@ -455,9 +460,14 @@ async fn e2e_hook_outputs_and_stop_capture() {
     assert_eq!(serde_json::from_str::<Value>(&output).unwrap(), json!({
         "injectSteps": [{ "systemMessage": { "systemMessage": text } }]
     }));
-    assert_eq!(state.lock().unwrap().scoped_searches.as_slice(), &[json!({
-        "query": "Read project notes", "target_uri": "viking://resources/projects/demo/", "limit": 5
-    })]);
+    {
+        let guard = state.lock().unwrap();
+        assert_eq!(guard.scoped_searches.len(),2);
+        assert!(guard.scoped_searches.contains(&json!({
+            "query": "Read project notes", "target_uri": "viking://resources/projects/demo/", "limit": 5
+        })));
+        assert!(guard.scoped_searches.iter().any(|req| req["target_uri"].as_str().is_some_and(|uri| uri.starts_with("viking://~/peers/project-"))));
+    }
 
     let agent = AgentId::Codex;
     let input = json!({ "cwd": tmp.path(), "message": "Read project notes" });
@@ -525,6 +535,9 @@ async fn e2e_hook_outputs_and_stop_capture() {
     let guard = state.lock().unwrap();
     assert_eq!(guard.session_commits, 1);
     assert_eq!(guard.session_messages, vec!["Remember this decision\nSecond line".to_string(), "Ignore user text".to_string()]);
+    assert_eq!(guard.session_configs[0]["memory_policy"]["peer"]["enabled"], true);
+    assert!(guard.session_peers[0].as_deref().unwrap().starts_with("project-"));
+    assert_eq!(guard.session_peers[0],guard.session_peers[1]);
 }
 
 #[tokio::test]
@@ -685,4 +698,23 @@ async fn e2e_unconfirmed_commit_never_replays_messages() {
     state.lock().unwrap().fail_session_commit = false;
     assert_eq!(ov_core::capture::sync_capture(&db,&client).await.unwrap(),0);
     assert_eq!(state.lock().unwrap().session_messages.len(),1);
+}
+
+
+#[tokio::test]
+async fn e2e_capture_threshold_and_forced_flush() {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let url = start_mock_openviking_server(state.clone()).await;
+    let client = test_client(&url, "work");
+    let db = DesktopDb::open_in_memory().unwrap();
+    let (_, messages) = ov_core::capture::collect(&json!({"messages":[{"role":"assistant","content":"small batch"}]}));
+    let profile = client.profile_key();
+    db.enqueue_scoped_capture(&profile,"session","codex","viking://resources/projects/demo/",Some("project-demo"),&messages,false).unwrap();
+    assert_eq!(ov_core::capture::sync_capture_at_threshold(&db,&client,100).await.unwrap(),0);
+    assert_eq!(db.capture_health(&profile).unwrap().pending,1);
+    db.enqueue_scoped_capture(&profile,"session","codex","viking://resources/projects/demo/",Some("project-demo"),&[],true).unwrap();
+    assert_eq!(ov_core::capture::sync_capture_at_threshold(&db,&client,100).await.unwrap(),1);
+    let guard = state.lock().unwrap();
+    assert_eq!(guard.session_peers,vec![Some("project-demo".to_string())]);
+    assert_eq!(guard.session_commits,1);
 }

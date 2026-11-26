@@ -1,9 +1,9 @@
-use crate::mcp::{extract_top_hit, render_recall};
+use crate::mcp::{extract_top_hit, find_scopes, render_recall};
 use chrono::Utc;
 use ov_core::dreaming::db::{DesktopDb, RecallEvent};
-use ov_core::ov_client::{FindRequest, OvClient};
+use ov_core::ov_client::OvClient;
 use ov_core::policy::model::{AgentId, PolicyConfig};
-use ov_core::policy::router::resolve_route_for_agent;
+use ov_core::policy::router::{project_peer, resolve_route_for_agent};
 use ov_core::policy::store::PolicyStore;
 use ov_core::provenance::wrap_ifc_readonly;
 use serde_json::{json, Value};
@@ -91,6 +91,7 @@ pub(crate) async fn execute_hook(
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let route = resolve_route_for_agent(policy, &cwd, Some(agent));
+    let peer = project_peer(&route);
     let mut evt = RecallEvent {
         id: Uuid::new_v4().to_string(),
         agent_id: agent.as_str().to_string(),
@@ -182,12 +183,8 @@ pub(crate) async fn execute_hook(
                     return String::new();
                 }
             }
-            let Ok(Ok(res)) = tokio::time::timeout(std::time::Duration::from_secs(3), client
-                .find(&FindRequest {
-                    query: prompt.to_string(),
-                    target_uri: Some(route.target_resource_uri).filter(|uri| !uri.is_empty()),
-                    limit: Some(5),
-                })).await
+            let Ok(Ok(res)) = tokio::time::timeout(std::time::Duration::from_secs(3),
+                find_scopes(client, prompt, &route.target_resource_uri, peer.as_deref(), Some(5))).await
             else {
                 return String::new();
             };
@@ -216,10 +213,12 @@ pub(crate) async fn execute_hook(
             } else {
                 let (session, messages) = collect(payload);
                 let Some(db) = db else { return String::new(); };
-                if messages.is_empty() { return String::new(); }
-                let runtime_id = session.unwrap_or_else(|| messages[0].key.clone());
+                let Some(runtime_id) = session.or_else(|| messages.first().map(|m|m.key.clone())) else {
+                    return String::new();
+                };
+                let flush = matches!(event,"pre-compact" | "session-end");
                 let session_key = sha256_hex(&format!("{}:{}:{}", agent.as_str(), route.target_resource_uri, runtime_id));
-                match db.enqueue_capture(&client.profile_key(), &session_key, agent.as_str(), &route.target_resource_uri, &messages) {
+                match db.enqueue_scoped_capture(&client.profile_key(), &session_key, agent.as_str(), &route.target_resource_uri, peer.as_deref(), &messages, flush) {
                     Ok(0) | Err(_) => return String::new(),
                     Ok(_) => {}
                 }

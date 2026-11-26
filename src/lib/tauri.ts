@@ -43,6 +43,7 @@ let previewPolicy: PolicyConfig = {
   schema_version: 1,
   global: {
     capture_enabled: true,
+    capture_commit_tokens: 0,
     active_profile: "default",
     default_visibility: "private",
   },

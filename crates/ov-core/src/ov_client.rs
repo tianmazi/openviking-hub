@@ -487,9 +487,16 @@ impl OvClient {
         role: &str,
         content: &str,
     ) -> Result<Value, OvClientError> {
+        self.add_session_message_for_peer(session_id, role, content, None).await
+    }
+
+    pub async fn add_session_message_for_peer(
+        &self, session_id: &str, role: &str, content: &str, peer_id: Option<&str>,
+    ) -> Result<Value, OvClientError> {
         let path = format!("/api/v1/sessions/{}/messages", session_id);
-        self.post_json(&path, &json!({ "role": role, "content": content }))
-            .await
+        let mut body = json!({ "role": role, "content": content });
+        if let Some(peer) = peer_id { body["peer_id"] = json!(peer); }
+        self.post_json(&path, &body).await
     }
 
     pub async fn commit_session(&self, session_id: &str) -> Result<Value, OvClientError> {

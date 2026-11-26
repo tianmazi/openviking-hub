@@ -30,6 +30,8 @@ impl Default for PolicyConfig {
 #[serde(default)]
 pub struct GlobalPolicy {
     pub capture_enabled: bool,
+    /// Approximate queued tokens before sync; 0 commits every completed turn.
+    pub capture_commit_tokens: u64,
     pub active_profile: String,
     pub default_visibility: VisibilityScope,
 }
@@ -38,6 +40,7 @@ impl Default for GlobalPolicy {
     fn default() -> Self {
         Self {
             capture_enabled: true,
+            capture_commit_tokens: 0,
             active_profile: "default".to_string(),
             default_visibility: VisibilityScope::Private,
         }

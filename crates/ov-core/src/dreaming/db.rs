@@ -174,6 +174,8 @@ impl DesktopDb {
                 agent TEXT NOT NULL,
                 resource_uri TEXT NOT NULL,
                 remote_id TEXT,
+                peer_id TEXT,
+                flush_requested INTEGER NOT NULL DEFAULT 0,
                 state TEXT NOT NULL DEFAULT 'idle',
                 claimed_at INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT,

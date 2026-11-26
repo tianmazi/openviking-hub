@@ -56,7 +56,8 @@ async fn main() -> anyhow::Result<()> {
             let policy = PolicyStore::load_or_init()?;
             if policy.global.capture_enabled {
                 let db = ov_core::dreaming::db::DesktopDb::open_default().map_err(anyhow::Error::msg)?;
-                let count = ov_core::capture::sync_capture(&db, &client).await.map_err(anyhow::Error::msg)?;
+                let threshold = if profile.is_some() {policy.global.capture_commit_tokens} else {0};
+                let count = ov_core::capture::sync_capture_at_threshold(&db, &client, threshold).await.map_err(anyhow::Error::msg)?;
                 println!("{}", serde_json::json!({"committed_sessions":count}));
             }
         }

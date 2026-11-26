@@ -2,7 +2,7 @@ use chrono::Utc;
 use ov_core::dreaming::db::{DesktopDb, RecallEvent};
 use ov_core::ov_client::{ContextSearchRequest, FindRequest, OvClient};
 use ov_core::policy::model::{AgentId, ContextLayer, PolicyConfig};
-use ov_core::policy::router::{is_protected_rule_path, resolve_route_for_agent};
+use ov_core::policy::router::{is_protected_rule_path, project_peer, resolve_route_for_agent};
 use ov_core::policy::store::PolicyStore;
 use ov_core::provenance::{render_with_provenance, wrap_ifc_readonly, MemoryProvenance};
 use serde_json::{json, Value};
@@ -180,25 +180,16 @@ pub(crate) async fn call_tool(
                 .get("query")
                 .and_then(|v| v.as_str())
                 .ok_or("Missing query")?;
-            let target_uri = args
-                .get("target_uri")
-                .and_then(|v| v.as_str())
-                .map(|uri| uri.trim().to_owned())
-                .unwrap_or_else(|| {
-                    let cwd = std::env::current_dir().unwrap_or_default();
-                    resolve_route_for_agent(policy, &cwd, Some(agent)).target_resource_uri
-                });
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let route = resolve_route_for_agent(policy, &cwd, Some(agent));
+            let explicit_uri = args.get("target_uri").and_then(Value::as_str);
+            let peer = if explicit_uri.is_none() { project_peer(&route) } else { None };
+            let target_uri = explicit_uri.map(|uri| uri.trim().to_owned()).unwrap_or(route.target_resource_uri);
             let target_uri = (!target_uri.is_empty()).then_some(target_uri);
             let limit = args.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
 
-            let res = if target_uri.is_some() {
-                client
-                    .find(&FindRequest {
-                        query: query.to_string(),
-                        target_uri: target_uri.clone(),
-                        limit,
-                    })
-                    .await
+            let res = if let Some(uri) = &target_uri {
+                find_scopes(client, query, uri, peer.as_deref(), limit).await
             } else {
                 client
                     .search_context(&ContextSearchRequest {
@@ -371,6 +362,22 @@ pub(crate) async fn call_tool(
             Ok(serde_json::to_string_pretty(&res).unwrap_or_default())
         }
         _ => Err(format!("Unknown tool: {}", name)),
+    }
+}
+
+/// Retrieve project resources and native peer memories concurrently, retaining
+/// the primary result if the peer has not been indexed yet.
+pub(crate) async fn find_scopes(client: &OvClient, query: &str, resource: &str,
+    peer: Option<&str>, limit: Option<usize>) -> Result<Value, ov_core::ov_client::OvClientError> {
+    let primary = FindRequest {query:query.to_owned(), target_uri:(!resource.is_empty()).then(||resource.to_owned()),limit};
+    let Some(peer) = peer else {return client.find(&primary).await;};
+    let memory = FindRequest {query:query.to_owned(),target_uri:Some(format!("viking://~/peers/{peer}/memories/")),limit};
+    let (a,b) = tokio::join!(client.find(&primary),client.find(&memory));
+    match (a,b) {
+        (Ok(a),Ok(b)) => Ok(Value::Array(search_items(&a).into_iter().chain(search_items(&b)).cloned().collect())),
+        (Ok(a),Err(_)) => Ok(a),
+        (Err(_),Ok(b)) => Ok(b),
+        (Err(a),Err(_)) => Err(a),
     }
 }
 

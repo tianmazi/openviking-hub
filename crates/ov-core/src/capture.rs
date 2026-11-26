@@ -113,16 +113,26 @@ struct Session {
     agent: String,
     resource_uri: String,
     remote_id: Option<String>,
+    peer_id: Option<String>,
 }
 
 impl DesktopDb {
     /// The unique message key is the durable capture watermark. Enqueueing is atomic.
     pub fn enqueue_capture(&self, profile: &str, session: &str, agent: &str,
         uri: &str, messages: &[CapturedMessage]) -> Result<usize, String> {
+        self.enqueue_scoped_capture(profile,session,agent,uri,None,messages,false)
+    }
+
+    pub fn enqueue_scoped_capture(&self, profile: &str, session: &str, agent: &str,
+        uri: &str, peer: Option<&str>, messages: &[CapturedMessage], flush: bool) -> Result<usize,String> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
-        tx.execute("INSERT OR IGNORE INTO capture_sessions(profile_key,session_key,agent,resource_uri) VALUES (?1,?2,?3,?4)",
-            params![profile,session,agent,uri]).map_err(|e| e.to_string())?;
+        tx.execute("INSERT OR IGNORE INTO capture_sessions(profile_key,session_key,agent,resource_uri,peer_id) VALUES (?1,?2,?3,?4,?5)",
+            params![profile,session,agent,uri,peer]).map_err(|e| e.to_string())?;
+        if flush {
+            tx.execute("UPDATE capture_sessions SET flush_requested=1 WHERE profile_key=?1 AND session_key=?2",
+                params![profile,session]).map_err(|e| e.to_string())?;
+        }
         let mut added = 0;
         for msg in messages {
             added += tx.execute("INSERT OR IGNORE INTO capture_outbox(profile_key,session_key,event_key,role,content) VALUES (?1,?2,?3,?4,?5)",
@@ -132,18 +142,22 @@ impl DesktopDb {
         Ok(added)
     }
 
-    fn claim_capture(&self, profile: &str) -> Result<Option<Session>, String> {
+    fn claim_capture(&self, profile: &str, threshold: u64) -> Result<Option<Session>, String> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
         // A crashed process may have completed a remote write. Never blindly replay it.
         let now = Utc::now().timestamp();
         tx.execute("UPDATE capture_sessions SET state='unknown',last_error='Interrupted sync; reconcile remote session before retry' WHERE profile_key=?1 AND state='sending' AND claimed_at<?2",
             params![profile,now-3600]).map_err(|e| e.to_string())?;
-        let session = tx.query_row("SELECT session_key,agent,resource_uri,remote_id FROM capture_sessions s
+        let session = tx.query_row("SELECT session_key,agent,resource_uri,remote_id,peer_id FROM capture_sessions s
             WHERE profile_key=?1 AND state='idle' AND EXISTS (SELECT 1 FROM capture_outbox o
                 WHERE o.profile_key=s.profile_key AND o.session_key=s.session_key AND o.state IN ('pending','sent'))
+            AND (s.flush_requested=1 OR ?2=0 OR EXISTS (SELECT 1 FROM capture_outbox o
+                WHERE o.profile_key=s.profile_key AND o.session_key=s.session_key AND o.state='sent')
+                OR (SELECT COALESCE(SUM(length(CAST(content AS BLOB))),0) FROM capture_outbox o
+                WHERE o.profile_key=s.profile_key AND o.session_key=s.session_key AND o.state='pending') >= ?2)
             ORDER BY (SELECT MIN(seq) FROM capture_outbox o WHERE o.profile_key=s.profile_key AND o.session_key=s.session_key AND o.state IN ('pending','sent')) LIMIT 1",
-            [profile], |r| Ok(Session {key:r.get(0)?,agent:r.get(1)?,resource_uri:r.get(2)?,remote_id:r.get(3)?}))
+            params![profile,threshold.min(i64::MAX as u64 / 4) as i64 * 4], |r| Ok(Session {key:r.get(0)?,agent:r.get(1)?,resource_uri:r.get(2)?,remote_id:r.get(3)?,peer_id:r.get(4)?}))
             .optional().map_err(|e| e.to_string())?;
         if let Some(s) = &session {
             tx.execute("UPDATE capture_sessions SET state='sending',claimed_at=?3 WHERE profile_key=?1 AND session_key=?2",
@@ -202,12 +216,21 @@ pub async fn refresh_extraction_tasks(db: &DesktopDb, client: &OvClient) -> Resu
 }
 
 pub async fn sync_capture(db: &DesktopDb, client: &OvClient) -> Result<usize,String> {
+    sync_capture_at_threshold(db,client,0).await
+}
+
+pub async fn sync_capture_at_threshold(db: &DesktopDb, client: &OvClient, threshold: u64) -> Result<usize,String> {
     let profile = client.profile_key();
     let mut committed = 0;
-    while let Some(session) = db.claim_capture(&profile)? {
+    while let Some(session) = db.claim_capture(&profile,threshold)? {
         let remote = match session.remote_id {
             Some(id) => id,
-            None => match client.create_session(json!({"session_id":session.key})).await {
+            None => {
+                let mut config = json!({"session_id":session.key,"auto_commit_policy":null});
+                if session.peer_id.is_some() {
+                    config["memory_policy"] = json!({"self":{"enabled":false},"peer":{"enabled":true}});
+                }
+                match client.create_session(config).await {
                 Ok(result) => {
                     let Some(id) = text(&result,&["session_id","id"]) else {
                         db.capture_state(&profile,&session.key,"unknown",Some("Session creation returned no ID"))?;
@@ -221,10 +244,11 @@ pub async fn sync_capture(db: &DesktopDb, client: &OvClient) -> Result<usize,Str
                     db.capture_state(&profile,&session.key,if retryable(&error) {"idle"} else {"unknown"},Some("Session creation failed"))?;
                     return Err(error.to_string());
                 }
+                }
             }
         };
         for (seq,role,content) in db.capture_rows(&profile,&session.key)? {
-            if let Err(error) = client.add_session_message(&remote,&role,&content).await {
+            if let Err(error) = client.add_session_message_for_peer(&remote,&role,&content,session.peer_id.as_deref()).await {
                 db.capture_state(&profile,&session.key,if retryable(&error) {"idle"} else {"unknown"},Some("Message delivery failed"))?;
                 return Err(error.to_string());
             }
@@ -241,7 +265,9 @@ pub async fn sync_capture(db: &DesktopDb, client: &OvClient) -> Result<usize,Str
                     tx.execute("INSERT OR IGNORE INTO capture_tasks(profile_key,task_id) VALUES (?1,?2)",
                         params![profile,task_id]).map_err(|e| e.to_string())?;
                 }
-                tx.execute("UPDATE capture_sessions SET state='idle',last_error=NULL,task_id=?3 WHERE profile_key=?1 AND session_key=?2",
+                tx.execute("UPDATE capture_sessions SET state='idle',last_error=NULL,task_id=?3,
+                    flush_requested=CASE WHEN EXISTS (SELECT 1 FROM capture_outbox o WHERE o.profile_key=?1 AND o.session_key=?2 AND o.state='pending') THEN flush_requested ELSE 0 END
+                    WHERE profile_key=?1 AND session_key=?2",
                     params![profile,session.key,task]).map_err(|e| e.to_string())?;
                 tx.commit().map_err(|e| e.to_string())?;
                 drop(conn);

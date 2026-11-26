@@ -171,6 +171,14 @@ pub fn project_identity(remote: &str) -> Option<String> {
     Some(format!("{slug}__{}", &sha256_hex(&canonical)[..12]))
 }
 
+/// The mapped resource root defines a shared project peer, independent of the agent.
+pub fn project_peer(route: &ResolvedRoute) -> Option<String> {
+    if route.is_fallback_inbox || route.target_resource_uri.is_empty() {
+        return None;
+    }
+    Some(format!("project-{}", &sha256_hex(route.target_resource_uri.trim_end_matches('/'))[..24]))
+}
+
 pub fn parse_repo_slug(remote: &str) -> Option<String> {
     let trimmed = remote.trim().trim_end_matches('/').trim_end_matches(".git");
     let last = trimmed.rsplit(['/', ':']).next()?;
@@ -267,6 +275,8 @@ mod tests {
             Some("viking://agent/codex/memories/")
         );
         assert_eq!(route.target_memory_uri, USER_MEMORIES_URI);
+        let other = resolve_route_for_agent(&policy, dir.path(), Some(AgentId::ClaudeCode));
+        assert_eq!(project_peer(&route), project_peer(&other));
         assert!(!route.is_fallback_inbox);
     }
 }

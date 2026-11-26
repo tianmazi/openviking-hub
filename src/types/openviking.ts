@@ -86,6 +86,7 @@ export interface PolicyConfig {
   schema_version: number;
   global: {
     capture_enabled: boolean;
+    capture_commit_tokens: number;
     active_profile: string;
     default_visibility: VisibilityScope;
   };
