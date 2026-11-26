@@ -7,6 +7,7 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DreamingRun {
@@ -23,7 +24,7 @@ pub struct DreamingRun {
 pub struct RecallEvent {
     pub id: String,
     pub agent_id: String,
-    pub event_type: String, // "recall" | "capture" | "hook_start" | "hook_stop"
+    pub event_type: String,
     pub query: Option<String>,
     pub target_uri: Option<String>,
     pub layer: Option<String>,
@@ -41,8 +42,9 @@ pub struct UriHitStat {
     pub agents: Vec<String>,
 }
 
+/// Thread-safe (`Send + Sync`) SQLite wrapper for OpenViking Desktop local state.
 pub struct DesktopDb {
-    conn: Connection,
+    conn: Mutex<Connection>,
 }
 
 impl DesktopDb {
@@ -57,92 +59,102 @@ impl DesktopDb {
 
     pub fn open(path: &Path) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
-        let db = Self { conn };
+        let db = Self {
+            conn: Mutex::new(conn),
+        };
         db.init_schema()?;
         Ok(db)
     }
 
     pub fn open_in_memory() -> Result<Self, String> {
         let conn = Connection::open_in_memory().map_err(|e| e.to_string())?;
-        let db = Self { conn };
+        let db = Self {
+            conn: Mutex::new(conn),
+        };
         db.init_schema()?;
         Ok(db)
     }
 
-    fn init_schema(&self) -> Result<(), String> {
+    fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, String> {
         self.conn
-            .execute_batch(
-                r#"
-                PRAGMA journal_mode = WAL;
-                CREATE TABLE IF NOT EXISTS dreaming_runs (
-                    id TEXT PRIMARY KEY,
-                    trigger_source TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    snapshot_id TEXT,
-                    started_at INTEGER NOT NULL,
-                    finished_at INTEGER,
-                    summary_json TEXT NOT NULL DEFAULT '{}'
-                );
+            .lock()
+            .map_err(|_| "DesktopDb mutex poisoned".to_string())
+    }
 
-                CREATE TABLE IF NOT EXISTS pending_memory_changes (
-                    id TEXT PRIMARY KEY,
-                    run_id TEXT NOT NULL,
-                    snapshot_id TEXT,
-                    action TEXT NOT NULL,
-                    risk_level TEXT NOT NULL DEFAULT 'medium',
-                    target_uri TEXT NOT NULL,
-                    destination_uri TEXT,
-                    category TEXT NOT NULL,
-                    base_hash TEXT,
-                    before_content TEXT,
-                    after_content TEXT,
-                    rationale TEXT NOT NULL,
-                    evidence_json TEXT NOT NULL DEFAULT '{}',
-                    status TEXT NOT NULL DEFAULT 'pending',
-                    created_at INTEGER NOT NULL
-                );
+    fn init_schema(&self) -> Result<(), String> {
+        let conn = self.lock_conn()?;
+        conn.execute_batch(
+            r#"
+            PRAGMA journal_mode = WAL;
+            CREATE TABLE IF NOT EXISTS dreaming_runs (
+                id TEXT PRIMARY KEY,
+                trigger_source TEXT NOT NULL,
+                status TEXT NOT NULL,
+                snapshot_id TEXT,
+                started_at INTEGER NOT NULL,
+                finished_at INTEGER,
+                summary_json TEXT NOT NULL DEFAULT '{}'
+            );
 
-                CREATE TABLE IF NOT EXISTS recall_events (
-                    id TEXT PRIMARY KEY,
-                    agent_id TEXT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    query TEXT,
-                    target_uri TEXT,
-                    layer TEXT,
-                    tokens_used INTEGER NOT NULL DEFAULT 0,
-                    latency_ms INTEGER NOT NULL DEFAULT 0,
-                    blocked_by_privacy INTEGER NOT NULL DEFAULT 0,
-                    created_at INTEGER NOT NULL
-                );
+            CREATE TABLE IF NOT EXISTS pending_memory_changes (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                snapshot_id TEXT,
+                action TEXT NOT NULL,
+                risk_level TEXT NOT NULL DEFAULT 'medium',
+                target_uri TEXT NOT NULL,
+                destination_uri TEXT,
+                category TEXT NOT NULL,
+                base_hash TEXT,
+                before_content TEXT,
+                after_content TEXT,
+                rationale TEXT NOT NULL,
+                evidence_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at INTEGER NOT NULL
+            );
 
-                CREATE TABLE IF NOT EXISTS pinned_uris (
-                    uri TEXT PRIMARY KEY,
-                    created_at INTEGER NOT NULL
-                );
-                "#,
-            )
-            .map_err(|e| e.to_string())
+            CREATE TABLE IF NOT EXISTS recall_events (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                query TEXT,
+                target_uri TEXT,
+                layer TEXT,
+                tokens_used INTEGER NOT NULL DEFAULT 0,
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                blocked_by_privacy INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS pinned_uris (
+                uri TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL
+            );
+            "#,
+        )
+        .map_err(|e| e.to_string())
     }
 
     pub fn record_event(&self, evt: &RecallEvent) -> Result<(), String> {
-        self.conn
-            .execute(
-                "INSERT INTO recall_events (id, agent_id, event_type, query, target_uri, layer, tokens_used, latency_ms, blocked_by_privacy, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    evt.id,
-                    evt.agent_id,
-                    evt.event_type,
-                    evt.query,
-                    evt.target_uri,
-                    evt.layer,
-                    evt.tokens_used,
-                    evt.latency_ms,
-                    if evt.blocked_by_privacy { 1 } else { 0 },
-                    evt.created_at,
-                ],
-            )
-            .map_err(|e| e.to_string())?;
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO recall_events (id, agent_id, event_type, query, target_uri, layer, tokens_used, latency_ms, blocked_by_privacy, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                evt.id,
+                evt.agent_id,
+                evt.event_type,
+                evt.query,
+                evt.target_uri,
+                evt.layer,
+                evt.tokens_used,
+                evt.latency_ms,
+                if evt.blocked_by_privacy { 1 } else { 0 },
+                evt.created_at,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -151,10 +163,10 @@ impl DesktopDb {
         agent_filter: Option<&str>,
         limit: usize,
     ) -> Result<Vec<RecallEvent>, String> {
+        let conn = self.lock_conn()?;
         let mut results = Vec::new();
         if let Some(agent) = agent_filter {
-            let mut stmt = self
-                .conn
+            let mut stmt = conn
                 .prepare(
                     "SELECT id, agent_id, event_type, query, target_uri, layer, tokens_used, latency_ms, blocked_by_privacy, created_at
                      FROM recall_events WHERE agent_id = ?1 ORDER BY created_at DESC LIMIT ?2",
@@ -167,8 +179,7 @@ impl DesktopDb {
                 results.push(r.map_err(|e| e.to_string())?);
             }
         } else {
-            let mut stmt = self
-                .conn
+            let mut stmt = conn
                 .prepare(
                     "SELECT id, agent_id, event_type, query, target_uri, layer, tokens_used, latency_ms, blocked_by_privacy, created_at
                      FROM recall_events ORDER BY created_at DESC LIMIT ?1",
@@ -185,8 +196,8 @@ impl DesktopDb {
     }
 
     pub fn hit_stats_by_uri(&self) -> Result<HashMap<String, UriHitStat>, String> {
-        let mut stmt = self
-            .conn
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
             .prepare(
                 "SELECT target_uri, COUNT(*), MAX(created_at), GROUP_CONCAT(DISTINCT agent_id)
                  FROM recall_events WHERE target_uri IS NOT NULL AND event_type = 'recall'
@@ -222,14 +233,14 @@ impl DesktopDb {
     }
 
     pub fn create_run(&self, id: &str, trigger_source: &str) -> Result<DreamingRun, String> {
+        let conn = self.lock_conn()?;
         let now = Utc::now().timestamp();
-        self.conn
-            .execute(
-                "INSERT INTO dreaming_runs (id, trigger_source, status, started_at, summary_json)
-                 VALUES (?1, ?2, 'running', ?3, '{}')",
-                params![id, trigger_source, now],
-            )
-            .map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO dreaming_runs (id, trigger_source, status, started_at, summary_json)
+             VALUES (?1, ?2, 'running', ?3, '{}')",
+            params![id, trigger_source, now],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(DreamingRun {
             id: id.to_string(),
             trigger_source: trigger_source.to_string(),
@@ -248,24 +259,24 @@ impl DesktopDb {
         snapshot_id: Option<&str>,
         summary_json: Option<&str>,
     ) -> Result<(), String> {
+        let conn = self.lock_conn()?;
         let now = Utc::now().timestamp();
-        self.conn
-            .execute(
-                "UPDATE dreaming_runs
-                 SET status = ?1,
-                     snapshot_id = COALESCE(?2, snapshot_id),
-                     summary_json = COALESCE(?3, summary_json),
-                     finished_at = ?4
-                 WHERE id = ?5",
-                params![status, snapshot_id, summary_json, now, run_id],
-            )
-            .map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE dreaming_runs
+             SET status = ?1,
+                 snapshot_id = COALESCE(?2, snapshot_id),
+                 summary_json = COALESCE(?3, summary_json),
+                 finished_at = ?4
+             WHERE id = ?5",
+            params![status, snapshot_id, summary_json, now, run_id],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
     pub fn list_runs(&self, limit: usize) -> Result<Vec<DreamingRun>, String> {
-        let mut stmt = self
-            .conn
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
             .prepare(
                 "SELECT id, trigger_source, status, snapshot_id, started_at, finished_at, summary_json
                  FROM dreaming_runs ORDER BY started_at DESC LIMIT ?1",
@@ -292,8 +303,8 @@ impl DesktopDb {
     }
 
     pub fn get_run(&self, run_id: &str) -> Result<Option<DreamingRun>, String> {
-        let mut stmt = self
-            .conn
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
             .prepare(
                 "SELECT id, trigger_source, status, snapshot_id, started_at, finished_at, summary_json
                  FROM dreaming_runs WHERE id = ?1",
@@ -320,34 +331,40 @@ impl DesktopDb {
     }
 
     pub fn insert_pending_change(&self, c: &PendingMemoryChange) -> Result<(), String> {
-        let action = serde_json::to_string(&c.action).unwrap().trim_matches('"').to_string();
-        let risk = serde_json::to_string(&c.risk_level).unwrap().trim_matches('"').to_string();
+        let conn = self.lock_conn()?;
+        let action = serde_json::to_string(&c.action)
+            .unwrap()
+            .trim_matches('"')
+            .to_string();
+        let risk = serde_json::to_string(&c.risk_level)
+            .unwrap()
+            .trim_matches('"')
+            .to_string();
         let category = c.category.as_str();
         let status = c.status.as_str();
-        self.conn
-            .execute(
-                "INSERT INTO pending_memory_changes
-                 (id, run_id, snapshot_id, action, risk_level, target_uri, destination_uri, category, base_hash, before_content, after_content, rationale, evidence_json, status, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-                params![
-                    c.id,
-                    c.run_id,
-                    c.snapshot_id,
-                    action,
-                    risk,
-                    c.target_uri,
-                    c.destination_uri,
-                    category,
-                    c.base_hash,
-                    c.before_content,
-                    c.after_content,
-                    c.rationale,
-                    c.evidence_json,
-                    status,
-                    c.created_at
-                ],
-            )
-            .map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO pending_memory_changes
+             (id, run_id, snapshot_id, action, risk_level, target_uri, destination_uri, category, base_hash, before_content, after_content, rationale, evidence_json, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                c.id,
+                c.run_id,
+                c.snapshot_id,
+                action,
+                risk,
+                c.target_uri,
+                c.destination_uri,
+                category,
+                c.base_hash,
+                c.before_content,
+                c.after_content,
+                c.rationale,
+                c.evidence_json,
+                status,
+                c.created_at
+            ],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -355,6 +372,7 @@ impl DesktopDb {
         &self,
         status_filter: Option<&str>,
     ) -> Result<Vec<PendingMemoryChange>, String> {
+        let conn = self.lock_conn()?;
         let sql = if status_filter.is_some() {
             "SELECT id, run_id, snapshot_id, action, risk_level, target_uri, destination_uri, category, base_hash, before_content, after_content, rationale, evidence_json, status, created_at
              FROM pending_memory_changes WHERE status = ?1 ORDER BY created_at DESC"
@@ -362,7 +380,7 @@ impl DesktopDb {
             "SELECT id, run_id, snapshot_id, action, risk_level, target_uri, destination_uri, category, base_hash, before_content, after_content, rationale, evidence_json, status, created_at
              FROM pending_memory_changes ORDER BY created_at DESC"
         };
-        let mut stmt = self.conn.prepare(sql).map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
         let mut out = Vec::new();
         if let Some(st) = status_filter {
             let rows = stmt
@@ -388,20 +406,19 @@ impl DesktopDb {
         status: ReviewStatus,
         edited_after_content: Option<&str>,
     ) -> Result<(), String> {
+        let conn = self.lock_conn()?;
         if let Some(after) = edited_after_content {
-            self.conn
-                .execute(
-                    "UPDATE pending_memory_changes SET status = ?1, after_content = ?2 WHERE id = ?3",
-                    params![status.as_str(), after, id],
-                )
-                .map_err(|e| e.to_string())?;
+            conn.execute(
+                "UPDATE pending_memory_changes SET status = ?1, after_content = ?2 WHERE id = ?3",
+                params![status.as_str(), after, id],
+            )
+            .map_err(|e| e.to_string())?;
         } else {
-            self.conn
-                .execute(
-                    "UPDATE pending_memory_changes SET status = ?1 WHERE id = ?2",
-                    params![status.as_str(), id],
-                )
-                .map_err(|e| e.to_string())?;
+            conn.execute(
+                "UPDATE pending_memory_changes SET status = ?1 WHERE id = ?2",
+                params![status.as_str(), id],
+            )
+            .map_err(|e| e.to_string())?;
         }
         Ok(())
     }
@@ -412,29 +429,29 @@ impl DesktopDb {
         snapshot_id: Option<&str>,
         status: ReviewStatus,
     ) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE pending_memory_changes SET status = ?1, snapshot_id = ?2 WHERE id = ?3",
-                params![status.as_str(), snapshot_id, id],
-            )
-            .map_err(|e| e.to_string())?;
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE pending_memory_changes SET status = ?1, snapshot_id = ?2 WHERE id = ?3",
+            params![status.as_str(), snapshot_id, id],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
     pub fn pin_uri(&self, uri: &str) -> Result<(), String> {
+        let conn = self.lock_conn()?;
         let now = Utc::now().timestamp();
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO pinned_uris (uri, created_at) VALUES (?1, ?2)",
-                params![uri, now],
-            )
-            .map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT OR REPLACE INTO pinned_uris (uri, created_at) VALUES (?1, ?2)",
+            params![uri, now],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
     pub fn is_pinned(&self, uri: &str) -> Result<bool, String> {
-        let count: i64 = self
-            .conn
+        let conn = self.lock_conn()?;
+        let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pinned_uris WHERE uri = ?1",
                 params![uri],
@@ -498,6 +515,13 @@ fn map_change_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingMemoryChan
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn test_desktop_db_is_send_sync() {
+        assert_send_sync::<DesktopDb>();
+    }
 
     #[test]
     fn test_sqlite_dreaming_lifecycle() {
