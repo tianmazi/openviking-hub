@@ -81,7 +81,14 @@ pub async fn run_dreaming(
 
     // Analyzer 2 & 3: Semantic Conflict/Dedupe Merger + Hot Promote + Cold Archival
     let mut seen_merge_pairs: HashSet<(String, String)> = HashSet::new();
-    if let Ok(mem_tree) = client.tree("viking://user/memories/").await {
+    let (mem_root, mem_tree_res) = match client.tree("viking://~/memories/").await {
+        Ok(tree) => ("viking://~/memories/", Ok(tree)),
+        Err(_) => (
+            "viking://user/memories/",
+            client.tree("viking://user/memories/").await,
+        ),
+    };
+    if let Ok(mem_tree) = mem_tree_res {
         for uri in extract_uri_entries(&mem_tree) {
             if is_protected_rule_path(policy, &uri) || db.is_pinned(&uri)? {
                 continue;
@@ -175,7 +182,7 @@ pub async fn run_dreaming(
                 if let Some(content) = read_text_safely(client, &uri).await {
                     let snippet: String = content.chars().take(240).collect();
                     if snippet.trim().len() >= 20 {
-                        let scope = format!("viking://user/memories/{}/", category.as_str());
+                        let scope = format!("{}{}/", mem_root, category.as_str());
                         if let Ok(found) = client
                             .find(&FindRequest {
                                 query: snippet,
@@ -442,12 +449,18 @@ fn extract_uri_entries(val: &Value) -> Vec<String> {
 }
 
 fn extract_scored_uris(val: &Value) -> Vec<(String, f64)> {
+    let mut slices: Vec<&[Value]> = Vec::new();
+    if let Some(items) = val.as_array() {
+        slices.push(items);
+    } else {
+        for key in ["items", "results", "memories", "resources", "skills"] {
+            if let Some(items) = val.get(key).and_then(|i| i.as_array()) {
+                slices.push(items);
+            }
+        }
+    }
     let mut out = Vec::new();
-    let arr = val
-        .as_array()
-        .or_else(|| val.get("items").and_then(|i| i.as_array()))
-        .or_else(|| val.get("results").and_then(|i| i.as_array()));
-    if let Some(items) = arr {
+    for items in slices {
         for item in items {
             let uri = item.get("uri").and_then(|u| u.as_str());
             let score = item

@@ -67,6 +67,20 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
       - name: Build ov-bridge sidecar
         run: cargo build --release -p ov-bridge ${{ matrix.args }}
+      - name: Stage ov-bridge sidecar for Tauri externalBin
+        shell: bash
+        run: |
+          TRIPLE="${{ matrix.target }}"
+          if [ -z "$TRIPLE" ]; then
+            TRIPLE="$(rustc -vV | awk '/^host:/ {print $2}')"
+            SRC_DIR="target/release"
+          else
+            SRC_DIR="target/${TRIPLE}/release"
+          fi
+          EXT=""
+          if [[ "$TRIPLE" == *windows* ]]; then EXT=".exe"; fi
+          mkdir -p src-tauri/binaries
+          cp "${SRC_DIR}/ov-bridge${EXT}" "src-tauri/binaries/ov-bridge-${TRIPLE}${EXT}"
       - name: Install frontend deps
         run: npm ci
       - name: Build Tauri v2 bundle & publish release

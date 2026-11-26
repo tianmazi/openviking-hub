@@ -4,7 +4,7 @@ import { api } from "../lib/tauri";
 import type { ContextLayer, LayeredContent } from "../types/openviking";
 
 const ROOT_SCOPES = [
-  { label: "用户共享记忆", uri: "viking://user/memories/" },
+  { label: "用户共享记忆", uri: "viking://~/memories/" },
   { label: "项目知识库", uri: "viking://resources/projects/" },
   { label: "Inbox 待分拣区", uri: "viking://~/resources/inbox/" },
 ];

@@ -313,22 +313,30 @@ async fn handle_tool_call(agent: AgentId, params: &Value) -> Result<String, Stri
 }
 
 fn extract_top_hit(val: &Value) -> Option<(String, f64)> {
-    let arr = val
-        .as_array()
-        .or_else(|| val.get("items").and_then(|i| i.as_array()))
-        .or_else(|| val.get("results").and_then(|i| i.as_array()))?;
+    let mut slices: Vec<&[Value]> = Vec::new();
+    if let Some(items) = val.as_array() {
+        slices.push(items);
+    } else {
+        for key in ["items", "results", "memories", "resources", "skills"] {
+            if let Some(items) = val.get(key).and_then(|i| i.as_array()) {
+                slices.push(items);
+            }
+        }
+    }
     let mut best: Option<(String, f64)> = None;
-    for item in arr {
-        let Some(uri) = item.get("uri").and_then(|u| u.as_str()) else {
-            continue;
-        };
-        let score = item
-            .get("score")
-            .or_else(|| item.get("similarity"))
-            .and_then(|s| s.as_f64())
-            .unwrap_or(0.0);
-        if best.as_ref().map(|(_, s)| score > *s).unwrap_or(true) {
-            best = Some((uri.to_string(), score));
+    for items in slices {
+        for item in items {
+            let Some(uri) = item.get("uri").and_then(|u| u.as_str()) else {
+                continue;
+            };
+            let score = item
+                .get("score")
+                .or_else(|| item.get("similarity"))
+                .and_then(|s| s.as_f64())
+                .unwrap_or(0.0);
+            if best.as_ref().map(|(_, s)| score > *s).unwrap_or(true) {
+                best = Some((uri.to_string(), score));
+            }
         }
     }
     best

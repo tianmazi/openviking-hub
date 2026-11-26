@@ -65,19 +65,23 @@ impl PlatformPaths {
     }
 
     /// Ensure the bundled `ov-bridge` sidecar binary is installed into `~/.openviking/bin/`
-    /// with executable permissions on Unix. Safe no-op if no bundled binary is adjacent.
+    /// with executable permissions on Unix. Returns an error if neither a bundled source nor
+    /// an already-installed binary exists.
     pub fn ensure_bridge_installed(&self, explicit_source: Option<&Path>) -> Result<PathBuf, String> {
         let dest = self.bridge_binary();
         let source = explicit_source
             .map(PathBuf::from)
             .or_else(find_bundled_bridge_binary);
 
-        let Some(src) = source else {
-            return Ok(dest);
+        let Some(src) = source.filter(|p| p.is_file()) else {
+            if dest.is_file() {
+                return Ok(dest);
+            }
+            return Err(format!(
+                "ov-bridge binary not found (expected bundled sidecar or existing {})",
+                dest.display()
+            ));
         };
-        if !src.is_file() {
-            return Ok(dest);
-        }
 
         let needs_copy = match (fs::metadata(&src), fs::metadata(&dest)) {
             (Ok(sm), Ok(dm)) => sm.len() != dm.len(),
@@ -209,6 +213,11 @@ fn find_bundled_bridge_binary() -> Option<PathBuf> {
     let direct = dir.join(bin_name);
     if direct.is_file() {
         return Some(direct);
+    }
+    if let Some(release_sibling) = dir.parent().map(|p| p.join("release").join(bin_name)) {
+        if release_sibling.is_file() {
+            return Some(release_sibling);
+        }
     }
     None
 }

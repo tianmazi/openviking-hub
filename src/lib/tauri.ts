@@ -364,25 +364,36 @@ export const api = {
   ): Promise<Array<{ name: string; uri: string; isDir?: boolean; size?: number }>> {
     if (isTauriRuntime()) {
       const res = await callTauri<unknown>("fs_ls", { uri });
-      return Array.isArray(res) ? res : [];
+      const items = Array.isArray(res) ? res : [];
+      return items.map((item: { name?: string; uri?: string; isDir?: boolean; size?: number }) => {
+        const itemUri = item.uri ?? "";
+        const derivedName =
+          item.name ?? (itemUri.replace(/\/+$/, "").split("/").pop() || itemUri);
+        return {
+          name: item.isDir && !derivedName.endsWith("/") ? `${derivedName}/` : derivedName,
+          uri: itemUri,
+          isDir: item.isDir,
+          size: item.size,
+        };
+      });
     }
-    if (uri === "viking://user/memories/") {
+    if (uri === "viking://~/memories/" || uri === "viking://user/memories/") {
       return [
         {
           name: "preferences/git-commit.md",
-          uri: "viking://user/memories/preferences/git-commit.md",
+          uri: "viking://~/memories/preferences/git-commit.md",
           isDir: false,
           size: 412,
         },
         {
           name: "profile/coding-style.md",
-          uri: "viking://user/memories/profile/coding-style.md",
+          uri: "viking://~/memories/profile/coding-style.md",
           isDir: false,
           size: 680,
         },
         {
           name: "entities/openviking-cluster.md",
-          uri: "viking://user/memories/entities/openviking-cluster.md",
+          uri: "viking://~/memories/entities/openviking-cluster.md",
           isDir: false,
           size: 520,
         },
@@ -428,7 +439,16 @@ export const api = {
         targetUri: targetUri ?? null,
         limit: 20,
       });
-      const arr = Array.isArray(res) ? res : [];
+      const rec = (res && typeof res === "object" ? res : {}) as Record<string, unknown>;
+      const arr = Array.isArray(res)
+        ? res
+        : [
+            ...(Array.isArray(rec.items) ? rec.items : []),
+            ...(Array.isArray(rec.results) ? rec.results : []),
+            ...(Array.isArray(rec.memories) ? rec.memories : []),
+            ...(Array.isArray(rec.resources) ? rec.resources : []),
+            ...(Array.isArray(rec.skills) ? rec.skills : []),
+          ];
       return arr.map((item: { uri?: string; name?: string }) => ({
         name: item.name ?? item.uri?.split("/").pop() ?? "result",
         uri: item.uri ?? "",

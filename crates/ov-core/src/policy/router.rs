@@ -4,6 +4,8 @@ use globset::{Glob, GlobSetBuilder};
 use std::fs;
 use std::path::Path;
 
+pub const USER_MEMORIES_URI: &str = "viking://~/memories/";
+
 /// Resolve the target OpenViking resource and memory URIs for a given working directory.
 /// Precedence:
 /// 1. Project-local `RESOURCE_POLICY.md` (`resource_uri: viking://...`)
@@ -16,7 +18,7 @@ pub fn resolve_route(policy: &PolicyConfig, cwd: &Path) -> ResolvedRoute {
         if let Some((uri, slug)) = read_project_policy_uri(cwd) {
             return ResolvedRoute {
                 target_resource_uri: uri,
-                target_memory_uri: "viking://user/memories/".to_string(),
+                target_memory_uri: USER_MEMORIES_URI.to_string(),
                 matched_source: RouteMatchSource::ProjectPolicyFile,
                 is_fallback_inbox: false,
                 project_slug: slug,
@@ -40,7 +42,7 @@ pub fn resolve_route(policy: &PolicyConfig, cwd: &Path) -> ResolvedRoute {
                 .map(|s| s.to_string());
             return ResolvedRoute {
                 target_resource_uri: mapping.resource_uri.clone(),
-                target_memory_uri: "viking://user/memories/".to_string(),
+                target_memory_uri: USER_MEMORIES_URI.to_string(),
                 matched_source: RouteMatchSource::ManualMapping,
                 is_fallback_inbox: false,
                 project_slug: slug,
@@ -54,7 +56,7 @@ pub fn resolve_route(policy: &PolicyConfig, cwd: &Path) -> ResolvedRoute {
             let prefix = policy.global.default_visibility.resources_prefix();
             return ResolvedRoute {
                 target_resource_uri: format!("{}/projects/{}/", prefix, repo_slug),
-                target_memory_uri: "viking://user/memories/".to_string(),
+                target_memory_uri: USER_MEMORIES_URI.to_string(),
                 matched_source: RouteMatchSource::GitRemoteAuto,
                 is_fallback_inbox: false,
                 project_slug: Some(repo_slug),
@@ -65,7 +67,7 @@ pub fn resolve_route(policy: &PolicyConfig, cwd: &Path) -> ResolvedRoute {
     // 4. Fallback to inbox
     ResolvedRoute {
         target_resource_uri: policy.routing.inbox_uri.clone(),
-        target_memory_uri: "viking://user/memories/".to_string(),
+        target_memory_uri: USER_MEMORIES_URI.to_string(),
         matched_source: RouteMatchSource::InboxFallback,
         is_fallback_inbox: true,
         project_slug: None,

@@ -114,8 +114,8 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                         json!({
                             "status": "ok",
                             "result": {
-                                "items": [
-                                    { "uri": "viking://user/memories/preferences/git.md", "score": 0.92, "snippet": "Use Conventional Commits" }
+                                "memories": [
+                                    { "uri": "viking://~/memories/preferences/git.md", "score": 0.92, "snippet": "Use Conventional Commits" }
                                 ]
                             }
                         })
@@ -124,8 +124,8 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                         json!({
                             "status": "ok",
                             "result": {
-                                "items": [
-                                    { "uri": "viking://user/memories/preferences/git-old.md", "score": 0.89 }
+                                "memories": [
+                                    { "uri": "viking://~/memories/preferences/git-old.md", "score": 0.89 }
                                 ]
                             }
                         })
@@ -172,11 +172,11 @@ async fn e2e_ov_bridge_mcp_and_dreaming_pipeline() {
             "# Scratch note\nAuth token header notes".to_string(),
         );
         guard.files.insert(
-            "viking://user/memories/preferences/git.md".to_string(),
+            "viking://~/memories/preferences/git.md".to_string(),
             "# Git Commit Style\nAlways use English Conventional Commits for clarity.".to_string(),
         );
         guard.files.insert(
-            "viking://user/memories/preferences/git-old.md".to_string(),
+            "viking://~/memories/preferences/git-old.md".to_string(),
             "# Git Commit Style\nAlways use English Conventional Commits for clarity.\nExtra legacy line.".to_string(),
         );
         guard.files.insert(
@@ -255,7 +255,7 @@ async fn e2e_ov_bridge_mcp_and_dreaming_pipeline() {
                 "method": "tools/call",
                 "params": {
                     "name": "remember",
-                    "arguments": { "uri": "viking://user/memories/preferences/editor.md", "content": "Prefer Rust + Tauri" }
+                    "arguments": { "uri": "viking://~/memories/preferences/editor.md", "content": "Prefer Rust + Tauri" }
                 }
             })
         )
@@ -288,7 +288,7 @@ async fn e2e_ov_bridge_mcp_and_dreaming_pipeline() {
         .lock()
         .unwrap()
         .files
-        .contains_key("viking://user/memories/preferences/editor.md"));
+        .contains_key("viking://~/memories/preferences/editor.md"));
 
     // 2. Full Dreaming Stage-then-Commit + Optimistic Lock + Snapshot Rollback E2E
     let client = OvClient::new(&OvCliConfig {
@@ -308,7 +308,7 @@ async fn e2e_ov_bridge_mcp_and_dreaming_pipeline() {
 
     // Simulate concurrent remote drift on git.md before apply
     state.lock().unwrap().files.insert(
-        "viking://user/memories/preferences/git.md".to_string(),
+        "viking://~/memories/preferences/git.md".to_string(),
         "# Modified concurrently by another agent!".to_string(),
     );
 
