@@ -2,7 +2,7 @@
 
 跨平台（**macOS / Windows（含 WSL）/ Linux**）的 **OpenViking** 本地桌面控制平面、零依赖 MCP/Hooks 桥接引擎与 **Dreaming 记忆治理控制台**，基于 **Tauri v2 + Rust 3-Crate Workspace + React/TypeScript/Tailwind CSS** 构建。
 
-详细架构与 [OpenViking 官方 HTTP API](https://docs.openviking.ai/en/api/01-overview) 对齐规范请参见 [docs/DESIGN.md](docs/DESIGN.md)。
+完整使用手册请参见 [docs/USER_GUIDE.md](docs/USER_GUIDE.md)，详细架构与 [OpenViking 官方 HTTP API](https://docs.openviking.ai/en/api/01-overview) 对齐规范请参见 [docs/DESIGN.md](docs/DESIGN.md)。
 
 ## 核心特性
 
