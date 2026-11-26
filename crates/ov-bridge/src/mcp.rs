@@ -188,7 +188,7 @@ pub(crate) async fn call_tool(
             let target_uri = (!target_uri.is_empty()).then_some(target_uri);
             let limit = args.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
 
-            let res = if let Some(uri) = &target_uri {
+            let candidates = if let Some(uri) = &target_uri {
                 find_scopes(client, query, uri, peer.as_deref(), limit).await
             } else {
                 client
@@ -198,12 +198,11 @@ pub(crate) async fn call_tool(
                         mode: Some("context".to_string()),
                         limit,
                     })
-                    .await
+                    .await.map(parse_candidates)
             }
             .map_err(|e| e.to_string())?;
 
-            let top_hit = extract_top_hit(&res);
-            let (text, layer, hits) = render_recall(client, &res, &budget).await;
+            let (text, layer, hits) = render_recall(client, candidates, &budget).await;
             let wrapped = wrap_ifc_readonly(
                 &text,
                 &format!("recall:{}", agent.as_str()),
@@ -217,15 +216,17 @@ pub(crate) async fn call_tool(
                     agent_id: agent.as_str().to_string(),
                     event_type: "recall".to_string(),
                     query: Some(query.to_string()),
-                    target_uri: top_hit.map(|(uri, _)| uri),
+                    target_uri: hits.iter().find(|(_,_,injected)| *injected).map(|(uri,_,_)| uri.clone()),
                     layer: Some(layer),
                     tokens_used: approx_tokens,
                     latency_ms: start.elapsed().as_millis() as i64,
                     blocked_by_privacy: false,
                     created_at: Utc::now().timestamp(),
                 };
-                let _ = db.record_event_for_profile(&client.profile_key(), &evt);
-                let _ = db.record_recall_hits(&evt.id, &hits);
+                if let Err(error) = db.record_event_for_profile(&client.profile_key(), &evt)
+                    .and_then(|_| db.record_recall_hits(&evt.id, &hits)) {
+                    eprintln!("OpenViking recall telemetry: {error}");
+                }
             }
             Ok(wrapped)
         }
@@ -365,92 +366,71 @@ pub(crate) async fn call_tool(
     }
 }
 
-/// Retrieve project resources and native peer memories concurrently, retaining
-/// the primary result if the peer has not been indexed yet.
+#[derive(Debug)]
+pub(crate) struct RecallCandidate {
+    uri: String,
+    score: f64,
+    record: String,
+}
+
+/// Parse each response once; combine scopes before ranking and deduplicating.
+fn parse_candidates(value: Value) -> Vec<RecallCandidate> {
+    let items: Vec<&Value> = if let Some(array) = value.as_array() {
+        array.iter().collect()
+    } else {
+        ["items","results","entries","memories","resources","skills"].iter()
+            .filter_map(|key| value.get(*key).and_then(Value::as_array))
+            .flatten().collect()
+    };
+    items.into_iter().filter_map(|item| {
+        let uri = item["uri"].as_str().filter(|uri| !uri.is_empty())?.to_owned();
+        let score = item.get("score").or_else(||item.get("similarity")).and_then(Value::as_f64).unwrap_or(0.0);
+        Some(RecallCandidate {uri, score, record:item.to_string()})
+    }).collect()
+}
+
 pub(crate) async fn find_scopes(client: &OvClient, query: &str, resource: &str,
-    peer: Option<&str>, limit: Option<usize>) -> Result<Value, ov_core::ov_client::OvClientError> {
+    peer: Option<&str>, limit: Option<usize>) -> Result<Vec<RecallCandidate>, ov_core::ov_client::OvClientError> {
     let primary = FindRequest {query:query.to_owned(), target_uri:(!resource.is_empty()).then(||resource.to_owned()),limit};
-    let Some(peer) = peer else {return client.find(&primary).await;};
+    let Some(peer) = peer else {return client.find(&primary).await.map(parse_candidates);};
     let memory = FindRequest {query:query.to_owned(),target_uri:Some(format!("viking://~/peers/{peer}/memories/")),limit};
     let (a,b) = tokio::join!(client.find(&primary),client.find(&memory));
     match (a,b) {
-        (Ok(a),Ok(b)) => Ok(Value::Array(search_items(&a).into_iter().chain(search_items(&b)).cloned().collect())),
-        (Ok(a),Err(_)) => Ok(a),
-        (Err(_),Ok(b)) => Ok(b),
+        (Ok(a),Ok(b)) => {
+            let mut candidates = parse_candidates(a);
+            candidates.extend(parse_candidates(b));
+            Ok(candidates)
+        }
+        (Ok(a),Err(_)) => {eprintln!("OpenViking peer recall failed"); Ok(parse_candidates(a))}
+        (Err(_),Ok(b)) => {eprintln!("OpenViking resource recall failed"); Ok(parse_candidates(b))}
         (Err(a),Err(_)) => Err(a),
     }
 }
 
-fn search_items(val: &Value) -> Vec<&Value> {
-    let mut items = Vec::new();
-    if let Some(array) = val.as_array() {
-        items.extend(array);
-    } else {
-        for key in ["items", "results", "entries", "memories", "resources", "skills"] {
-            if let Some(array) = val.get(key).and_then(Value::as_array) {
-                items.extend(array);
-            }
-        }
-    }
-    items.retain(|item| item["uri"].as_str().is_some_and(|uri| !uri.is_empty()));
-    items.sort_by(|a,b| score(b).total_cmp(&score(a)));
-    items
+fn rank_candidates(mut candidates: Vec<RecallCandidate>) -> Vec<RecallCandidate> {
+    candidates.sort_by(|a,b| b.score.total_cmp(&a.score));
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|item| seen.insert(item.uri.clone()));
+    candidates
 }
 
-fn recall_version(item: &Value) -> String {
-    let mut stable = item.clone();
-    if let Some(fields) = stable.as_object_mut() {
-        for field in ["score", "similarity", "rank"] { fields.remove(field); }
-    }
-    ov_core::fs_util::sha256_hex(&stable.to_string())
-}
-
-pub(crate) fn unseen_recall(db: &DesktopDb, session: &str, result: &Value) -> Value {
-    Value::Array(search_items(result).into_iter().filter(|item| {
-        let key = format!("{}:{}", session, ov_core::fs_util::sha256_hex(item["uri"].as_str().unwrap()));
-        db.get_kv(&key).ok().flatten().as_deref() != Some(recall_version(item).as_str())
-    }).cloned().collect())
-}
-
-pub(crate) fn mark_injected(db: &DesktopDb, session: &str, result: &Value, hits: &[(String,f64,bool)]) {
-    for item in search_items(result) {
-        let uri = item["uri"].as_str().unwrap();
-        if hits.iter().any(|(hit,_,injected)| hit == uri && *injected) {
-            let key = format!("{}:{}", session, ov_core::fs_util::sha256_hex(uri));
-            let _ = db.set_kv(&key, &recall_version(item));
-        }
-    }
-}
-
-fn score(item: &Value) -> f64 {
-    item.get("score").or_else(|| item.get("similarity")).and_then(Value::as_f64).unwrap_or(0.0)
-}
-
-pub(crate) fn extract_top_hit(val: &Value) -> Option<(String, f64)> {
-    let items = search_items(val);
-    let item = items.first()?;
-    Some((item["uri"].as_str()?.to_owned(), score(item)))
-}
-
-/// Shared renderer: fit whole candidates and record whether each was injected.
-pub(crate) async fn render_recall(client: &OvClient, result: &Value,
+/// Fit whole candidates. Cross-turn suppression is deliberately avoided:
+/// runtimes may discard injected context after each invocation.
+pub(crate) async fn render_recall(client: &OvClient, candidates: Vec<RecallCandidate>,
     budget: &ov_core::policy::model::EffectiveBudget) -> (String, String, Vec<(String,f64,bool)>) {
     let mut text = String::new();
     let mut layer = "l0".to_owned();
-    let mut hits: Vec<(String,f64,bool)> = Vec::new();
+    let mut hits = Vec::new();
     let max = budget.max_recall_tokens.saturating_mul(4);
-    for item in search_items(result) {
-        let uri = item["uri"].as_str().unwrap();
-        if hits.iter().any(|(prior,_,_)| prior == uri) { continue; }
-        let record = serde_json::to_string(item).unwrap_or_default();
-        let injected = text.len() + record.len() + 1 <= max;
+    for item in rank_candidates(candidates) {
+        let injected = text.len() + item.record.len() + 1 <= max;
         if injected {
-            text.push_str(&record);
+            text.push_str(&item.record);
             text.push('\n');
         }
-        hits.push((uri.to_owned(),score(item),injected));
+        hits.push((item.uri,item.score,injected));
     }
-    if let Some((uri, score, true)) = hits.first() {
+    if let Some((uri, score, _)) = hits.iter().find(|(_,_,injected)| *injected) {
         let selected = if budget.default_recall_layer == ContextLayer::L0 && *score >= budget.auto_expand_l1_threshold as f64 {
             ContextLayer::L1
         } else { budget.default_recall_layer };
@@ -470,40 +450,19 @@ pub(crate) async fn render_recall(client: &OvClient, result: &Value,
 }
 
 #[cfg(test)]
-mod recall_version_tests {
+mod recall_tests {
     use super::*;
 
     #[test]
-    fn session_ledger_only_suppresses_injected_unchanged_hits() {
-        let db = DesktopDb::open_in_memory().unwrap();
-        let result = serde_json::json!([
-            {"uri":"viking://resources/a", "score":0.9, "abstract":"one"},
-            {"uri":"viking://resources/b", "score":0.8, "abstract":"two"}
-        ]);
-        mark_injected(&db, "session", &result, &[("viking://resources/a".into(),0.9,true),("viking://resources/b".into(),0.8,false)]);
-        let changed_score = serde_json::json!([
-            {"uri":"viking://resources/a", "score":0.5, "abstract":"one"},
-            {"uri":"viking://resources/b", "score":0.7, "abstract":"two"}
-        ]);
-        assert_eq!(search_items(&unseen_recall(&db,"session",&changed_score)).len(),1);
-        let changed = serde_json::json!([{"uri":"viking://resources/a","score":0.9,"abstract":"new"}]);
-        assert_eq!(search_items(&unseen_recall(&db,"session",&changed)).len(),1);
-        assert_eq!(search_items(&unseen_recall(&db,"other",&result)).len(),2);
+    fn candidates_rank_once_and_keep_best_duplicate() {
+        let candidates = parse_candidates(json!({"memories":[
+            {"uri":"viking://resources/a", "score":0.5},
+            {"uri":"viking://resources/b", "score":0.8},
+            {"uri":"viking://resources/a", "score":0.9}
+        ]}));
+        let ranked = rank_candidates(candidates);
+        assert_eq!(ranked.len(),2);
+        assert_eq!(ranked[0].uri,"viking://resources/a");
+        assert_eq!(ranked[0].score,0.9);
     }
-}
-
-pub fn truncate_to_token_budget(text: &str, max_tokens: usize) -> String {
-    let max_chars = max_tokens.saturating_mul(4);
-    if text.len() <= max_chars {
-        return text.to_string();
-    }
-    let mut end = max_chars;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!(
-        "{}\n\n[Truncated by OpenViking Desktop policy budget: {} tokens]",
-        &text[..end],
-        max_tokens
-    )
 }

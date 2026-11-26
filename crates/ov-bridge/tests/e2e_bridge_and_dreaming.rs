@@ -378,7 +378,7 @@ async fn e2e_mcp_recall_and_capture_are_profile_scoped() {
     let other_events = db.list_events_for_profile(&other.profile_key(), None, 10).unwrap();
     assert_eq!(other_events.len(), 1);
     assert_eq!(other_events[0].layer.as_deref(), Some("l0"));
-    assert_eq!(other_events[0].target_uri.as_deref(), Some("viking://resources/projects/demo/README.md"));
+    assert_eq!(other_events[0].target_uri, None);
     assert!(db.hit_stats_by_uri_for_profile(&other.profile_key()).unwrap().is_empty());
     assert!(db.list_events_for_profile("", None, 10).unwrap().is_empty());
 
@@ -747,4 +747,21 @@ async fn e2e_manual_sync_reconciles_append_acknowledgement_loss() {
     assert_eq!(ov_core::capture::sync_capture(&db,&client,0,true).await.unwrap(),1);
     assert_eq!(db.capture_health(&profile).unwrap().uncertain_sessions,0);
     assert_eq!(state.lock().unwrap().session_messages.len(),1);
+}
+
+
+#[tokio::test]
+async fn e2e_short_prompts_and_pi_temporary_context_are_not_suppressed() {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let url = start_mock_openviking_server(state.clone()).await;
+    let client = test_client(&url, "work");
+    let db = DesktopDb::open_in_memory().unwrap();
+    let policy = PolicyConfig::default();
+    let tmp = tempdir().unwrap();
+    std::fs::write(tmp.path().join("RESOURCE_POLICY.md"),"resource_uri: viking://resources/projects/demo\n").unwrap();
+    let input = json!({"cwd":tmp.path(),"session_id":"pi-session","prompt":"继续"});
+    let first = hook::execute_hook("user-prompt-submit",AgentId::Pi,&input,&policy,&client,Some(&db)).await;
+    let second = hook::execute_hook("user-prompt-submit",AgentId::Pi,&input,&policy,&client,Some(&db)).await;
+    assert!(first.contains("viking://resources/projects/demo/README.md"));
+    assert_eq!(first,second);
 }

@@ -1,4 +1,4 @@
-use crate::mcp::{extract_top_hit, find_scopes, mark_injected, render_recall, unseen_recall};
+use crate::mcp::{find_scopes, render_recall};
 use chrono::Utc;
 use ov_core::dreaming::db::{DesktopDb, RecallEvent};
 use ov_core::ov_client::OvClient;
@@ -101,15 +101,6 @@ pub(crate) async fn execute_hook(
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let route = resolve_route_for_agent(policy, &cwd, Some(agent));
     let peer = project_peer(&route);
-    let recall_key = payload_text(payload, &["session_id", "sessionId", "conversationId", "transcript_path", "transcriptPath"])
-        .map(|session| format!("recall:{}:{}", client.profile_key(),
-            sha256_hex(&format!("{}:{}:{}", agent.as_str(), route.target_resource_uri, session))));
-    let ledger = if let (Some(db), Some(key)) = (db, &recall_key) {
-        if matches!(event, "session-start" | "pre-compact") {
-            let _ = db.set_kv(key, &Uuid::new_v4().to_string());
-        }
-        Some(format!("{}:{}", key, db.get_kv(key).ok().flatten().unwrap_or_default()))
-    } else { None };
     let mut evt = RecallEvent {
         id: Uuid::new_v4().to_string(),
         agent_id: agent.as_str().to_string(),
@@ -189,28 +180,19 @@ pub(crate) async fn execute_hook(
             ) else {
                 return String::new();
             };
-            if matches!(prompt.trim().to_lowercase().as_str(), "ok" | "yes" | "继续" | "可以" | "好的") {
-                return String::new();
-            }
-            let Ok(Ok(res)) = tokio::time::timeout(std::time::Duration::from_secs(3),
-                find_scopes(client, prompt, &route.target_resource_uri, peer.as_deref(), Some(5))).await
-            else {
-                return String::new();
+            let candidates = match tokio::time::timeout(std::time::Duration::from_secs(3),
+                find_scopes(client, prompt, &route.target_resource_uri, peer.as_deref(), Some(5))).await {
+                Ok(Ok(candidates)) => candidates,
+                Ok(Err(_)) => { eprintln!("OpenViking recall request failed"); return String::new(); }
+                Err(_) => { eprintln!("OpenViking recall timed out"); return String::new(); }
             };
-            let res = if let (Some(db), Some(key)) = (db, &ledger) {
-                unseen_recall(db, key, &res)
-            } else { res };
-            let Some((top_uri, _)) = extract_top_hit(&res) else {
-                return String::new();
-            };
-            let (text, layer, hits) = render_recall(client, &res, &budget).await;
+            let (text, layer, hits) = render_recall(client, candidates, &budget).await;
+            evt.target_uri = hits.iter().find(|(_,_,injected)| *injected).map(|(uri,_,_)| uri.clone());
             if let Some(db) = db {
-                let _ = db.record_recall_hits(&evt.id, &hits);
+                if let Err(error) = db.record_recall_hits(&evt.id, &hits) {
+                    eprintln!("OpenViking recall hits: {error}");
+                }
             }
-            if let (Some(db), Some(key)) = (db, &ledger) {
-                mark_injected(db, key, &res, &hits);
-            }
-            evt.target_uri = Some(top_uri);
             evt.query = Some(prompt.chars().take(120).collect());
             evt.layer = Some(layer);
             evt.tokens_used = (text.len() / 4) as i64;
@@ -249,7 +231,9 @@ pub(crate) async fn execute_hook(
 
     if let Some(db) = db {
         evt.latency_ms = start.elapsed().as_millis() as i64;
-        let _ = db.record_event_for_profile(&client.profile_key(), &evt);
+        if let Err(error) = db.record_event_for_profile(&client.profile_key(), &evt) {
+            eprintln!("OpenViking telemetry: {error}");
+        }
     }
     wrap_ifc_readonly(&text, &format!("{event}:{}", agent.as_str()), "reference")
 }
