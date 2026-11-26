@@ -21,7 +21,9 @@ pub fn run() {
         ))
         .setup(|app| {
             let _ = PolicyStore::load_or_init();
-            let _ = DesktopDb::open_default();
+            if let Ok(db) = DesktopDb::open_default() {
+                let _ = db.recover_stale_claims();
+            }
             if let Some(paths) = PlatformPaths::detect() {
                 let _ = paths.ensure_bridge_installed(None);
             }
@@ -111,69 +113,61 @@ pub fn run() {
 
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                let mut last_poll = chrono::Utc::now();
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    let now = chrono::Utc::now();
+                    let since = std::mem::replace(&mut last_poll, now);
                     let Ok(policy) = PolicyStore::load_or_init() else {
                         continue;
                     };
-                    if !policy.lifecycle.dreaming.enabled {
+                    let dreaming = &policy.lifecycle.dreaming;
+                    if !dreaming.enabled || dreaming.trigger == DreamingTrigger::Manual {
                         continue;
                     }
-                    let should_run = match policy.lifecycle.dreaming.trigger {
+                    let (Ok(client), Ok(db)) =
+                        (OvClient::from_local_config(), DesktopDb::open_default())
+                    else {
+                        continue;
+                    };
+                    let profile_key = client.profile_key();
+                    let source = match dreaming.trigger {
                         DreamingTrigger::Schedule => {
-                            let expr = normalize_cron(&policy.lifecycle.dreaming.cron);
-                            cron::Schedule::from_str(&expr)
-                                .ok()
-                                .and_then(|s| s.upcoming(chrono::Utc).next())
-                                .map(|next| {
-                                    let diff = (next - chrono::Utc::now()).num_seconds();
-                                    (0..=60).contains(&diff)
-                                })
-                                .unwrap_or(false)
+                            let expr = normalize_cron(&dreaming.cron);
+                            let Ok(schedule) = cron::Schedule::from_str(&expr) else {
+                                continue;
+                            };
+                            let Some(slot) =
+                                schedule.after(&since).take_while(|at| *at <= now).last()
+                            else {
+                                continue;
+                            };
+                            if !matches!(
+                                db.claim_schedule_slot(&profile_key, slot.timestamp()),
+                                Ok(true)
+                            ) {
+                                continue;
+                            }
+                            "schedule"
                         }
                         DreamingTrigger::SessionThreshold => {
-                            if let Ok(db) = DesktopDb::open_default() {
-                                let last_ts = db
-                                    .list_runs(1)
-                                    .ok()
-                                    .and_then(|r| r.first().map(|x| x.started_at))
-                                    .unwrap_or(0);
-                                let new_sessions = db
-                                    .list_events(None, 200)
-                                    .unwrap_or_default()
-                                    .into_iter()
-                                    .filter(|e| {
-                                        e.created_at > last_ts
-                                            && (e.event_type == "hook_stop"
-                                                || e.event_type == "capture")
-                                    })
-                                    .count();
-                                new_sessions >= policy.lifecycle.dreaming.session_threshold as usize
-                            } else {
-                                false
+                            let Ok(runs) = db.list_runs_for_profile(&profile_key, 1) else {
+                                continue;
+                            };
+                            let last_ts = runs.first().map_or(0, |run| run.started_at);
+                            let Ok(new_sessions) = db.count_sessions_since(&profile_key, last_ts) else {
+                                continue;
+                            };
+                            if new_sessions < i64::from(dreaming.session_threshold) {
+                                continue;
                             }
+                            "session_threshold"
                         }
-                        DreamingTrigger::Manual => false,
+                        DreamingTrigger::Manual => continue,
                     };
 
-                    if should_run {
-                        if let (Ok(client), Ok(db)) =
-                            (OvClient::from_local_config(), DesktopDb::open_default())
-                        {
-                            let source = if policy.lifecycle.dreaming.trigger
-                                == DreamingTrigger::SessionThreshold
-                            {
-                                "session_threshold"
-                            } else {
-                                "schedule"
-                            };
-                            if let Ok((run, staged)) =
-                                run_dreaming(&client, &db, &policy, source).await
-                            {
-                                let _ =
-                                    app_handle.emit("dreaming://completed", (run, staged.len()));
-                            }
-                        }
+                    if let Ok((run, staged)) = run_dreaming(&client, &db, &policy, source).await {
+                        let _ = app_handle.emit("dreaming://completed", (run, staged.len()));
                     }
                 }
             });

@@ -1,21 +1,39 @@
+// Exercise the same handlers as the binary with an isolated policy and database.
+#[allow(dead_code)]
+#[path = "../src/hook.rs"]
+mod hook;
+#[allow(dead_code)]
+#[path = "../src/mcp.rs"]
+mod mcp;
+
 use ov_core::dreaming::db::DesktopDb;
 use ov_core::dreaming::engine::{apply_accepted_changes, rollback_dreaming_run, run_dreaming};
 use ov_core::ov_client::{OvCliConfig, OvClient};
-use ov_core::policy::model::{ChangeAction, PolicyConfig, ReviewStatus};
+use ov_core::policy::model::{
+    AgentId, ChangeAction, PolicyConfig, ReflectorMode, ReviewStatus, VisibilityScope, WorkspaceMapping,
+};
+use ov_core::provenance::parse_frontmatter;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 #[derive(Default)]
 struct MockState {
+    writes: usize,
+    fail_snapshot: bool,
+    fail_content_read: bool,
+    fail_session_commit: bool,
+    session_messages: Vec<String>,
+    session_commits: usize,
+    scoped_searches: Vec<Value>,
     files: HashMap<String, String>,
-    snapshots: Vec<String>,
-    restored: Vec<String>,
+    snapshots: Vec<Value>,
+    restored: Vec<Value>,
     compiled: Vec<String>,
 }
 
@@ -25,26 +43,42 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
 
     tokio::spawn(async move {
         loop {
-            let Ok((mut socket, _)) = listener.accept().await else {
+            let Ok((socket, _)) = listener.accept().await else {
                 break;
             };
             let st = state.clone();
             tokio::spawn(async move {
-                let mut buf = vec![0u8; 32768];
-                let Ok(n) = socket.read(&mut buf).await else {
-                    return;
-                };
-                if n == 0 {
+                let mut socket = BufReader::new(socket);
+                let mut first_line = String::new();
+                if socket.read_line(&mut first_line).await.unwrap() == 0 {
                     return;
                 }
-                let req_text = String::from_utf8_lossy(&buf[..n]);
-                let first_line = req_text.lines().next().unwrap_or("");
                 let mut parts = first_line.split_whitespace();
-                let method = parts.next().unwrap_or("GET");
-                let full_path = parts.next().unwrap_or("/");
+                let method = parts.next().unwrap();
+                let full_path = parts.next().unwrap();
                 let (path, query) = full_path.split_once('?').unwrap_or((full_path, ""));
-                let body_str = req_text.split("\r\n\r\n").nth(1).unwrap_or("");
-                let body_json: Value = serde_json::from_str(body_str).unwrap_or(json!({}));
+                let mut content_length = 0;
+                loop {
+                    let mut header = String::new();
+                    if socket.read_line(&mut header).await.unwrap() == 0 {
+                        return;
+                    }
+                    if header == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = header.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_length = value.trim().parse().unwrap();
+                        }
+                    }
+                }
+                let mut body = vec![0; content_length];
+                socket.read_exact(&mut body).await.unwrap();
+                let body_json: Value = if body.is_empty() {
+                    json!({})
+                } else {
+                    serde_json::from_slice(&body).unwrap()
+                };
 
                 let uri_param = query
                     .split('&')
@@ -56,6 +90,7 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                     })
                     .unwrap_or_default();
 
+                let mut status = "200 OK";
                 let resp_json: Value = match (method, path) {
                     ("GET", "/health") => json!({ "status": "ok", "result": { "healthy": true } }),
                     ("GET", "/api/v1/system/status") => {
@@ -63,6 +98,12 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                     }
                     ("GET", "/api/v1/observer/system") => {
                         json!({ "status": "ok", "result": { "queue": "idle", "vikingdb": "ready" } })
+                    }
+                    ("GET", "/api/v1/fs/ls") if uri_param == "viking://resources/projects/" => {
+                        json!({ "status": "ok", "result": [
+                            { "uri": "viking://resources/projects/demo/", "isDir": true },
+                            { "uri": "viking://resources/projects/readme.md", "isDir": false }
+                        ] })
                     }
                     ("GET", "/api/v1/fs/ls") => {
                         let guard = st.lock().unwrap();
@@ -86,8 +127,13 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                     }
                     ("GET", "/api/v1/content/read") => {
                         let guard = st.lock().unwrap();
-                        let content = guard.files.get(&uri_param).cloned().unwrap_or_default();
-                        json!({ "status": "ok", "result": { "content": content } })
+                        if guard.fail_content_read {
+                            status = "503 Service Unavailable";
+                            json!({ "status": "error", "message": "Content temporarily unavailable" })
+                        } else {
+                            let content = guard.files.get(&uri_param).cloned().unwrap_or_default();
+                            json!({ "status": "ok", "result": { "content": content } })
+                        }
                     }
                     ("GET", "/api/v1/content/overview") => {
                         json!({ "status": "ok", "result": { "content": format!("L1_OVERVIEW_FOR:{}", uri_param) } })
@@ -98,19 +144,29 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                     ("POST", "/api/v1/content/write") => {
                         let uri = body_json["uri"].as_str().unwrap_or("").to_string();
                         let content = body_json["content"].as_str().unwrap_or("").to_string();
-                        st.lock().unwrap().files.insert(uri.clone(), content);
+                        let mut guard = st.lock().unwrap();
+                        guard.writes += 1;
+                        guard.files.insert(uri.clone(), content);
                         json!({ "status": "ok", "result": { "uri": uri, "written": true } })
                     }
                     ("POST", "/api/v1/fs/mv") => {
                         let from = body_json["from_uri"].as_str().unwrap_or("");
                         let to = body_json["to_uri"].as_str().unwrap_or("").to_string();
                         let mut guard = st.lock().unwrap();
+                        guard.writes += 1;
                         if let Some(v) = guard.files.remove(from) {
                             guard.files.insert(to.clone(), v);
                         }
                         json!({ "status": "ok", "result": { "moved_to": to } })
                     }
-                    ("POST", "/api/v1/search/search") => {
+                    ("POST", "/api/v1/search/search")
+                        if body_json["mode"] == "context"
+                            && body_json.get("target_uri").is_some() =>
+                    {
+                        status = "400 Bad Request";
+                        json!({ "status": "error", "message": "Context search cannot be scoped" })
+                    }
+                    ("POST", "/api/v1/search/search") if body_json["mode"] == "context" => {
                         json!({
                             "status": "ok",
                             "result": {
@@ -120,41 +176,111 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                             }
                         })
                     }
+                    ("POST", "/api/v1/search/search") => {
+                        status = "400 Bad Request";
+                        json!({ "status": "error", "message": "Expected context search mode" })
+                    }
                     ("POST", "/api/v1/search/find") => {
-                        json!({
-                            "status": "ok",
-                            "result": {
-                                "memories": [
+                        st.lock().unwrap().scoped_searches.push(body_json.clone());
+                        if body_json["target_uri"] == "viking://resources/projects/demo/" {
+                            json!({
+                                "status": "ok",
+                                "result": { "entries": [
+                                    { "uri": "viking://resources/projects/demo/README.md", "score": 0.91 }
+                                ] }
+                            })
+                        } else {
+                            json!({
+                                "status": "ok",
+                                "result": { "memories": [
                                     { "uri": "viking://~/memories/preferences/git-old.md", "score": 0.89 }
-                                ]
-                            }
-                        })
+                                ] }
+                            })
+                        }
+                    }
+                    ("POST", "/v1/chat/completions") => {
+                        let prompt = body_json["messages"][1]["content"].as_str().unwrap();
+                        let content = if prompt.contains("[Existing Project Directories]") {
+                            assert!(prompt.contains("viking://resources/projects/demo/"));
+                            assert!(!prompt.contains("viking://resources/projects/readme.md"));
+                            json!({
+                                "destination_dir": "viking://resources/projects/demo/",
+                                "rationale": "Matches demo"
+                            }).to_string()
+                        } else {
+                            assert!(prompt.contains("[Primary URI:"));
+                            "# Reflected memory".to_string()
+                        };
+                        json!({ "choices": [{ "message": { "content": content } }] })
+                    }
+                    ("POST", "/api/v1/sessions") => {
+                        json!({ "status": "ok", "result": { "session_id": "e2e-session" } })
+                    }
+                    ("POST", "/api/v1/sessions/e2e-session/messages") => {
+                        assert_eq!(body_json["role"], "assistant");
+                        st.lock().unwrap().session_messages.push(
+                            body_json["content"].as_str().unwrap().to_string(),
+                        );
+                        json!({ "status": "ok", "result": {} })
+                    }
+                    ("POST", "/api/v1/sessions/e2e-session/commit") => {
+                        let mut guard = st.lock().unwrap();
+                        if guard.fail_session_commit {
+                            status = "500 Internal Server Error";
+                            json!({ "status": "error", "message": "Session commit failed" })
+                        } else {
+                            guard.session_commits += 1;
+                            json!({ "status": "ok", "result": {} })
+                        }
                     }
                     ("POST", "/api/v1/snapshot/commit") => {
-                        let snap = format!("snap-e2e-{}", st.lock().unwrap().snapshots.len() + 1);
-                        st.lock().unwrap().snapshots.push(snap.clone());
-                        json!({ "status": "ok", "result": { "snapshot_id": snap } })
+                        let mut guard = st.lock().unwrap();
+                        if guard.fail_snapshot {
+                            status = "500 Internal Server Error";
+                            json!({ "status": "error", "message": "Snapshot failed" })
+                        } else {
+                            let snap = format!("snap-e2e-{}", guard.snapshots.len() + 1);
+                            guard.snapshots.push(body_json.clone());
+                            json!({ "status": "ok", "result": { "commit_oid": snap } })
+                        }
                     }
                     ("POST", "/api/v1/snapshot/restore") => {
-                        let snap = body_json["snapshot_id"].as_str().unwrap_or("").to_string();
-                        st.lock().unwrap().restored.push(snap.clone());
-                        json!({ "status": "ok", "result": { "restored": snap } })
+                        if body_json.get("snapshot_id").is_some() {
+                            status = "400 Bad Request";
+                            json!({ "status": "error", "message": "snapshot_id is unsupported" })
+                        } else if !body_json["source_commit"].as_str().is_some_and(|s| !s.is_empty()) {
+                            status = "400 Bad Request";
+                            json!({ "status": "error", "message": "source_commit is required" })
+                        } else if !body_json["project_dir"].as_str().is_some_and(|s| s.starts_with("viking://") && s != "viking://") {
+                            status = "403 Forbidden";
+                            json!({ "status": "error", "message": "project_dir is required for User API Keys" })
+                        } else {
+                            st.lock().unwrap().restored.push(body_json.clone());
+                            json!({ "status": "ok", "result": { "restored": body_json["source_commit"] } })
+                        }
                     }
                     ("POST", "/api/v1/compile") => {
-                        let name = body_json["compile_name"].as_str().unwrap_or("").to_string();
-                        st.lock().unwrap().compiled.push(name.clone());
+                        assert_eq!(body_json["skill"], "wiki");
+                        assert_eq!(body_json["from"], json!(["viking://resources/projects/demo/"]));
+                        let to = body_json["to"].as_str().unwrap().to_string();
+                        let mut guard = st.lock().unwrap();
+                        guard.writes += 1;
+                        guard.compiled.push(to);
                         json!({ "status": "ok", "result": { "task_id": "task-e2e-1" } })
                     }
-                    _ => json!({ "status": "ok", "result": {} }),
+                    _ => {
+                        status = "404 Not Found";
+                        json!({ "status": "error", "message": "Unknown endpoint" })
+                    }
                 };
 
                 let body_bytes = serde_json::to_vec(&resp_json).unwrap();
                 let header = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body_bytes.len()
                 );
-                let _ = socket.write_all(header.as_bytes()).await;
-                let _ = socket.write_all(&body_bytes).await;
+                let _ = socket.get_mut().write_all(header.as_bytes()).await;
+                let _ = socket.get_mut().write_all(&body_bytes).await;
             });
         }
     });
@@ -162,201 +288,377 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
     format!("http://{}", addr)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn e2e_ov_bridge_mcp_and_dreaming_pipeline() {
-    let state = Arc::new(Mutex::new(MockState::default()));
-    {
-        let mut guard = state.lock().unwrap();
-        guard.files.insert(
-            "viking://~/resources/inbox/scratch.md".to_string(),
-            "# Scratch note\nAuth token header notes".to_string(),
-        );
-        guard.files.insert(
-            "viking://~/memories/preferences/git.md".to_string(),
-            "# Git Commit Style\nAlways use English Conventional Commits for clarity.".to_string(),
-        );
-        guard.files.insert(
-            "viking://~/memories/preferences/git-old.md".to_string(),
-            "# Git Commit Style\nAlways use English Conventional Commits for clarity.\nExtra legacy line.".to_string(),
-        );
-        guard.files.insert(
-            "viking://resources/projects/demo/README.md".to_string(),
-            "# Demo Project".to_string(),
-        );
-    }
+fn test_client(url: &str, account: &str) -> OvClient {
+    OvClient::new(&OvCliConfig {
+        url: url.to_string(),
+        account: Some(account.to_string()),
+        api_key: "test-key".to_string(),
+        ..Default::default()
+    })
+    .unwrap()
+}
 
-    let base_url = start_mock_openviking_server(state.clone()).await;
-
-    // 1. E2E test the compiled `ov-bridge` binary over stdio JSON-RPC 2.0
-    let tmp = tempdir().unwrap();
-    let conf_path = tmp.path().join("ovcli.conf");
-    std::fs::write(
-        &conf_path,
-        serde_json::to_string(&json!({ "url": base_url, "api_key": "user-test-key" })).unwrap(),
-    )
-    .unwrap();
-
-    let bridge_bin = env!("CARGO_BIN_EXE_ov-bridge");
-    let mut child = Command::new(bridge_bin)
+#[test]
+fn e2e_mcp_stdio_handshake_ping_and_parse_error() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ov-bridge"))
         .args(["mcp", "--agent", "claude-code"])
-        .env("OPENVIKING_CLI_CONFIG_FILE", &conf_path)
-        .env("NO_PROXY", "127.0.0.1,localhost")
-        .env_remove("HTTP_PROXY")
-        .env_remove("HTTPS_PROXY")
-        .env_remove("http_proxy")
-        .env_remove("https_proxy")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
-        .expect("failed to spawn ov-bridge");
-
-    {
-        let stdin = child.stdin.as_mut().unwrap();
-        writeln!(
-            stdin,
-            "{}",
-            json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} })
-        )
         .unwrap();
-        // Recall should auto-expand L0 -> L1 because mock score is 0.92 >= 0.80
-        writeln!(
-            stdin,
-            "{}",
-            json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/call",
-                "params": { "name": "recall", "arguments": { "query": "git commit style" } }
-            })
-        )
-        .unwrap();
-        // Protected rule glob write should be denied
-        writeln!(
-            stdin,
-            "{}",
-            json!({
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "tools/call",
-                "params": {
-                    "name": "remember",
-                    "arguments": { "uri": "viking://resources/projects/demo/CLAUDE.md", "content": "hack" }
-                }
-            })
-        )
-        .unwrap();
-        // Normal remember write should succeed with YAML Frontmatter provenance
-        writeln!(
-            stdin,
-            "{}",
-            json!({
-                "jsonrpc": "2.0",
-                "id": 4,
-                "method": "tools/call",
-                "params": {
-                    "name": "remember",
-                    "arguments": { "uri": "viking://~/memories/preferences/editor.md", "content": "Prefer Rust + Tauri" }
-                }
-            })
-        )
-        .unwrap();
-        // Private remember write should route into isolated agent namespace
-        writeln!(
-            stdin,
-            "{}",
-            json!({
-                "jsonrpc": "2.0",
-                "id": 5,
-                "method": "tools/call",
-                "params": {
-                    "name": "remember",
-                    "arguments": { "visibility": "private", "content": "Agent private scratchpad" }
-                }
-            })
-        )
-        .unwrap();
-    }
+    let stdin = child.stdin.as_mut().unwrap();
+    writeln!(stdin, "{}", json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize" })).unwrap();
+    writeln!(stdin, "malformed JSON").unwrap();
+    writeln!(stdin, "{}", json!({ "jsonrpc": "2.0", "id": 2, "method": "ping" })).unwrap();
+    writeln!(stdin, "{}", json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" })).unwrap();
 
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    let responses: Vec<Value> = stdout
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-    assert_eq!(responses.len(), 5);
+    let responses: Vec<Value> = stdout.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert_eq!(responses.len(), 4);
+    assert!(responses[0]["result"]["protocolVersion"].is_string());
+    assert_eq!(responses[1], json!({
+        "jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "Parse error"}
+    }));
+    assert_eq!(responses[2], json!({"jsonrpc": "2.0", "id": 2, "result": {}}));
+    assert!(responses[3]["result"]["tools"].as_array().unwrap()
+        .iter().any(|tool| tool["name"] == "recall"));
+}
 
-    // Verify L0 -> L1 auto-expansion fired in recall
-    let recall_text = responses[1]["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(
-        recall_text.contains("Auto-Expanded L1 Overview"),
-        "Expected L0->L1 auto-expansion in recall output, got: {}",
-        recall_text
-    );
+#[tokio::test]
+async fn e2e_mcp_recall_and_capture_are_profile_scoped() {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let url = start_mock_openviking_server(state.clone()).await;
+    let client = test_client(&url, "work");
+    let other = test_client(&url, "personal");
+    let db = DesktopDb::open_in_memory().unwrap();
+    let mut policy = PolicyConfig::default();
+    policy.routing.auto_map_git_repo = false;
+    policy.routing.respect_project_policy_file = false;
+    policy.routing.inbox_uri.clear();
+    let agent = AgentId::ClaudeCode;
+    let unscoped = json!({ "name": "recall", "arguments": { "query": "git commit style" } });
+    let text = mcp::call_tool(agent, &unscoped, &policy, &client, Some(&db)).await.unwrap();
+    assert!(text.contains("<openviking_memory_reference") && text.contains("readonly=\"true\""));
+    assert!(text.contains("Auto-Expanded L1 Overview"));
+    assert!(text.contains("L1_OVERVIEW_FOR:viking://~/memories/preferences/git.md"));
+    assert!(state.lock().unwrap().scoped_searches.is_empty());
 
-    // Verify protected CLAUDE.md write was rejected
-    assert_eq!(responses[2]["result"]["isError"], json!(true));
+    let scoped = json!({ "name": "recall", "arguments": {
+        "query": "Read project notes", "target_uri": "viking://resources/projects/demo/", "limit": 2
+    } });
+    let mut tight_policy = policy.clone();
+    tight_policy.budget.agent_overrides.clear();
+    tight_policy.budget.max_recall_tokens = 8;
+    let text = mcp::call_tool(agent, &scoped, &tight_policy, &other, Some(&db)).await.unwrap();
+    assert!(!text.contains("Auto-Expanded L1 Overview"));
+    assert_eq!(state.lock().unwrap().scoped_searches.as_slice(), &[json!({
+        "query": "Read project notes", "target_uri": "viking://resources/projects/demo/", "limit": 2
+    })]);
 
-    assert!(
-        recall_text.contains("<openviking_memory_reference") && recall_text.contains("readonly=\"true\""),
-        "Expected IFC readonly boundary in recall output"
-    );
+    let work_events = db.list_events_for_profile(&client.profile_key(), None, 10).unwrap();
+    assert_eq!(work_events.len(), 1);
+    assert_eq!(work_events[0].layer.as_deref(), Some("l1"));
+    assert_eq!(work_events[0].target_uri.as_deref(), Some("viking://~/memories/preferences/git.md"));
+    let other_events = db.list_events_for_profile(&other.profile_key(), None, 10).unwrap();
+    assert_eq!(other_events.len(), 1);
+    assert_eq!(other_events[0].layer.as_deref(), Some("l0"));
+    assert_eq!(other_events[0].target_uri.as_deref(), Some("viking://resources/projects/demo/README.md"));
+    assert!(db.list_events_for_profile("", None, 10).unwrap().is_empty());
 
-    // Verify normal remember persisted with YAML Frontmatter provenance
+    policy.routing.workspace_mappings.push(WorkspaceMapping {
+        local_path: std::env::current_dir().unwrap(),
+        resource_uri: "viking://resources/projects/demo".into(),
+        visibility: VisibilityScope::Shared,
+    });
+    let text = mcp::call_tool(agent, &unscoped, &policy, &client, None).await.unwrap();
+    assert!(text.contains("viking://resources/projects/demo/README.md"));
+    let global = json!({ "name": "recall", "arguments": {
+        "query": "git commit style", "target_uri": ""
+    } });
+    let text = mcp::call_tool(agent, &global, &policy, &client, None).await.unwrap();
+    assert!(text.contains("viking://~/memories/preferences/git.md"));
+    assert_eq!(state.lock().unwrap().scoped_searches.last().unwrap()["target_uri"],
+        "viking://resources/projects/demo/");
+    assert_eq!(state.lock().unwrap().scoped_searches.len(), 2);
+    policy.routing.workspace_mappings.clear();
+
+    let protected = json!({ "name": "remember", "arguments": {
+        "uri": "viking://resources/projects/demo/CLAUDE.md/", "content": "protected"
+    } });
+    let failure = mcp::call_tool(agent, &protected, &policy, &client, Some(&db)).await.unwrap_err();
+    assert!(failure.contains("Write denied"));
+    assert_eq!(state.lock().unwrap().writes, 0);
+
+    policy.routing.inbox_uri = "viking://~/resources/inbox///".to_string();
+    let note = json!({ "name": "remember", "arguments": { "content": "Prefer Rust + Tauri" } });
+    mcp::call_tool(agent, &note, &policy, &client, Some(&db)).await.unwrap();
     let guard = state.lock().unwrap();
-    let saved_editor = guard
-        .files
-        .get("viking://~/memories/preferences/editor.md")
-        .expect("editor.md must exist");
-    assert!(saved_editor.contains("source_agent: claude-code"));
-    assert!(saved_editor.contains("Prefer Rust + Tauri"));
-    assert!(
-        guard.files.keys().any(|k| k.starts_with("viking://agent/claude-code/memories/")),
-        "Expected private remember to route to isolated agent namespace"
-    );
+    let (uri, body) = guard.files.iter().next().unwrap();
+    let filename = uri.strip_prefix("viking://~/resources/inbox/note-").unwrap();
+    let (_, suffix) = filename.strip_suffix(".md").unwrap().rsplit_once('-').unwrap();
+    assert_eq!(suffix.len(), 4);
+    assert!(suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let (provenance, body) = parse_frontmatter(body);
+    assert_eq!(provenance.unwrap().source_agent, "claude-code");
+    assert_eq!(body, "Prefer Rust + Tauri");
     drop(guard);
+    assert_eq!(db.count_sessions_since(&client.profile_key(), 0).unwrap(), 1);
+    assert_eq!(db.count_sessions_since(&other.profile_key(), 0).unwrap(), 0);
 
-    // 2. Full Dreaming Stage-then-Commit + Optimistic Lock + Snapshot Rollback E2E
-    let client = OvClient::new(&OvCliConfig {
-        url: base_url,
-        api_key: "user-test-key".to_string(),
+    let explicit = json!({ "name": "remember", "arguments": {
+        "uri": "viking://~/memories/preferences/editor.md",
+        "content": "Prefer Rust + Tauri",
+        "verified": true
+    } });
+    mcp::call_tool(agent, &explicit, &policy, &client, None).await.unwrap();
+    let private = json!({ "name": "remember", "arguments": {
+        "visibility": "private", "content": "Agent private scratchpad"
+    } });
+    mcp::call_tool(agent, &private, &policy, &client, None).await.unwrap();
+    let guard = state.lock().unwrap();
+    let saved_editor = &guard.files["viking://~/memories/preferences/editor.md"];
+    let (provenance, body) = parse_frontmatter(saved_editor);
+    let provenance = provenance.unwrap();
+    assert_eq!(provenance.source_agent, "claude-code");
+    assert!(provenance.verified);
+    assert_eq!(body, "Prefer Rust + Tauri");
+    let (_, saved_private) = guard.files.iter().find(|(uri, _)| {
+        uri.starts_with("viking://agent/claude-code/memories/note-")
+    }).expect("Private note must use the agent namespace");
+    let (provenance, body) = parse_frontmatter(saved_private);
+    assert_eq!(provenance.unwrap().scope, "agent_private");
+    assert_eq!(body, "Agent private scratchpad");
+}
+
+#[tokio::test]
+async fn e2e_hook_outputs_and_stop_capture() {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let url = start_mock_openviking_server(state.clone()).await;
+    let client = test_client(&url, "work");
+    let db = DesktopDb::open_in_memory().unwrap();
+    let mut policy = PolicyConfig::default();
+    let tmp = tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("RESOURCE_POLICY.md"),
+        "resource_uri: viking://resources/projects/demo\n",
+    ).unwrap();
+
+    let prompt = json!({ "workspacePaths": [tmp.path()], "lastUserInput": "Read project notes" });
+    let agent = AgentId::Antigravity;
+    let text = hook::execute_hook("pre-invocation", agent, &prompt, &policy, &client, Some(&db)).await;
+    assert!(text.contains("viking://resources/projects/demo/README.md"));
+    let output = hook::hook_stdout("pre-invocation", agent, &text).unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&output).unwrap(), json!({
+        "injectSteps": [{ "systemMessage": { "systemMessage": text } }]
+    }));
+    assert_eq!(state.lock().unwrap().scoped_searches.as_slice(), &[json!({
+        "query": "Read project notes", "target_uri": "viking://resources/projects/demo/", "limit": 5
+    })]);
+
+    let agent = AgentId::Codex;
+    let input = json!({ "cwd": tmp.path(), "message": "Read project notes" });
+    for (event, hook_event_name, expected) in [
+        ("session-start", "SessionStart", "L0_ABSTRACT_FOR:viking://resources/projects/demo/"),
+        ("user-prompt-submit", "UserPromptSubmit", "viking://resources/projects/demo/README.md"),
+    ] {
+        let text = hook::execute_hook(event, agent, &input, &policy, &client, Some(&db)).await;
+        assert!(text.contains(expected), "Missing {expected} in {text}");
+        assert!(text.contains("readonly=\"true\""));
+        if event == "session-start" {
+            assert!(text.contains("viking://agent/codex/memories/"));
+            assert!(text.contains("L0_ABSTRACT_FOR:viking://~/memories/"));
+        }
+        assert_eq!(hook::hook_stdout(event, AgentId::Pi, &text).as_deref(), Some(text.as_str()));
+        for hook_agent in [AgentId::Codex, AgentId::ClaudeCode] {
+            let output = hook::hook_stdout(event, hook_agent, &text).unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&output).unwrap(), json!({
+                "hookSpecificOutput": { "hookEventName": hook_event_name, "additionalContext": text }
+            }));
+        }
+    }
+    assert_eq!(hook::hook_stdout("pre-invocation", AgentId::Antigravity, "").as_deref(), Some("{}"));
+    assert_eq!(hook::hook_stdout("stop", AgentId::Pi, ""), None);
+
+    let transcript = tmp.path().join("transcript.jsonl");
+    std::fs::write(&transcript, [
+        json!({ "type": "response_item", "payload": { "role": "assistant", "content": [
+            { "type": "output_text", "text": "Remember this decision" },
+            { "type": "output_text", "text": "Second line" },
+            { "type": "tool_use", "text": "Exclude this" }
+        ] } }).to_string(),
+        json!({ "type": "assistant", "message": { "role": "assistant", "content": [
+            { "type": "tool_use", "text": "Exclude this too" }
+        ] } }).to_string(),
+        json!({ "role": "user", "content": "Ignore user text" }).to_string(),
+        "{".to_string(),
+    ].join("\n")).unwrap();
+    let input = json!({ "cwd": tmp.path(), "transcriptPath": transcript });
+    policy.global.capture_enabled = false;
+    hook::execute_hook("stop", agent, &input, &policy, &client, Some(&db)).await;
+    assert!(state.lock().unwrap().session_messages.is_empty());
+    assert_eq!(db.count_sessions_since(&client.profile_key(), 0).unwrap(), 0);
+
+    policy.global.capture_enabled = true;
+    hook::execute_hook("stop", agent, &json!({}), &policy, &client, Some(&db)).await;
+    state.lock().unwrap().fail_session_commit = true;
+    hook::execute_hook("stop", agent, &input, &policy, &client, Some(&db)).await;
+    assert_eq!(db.count_sessions_since(&client.profile_key(), 0).unwrap(), 0);
+    assert_eq!(state.lock().unwrap().session_messages.len(), 1);
+
+    state.lock().unwrap().fail_session_commit = false;
+    let text = hook::execute_hook("stop", agent, &input, &policy, &client, Some(&db)).await;
+    assert_eq!(hook::hook_stdout("stop", agent, &text).as_deref(), Some("{}"));
+    assert_eq!(hook::hook_stdout("stop", AgentId::Antigravity, &text).as_deref(), Some("{}"));
+    assert_eq!(db.count_sessions_since(&client.profile_key(), 0).unwrap(), 1);
+    assert!(db.list_events_for_profile("", None, 10).unwrap().is_empty());
+    let other = test_client(&url, "personal");
+    assert!(db.list_events_for_profile(&other.profile_key(), None, 10).unwrap().is_empty());
+    let guard = state.lock().unwrap();
+    assert_eq!(guard.session_commits, 1);
+    assert_eq!(guard.session_messages.last().map(String::as_str), Some("Remember this decision\nSecond line"));
+}
+
+#[tokio::test]
+async fn e2e_dreaming_snapshot_failure_isolation_and_rollback() {
+    let state = Arc::new(Mutex::new(MockState {
+        files: HashMap::from([
+            ("viking://~/resources/inbox/scratch.md".to_string(), "# Scratch note".to_string()),
+            (
+                "viking://~/memories/preferences/git.md".to_string(),
+                "# Git Commit Style\nUse English Conventional Commits for clarity.".to_string(),
+            ),
+            (
+                "viking://~/memories/preferences/git-old.md".to_string(),
+                "# Git Commit Style\nUse English Conventional Commits for clarity.\nLegacy line.".to_string(),
+            ),
+        ]),
         ..Default::default()
-    })
-    .unwrap();
+    }));
+    let url = start_mock_openviking_server(state.clone()).await;
+    let client = test_client(&url, "work");
+    let other = test_client(&url, "personal");
     let db = DesktopDb::open_in_memory().unwrap();
     let policy = PolicyConfig::default();
 
     let (run, staged) = run_dreaming(&client, &db, &policy, "e2e").await.unwrap();
     assert_eq!(run.status, "ready_for_review");
-    assert!(staged.iter().any(|c| c.action == ChangeAction::MoveFromInbox));
-    assert!(staged.iter().any(|c| c.action == ChangeAction::Merge));
+    assert_eq!(run.profile_key, client.profile_key());
+    let inbox_move = staged.iter().find(|c| c.action == ChangeAction::MoveFromInbox).unwrap();
+    let merge = staged.iter().find(|c| c.action == ChangeAction::Merge).unwrap();
+    let evidence: Value = serde_json::from_str(&merge.evidence_json).unwrap();
+    assert_eq!(evidence["reflector"], "deterministic");
+    let (provenance, _) = parse_frontmatter(merge.after_content.as_deref().unwrap());
+    let provenance = provenance.unwrap();
+    assert_eq!(provenance.updated_by, "dreaming:deterministic");
+    assert!(provenance.verified);
+    assert_eq!(provenance.evidence_uris.len(), 2);
     assert!(staged.iter().any(|c| c.action == ChangeAction::WikiCompile));
 
-    // Simulate concurrent remote drift on git.md before apply
-    state.lock().unwrap().files.insert(
-        "viking://~/memories/preferences/git.md".to_string(),
-        "# Modified concurrently by another agent!".to_string(),
-    );
+    db.update_change_decision_for_profile(&client.profile_key(), &inbox_move.id, ReviewStatus::Accepted, None).unwrap();
+    let mut retry_policy = policy.clone();
+    retry_policy.lifecycle.dreaming.auto_snapshot_before_run = false;
+    state.lock().unwrap().fail_content_read = true;
+    let report = apply_accepted_changes(&client, &db, &retry_policy).await.unwrap();
+    assert!(report.conflict_ids.is_empty() && report.applied_ids.is_empty());
+    assert_eq!(report.failed_items.len(), 1);
+    assert_eq!(report.failed_items[0].0, inbox_move.id);
+    assert!(report.failed_items[0].1.contains("503"));
+    let accepted = db.list_pending_changes_for_profile(&client.profile_key(), Some("accepted")).unwrap();
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(accepted[0].id, inbox_move.id);
+    state.lock().unwrap().fail_content_read = false;
 
-    // Approve all staged changes
-    for c in &staged {
-        db.update_change_decision(&c.id, ReviewStatus::Accepted, None)
-            .unwrap();
+    for change in &staged {
+        db.update_change_decision_for_profile(&client.profile_key(), &change.id, ReviewStatus::Accepted, None).unwrap();
     }
 
-    let report = apply_accepted_changes(&client, &db, &policy).await.unwrap();
-    assert!(report.snapshot_id.is_some(), "Expected snapshot before commit");
-    assert!(
-        !report.conflict_ids.is_empty(),
-        "Expected optimistic concurrency conflict on drifted git.md"
-    );
-    assert!(
-        !report.applied_ids.is_empty(),
-        "Expected non-drifted changes to apply cleanly"
+    assert!(db.list_runs_for_profile(&other.profile_key(), 10).unwrap().is_empty());
+    assert!(db.list_pending_changes_for_profile(&other.profile_key(), None).unwrap().is_empty());
+    let other_report = apply_accepted_changes(&other, &db, &policy).await.unwrap();
+    assert!(other_report.applied_ids.is_empty() && other_report.snapshot_id.is_none());
+
+    state.lock().unwrap().fail_snapshot = true;
+    let error = apply_accepted_changes(&client, &db, &policy).await.unwrap_err();
+    assert!(error.contains("Snapshot failed"));
+    {
+        let mut guard = state.lock().unwrap();
+        assert_eq!(guard.writes, 0);
+        assert!(guard.snapshots.is_empty());
+        guard.fail_snapshot = false;
+        guard.files.insert("viking://~/memories/preferences/git.md".to_string(), "# Concurrent edit".to_string());
+    }
+    assert_eq!(
+        db.list_pending_changes_for_profile(&client.profile_key(), Some("accepted")).unwrap().len(),
+        staged.len(),
     );
 
-    // Roll back the Dreaming run via snapshot_restore
+    let report = apply_accepted_changes(&client, &db, &policy).await.unwrap();
+    assert_eq!(report.snapshot_id.as_deref(), Some("snap-e2e-1"));
+    assert!(!report.conflict_ids.is_empty());
+    assert!(report.applied_ids.contains(&inbox_move.id));
+    assert!(report.failed_items.is_empty());
+    {
+        let guard = state.lock().unwrap();
+        assert_eq!(guard.compiled.as_slice(), &["viking://resources/desktop-dreaming-wiki/"]);
+        assert_eq!(guard.snapshots.len(), 2);
+        assert!(guard.snapshots[0]["message"].as_str().unwrap().starts_with("dreaming-commit-"));
+        assert!(guard.snapshots[1]["message"].as_str().unwrap().starts_with("dreaming-applied-"));
+        assert_eq!(guard.snapshots[0]["paths"], json!([
+            "viking://resources/desktop-dreaming-wiki/",
+            "viking://~/memories/preferences/git.md",
+            "viking://~/resources/inbox/scratch.md",
+            "viking://~/resources/projects/general/scratch.md",
+        ]));
+        assert_eq!(guard.snapshots[1]["paths"], guard.snapshots[0]["paths"]);
+    }
+    assert!(rollback_dreaming_run(&other, &db, &run.id).await.is_err());
+    assert!(state.lock().unwrap().restored.is_empty());
     rollback_dreaming_run(&client, &db, &run.id).await.unwrap();
-    assert_eq!(state.lock().unwrap().restored.len(), 1);
+    assert_eq!(state.lock().unwrap().restored.as_slice(), &[
+        json!({ "source_commit": "snap-e2e-1", "project_dir": "viking://resources/desktop-dreaming-wiki" }),
+        json!({ "source_commit": "snap-e2e-1", "project_dir": "viking://~/resources/inbox" }),
+        json!({ "source_commit": "snap-e2e-1", "project_dir": "viking://~/resources/projects/general" }),
+    ]);
+    assert_eq!(db.get_run(&run.id).unwrap().unwrap().status, "rolled_back");
+}
+
+#[tokio::test]
+async fn e2e_dreaming_reflector_routes_inbox_and_adds_merge_provenance() {
+    let state = Arc::new(Mutex::new(MockState {
+        files: HashMap::from([
+            ("viking://~/resources/inbox/scratch.md".into(), "# Scratch note".into()),
+            (
+                "viking://~/memories/preferences/git.md".into(),
+                "# Git Commit Style\nUse English Conventional Commits.".into(),
+            ),
+            (
+                "viking://~/memories/preferences/git-old.md".into(),
+                "# Commit Style\nUse clear English commit messages.".into(),
+            ),
+        ]),
+        ..Default::default()
+    }));
+    let url = start_mock_openviking_server(state).await;
+    let client = test_client(&url, "work");
+    let db = DesktopDb::open_in_memory().unwrap();
+    let mut policy = PolicyConfig::default();
+    policy.lifecycle.dreaming.reflector_mode = ReflectorMode::OpenaiCompatible;
+    policy.lifecycle.dreaming.reflector_endpoint = format!("{url}/v1");
+    policy.lifecycle.dreaming.reflector_model = "e2e-reflector".into();
+
+    let (_, staged) = run_dreaming(&client, &db, &policy, "e2e").await.unwrap();
+    let inbox = staged.iter().find(|c| c.action == ChangeAction::MoveFromInbox).unwrap();
+    assert_eq!(inbox.destination_uri.as_deref(), Some("viking://resources/projects/demo/scratch.md"));
+    let evidence: Value = serde_json::from_str(&inbox.evidence_json).unwrap();
+    assert_eq!(evidence["reflector"], "llm:e2e-reflector");
+
+    let merge = staged.iter().find(|c| c.action == ChangeAction::Merge).unwrap();
+    let (provenance, body) = parse_frontmatter(merge.after_content.as_deref().unwrap());
+    assert_eq!(body, "# Reflected memory");
+    let provenance = provenance.unwrap();
+    assert_eq!(provenance.updated_by, "dreaming:llm:e2e-reflector");
+    assert!(provenance.verified);
+    assert_eq!(provenance.evidence_uris.len(), 2);
 }

@@ -25,27 +25,37 @@ export function MemoryFlowCanvas({
   const [simMode, setSimMode] = useState<"live" | "capture" | "recall" | "privacy">("live");
 
   const latestEvent = events[0];
-  const activeAgentId =
+  const nowSec = Math.floor(Date.now() / 1000);
+  const hasRecentLiveEvent =
+    Boolean(latestEvent) && serverReachable && nowSec - (latestEvent?.created_at ?? 0) <= 300;
+
+  const activeAgentId: AgentId | null =
     simMode === "live"
-      ? (latestEvent?.agent_id as AgentId | undefined) ?? "claude-code"
+      ? hasRecentLiveEvent
+        ? ((latestEvent?.agent_id as AgentId | undefined) ?? null)
+        : null
       : simMode === "capture"
         ? "codex"
         : simMode === "recall"
           ? "antigravity"
           : "claude-code";
 
-  const activeDirection: "capture" | "recall" | "blocked" =
-    simMode === "privacy" || (!captureEnabled && latestEvent?.event_type === "capture")
+  const activeDirection: "idle" | "capture" | "recall" | "blocked" =
+    simMode === "privacy"
       ? "blocked"
       : simMode === "capture"
         ? "capture"
         : simMode === "recall"
           ? "recall"
-          : latestEvent?.blocked_by_privacy
-            ? "blocked"
-            : latestEvent?.event_type === "capture" || latestEvent?.event_type === "hook_stop"
-              ? "capture"
-              : "recall";
+          : !hasRecentLiveEvent
+            ? "idle"
+            : !captureEnabled && latestEvent?.event_type === "capture"
+              ? "blocked"
+              : latestEvent?.blocked_by_privacy
+                ? "blocked"
+                : latestEvent?.event_type === "capture" || latestEvent?.event_type === "hook_stop"
+                  ? "capture"
+                  : "recall";
 
   const connectedSet = new Set(agents.filter((a) => a.connected).map((a) => a.agent_id));
 
@@ -61,11 +71,15 @@ export function MemoryFlowCanvas({
           <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
           <span className="text-xs font-semibold text-zinc-100">实时记忆信息流拓扑</span>
           <span className="text-[11px] font-mono text-zinc-500">
-            {activeDirection === "capture"
-              ? "Capture 采集写入中（绿）"
-              : activeDirection === "blocked"
-                ? "隐私模式已拦截写入（琥珀）"
-                : "Recall 记忆召回注入中（靛蓝）"}
+            {activeDirection === "idle"
+              ? serverReachable
+                ? "待机中（暂无近期实时事件）"
+                : "远端离线（待机）"
+              : activeDirection === "capture"
+                ? "Capture 采集写入中（绿）"
+                : activeDirection === "blocked"
+                  ? "隐私模式已拦截写入（琥珀）"
+                  : "Recall 记忆召回注入中（靛蓝）"}
           </span>
         </div>
 
@@ -230,8 +244,14 @@ export function MemoryFlowCanvas({
                         ? "url(#beamRecall)"
                         : "rgba(255,255,255,0.1)"
                   }
-                  strokeWidth={activeDirection === "blocked" ? 1.2 : 2.2}
-                  strokeDasharray={activeDirection === "blocked" ? "5 5" : undefined}
+                  strokeWidth={
+                    activeDirection === "blocked" || activeDirection === "idle" ? 1.2 : 2.2
+                  }
+                  strokeDasharray={
+                    activeDirection === "blocked" || activeDirection === "idle"
+                      ? "5 5"
+                      : undefined
+                  }
                 />
                 {activeDirection === "capture" && (
                   <circle r="4.5" fill="#34d399" filter="url(#glow)">
@@ -272,11 +292,21 @@ export function MemoryFlowCanvas({
               x="42"
               y="46"
               textAnchor="middle"
-              fill={activeDirection === "blocked" ? "#fbbf24" : "#818cf8"}
+              fill={
+                activeDirection === "blocked"
+                  ? "#fbbf24"
+                  : activeDirection === "idle"
+                    ? "#71717a"
+                    : "#818cf8"
+              }
               fontSize="9.5"
               fontFamily="Inter, sans-serif"
             >
-              {activeDirection === "blocked" ? "隐私拦截中" : "策略与预算门控"}
+              {activeDirection === "blocked"
+                ? "隐私拦截中"
+                : activeDirection === "idle"
+                  ? "等待事件触发"
+                  : "策略与预算门控"}
             </text>
           </g>
 

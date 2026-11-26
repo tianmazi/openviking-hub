@@ -1,7 +1,7 @@
 use chrono::Utc;
 use ov_core::dreaming::db::{DesktopDb, RecallEvent};
-use ov_core::ov_client::{ContextSearchRequest, OvClient};
-use ov_core::policy::model::{AgentId, ContextLayer};
+use ov_core::ov_client::{ContextSearchRequest, FindRequest, OvClient};
+use ov_core::policy::model::{AgentId, ContextLayer, PolicyConfig};
 use ov_core::policy::router::{is_protected_rule_path, resolve_route_for_agent};
 use ov_core::policy::store::PolicyStore;
 use ov_core::provenance::{render_with_provenance, wrap_ifc_readonly, MemoryProvenance};
@@ -12,17 +12,25 @@ use uuid::Uuid;
 
 pub async fn run_stdio_server(agent: AgentId) -> anyhow::Result<()> {
     let stdin = io::stdin();
+    let mut stdin = stdin.lock();
     let mut stdout = io::stdout();
+    let mut line = Vec::new();
 
-    for line in stdin.lock().lines() {
-        let line = line?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let req: Value = match serde_json::from_str(trimmed) {
+    while stdin.read_until(b'\n', &mut line)? != 0 {
+        let parsed = serde_json::from_slice(&line);
+        line.clear();
+        let req: Value = match parsed {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(_) => {
+                let response = json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": { "code": -32700, "message": "Parse error" }
+                });
+                writeln!(stdout, "{response}")?;
+                stdout.flush()?;
+                continue;
+            }
         };
 
         let id = req.get("id").cloned();
@@ -34,6 +42,7 @@ pub async fn run_stdio_server(agent: AgentId) -> anyhow::Result<()> {
         }
 
         let response = match method {
+            "ping" => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
             "initialize" => json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -96,7 +105,7 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Natural language search query" },
-                    "target_uri": { "type": "string", "description": "Optional viking:// scope override" },
+                    "target_uri": { "type": "string", "description": "Defaults to the workspace scope. Use a viking:// URI to override it or an empty string for global recall." },
                     "limit": { "type": "integer", "description": "Maximum items to return" }
                 },
                 "required": ["query"]
@@ -143,6 +152,19 @@ fn tool_definitions() -> Value {
 }
 
 async fn handle_tool_call(agent: AgentId, params: &Value) -> Result<String, String> {
+    let policy = PolicyStore::load_or_init().map_err(|e| e.to_string())?;
+    let client = OvClient::from_local_config().map_err(|e| e.to_string())?;
+    let db = DesktopDb::open_default().ok();
+    call_tool(agent, params, &policy, &client, db.as_ref()).await
+}
+
+pub(crate) async fn call_tool(
+    agent: AgentId,
+    params: &Value,
+    policy: &PolicyConfig,
+    client: &OvClient,
+    db: Option<&DesktopDb>,
+) -> Result<String, String> {
     let start = Instant::now();
     let name = params
         .get("name")
@@ -150,10 +172,7 @@ async fn handle_tool_call(agent: AgentId, params: &Value) -> Result<String, Stri
         .ok_or("Missing tool name")?;
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
 
-    let policy = PolicyStore::load_or_init().map_err(|e| e.to_string())?;
     let budget = policy.budget.resolve_for(agent);
-    let client = OvClient::from_local_config().map_err(|e| e.to_string())?;
-    let db = DesktopDb::open_default().ok();
 
     match name {
         "recall" => {
@@ -161,70 +180,93 @@ async fn handle_tool_call(agent: AgentId, params: &Value) -> Result<String, Stri
                 .get("query")
                 .and_then(|v| v.as_str())
                 .ok_or("Missing query")?;
-            let cwd = std::env::current_dir().unwrap_or_default();
-            let route = resolve_route_for_agent(&policy, &cwd, Some(agent));
             let target_uri = args
                 .get("target_uri")
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .or(Some(route.target_resource_uri.clone()));
+                .map(|uri| uri.trim().to_owned())
+                .unwrap_or_else(|| {
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    resolve_route_for_agent(policy, &cwd, Some(agent)).target_resource_uri
+                });
+            let target_uri = (!target_uri.is_empty()).then_some(target_uri);
             let limit = args.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
 
-            let res = client
-                .search_context(&ContextSearchRequest {
-                    query: query.to_string(),
-                    target_uri: target_uri.clone(),
-                    mode: Some("context".to_string()),
-                    limit,
-                })
-                .await
-                .map_err(|e| e.to_string())?;
+            let res = if target_uri.is_some() {
+                client
+                    .find(&FindRequest {
+                        query: query.to_string(),
+                        target_uri: target_uri.clone(),
+                        limit,
+                    })
+                    .await
+            } else {
+                client
+                    .search_context(&ContextSearchRequest {
+                        query: query.to_string(),
+                        target_uri: None,
+                        mode: Some("context".to_string()),
+                        limit,
+                    })
+                    .await
+            }
+            .map_err(|e| e.to_string())?;
 
-            let mut effective_layer = budget.default_recall_layer;
+            let top_hit = extract_top_hit(&res);
             let mut combined = serde_json::to_string_pretty(&res).unwrap_or_default();
+            let mut expansion = None;
 
             // Progressive L0 -> L1 auto-expansion when top hit exceeds threshold
-            if effective_layer == ContextLayer::L0 {
-                if let Some((top_uri, top_score)) = extract_top_hit(&res) {
-                    if top_score >= budget.auto_expand_l1_threshold as f64 {
-                        if let Ok(l1_val) = client.read_content(&top_uri, "l1").await {
-                            let l1_text = l1_val
-                                .as_str()
-                                .map(|s| s.to_string())
-                                .unwrap_or_else(|| {
-                                    serde_json::to_string_pretty(&l1_val).unwrap_or_default()
-                                });
-                            combined.push_str(&format!(
-                                "\n\n--- Auto-Expanded L1 Overview ({} | score {:.2}) ---\n{}",
-                                top_uri, top_score, l1_text
-                            ));
-                            effective_layer = ContextLayer::L1;
+            if let Some((top_uri, top_score)) = &top_hit {
+                if budget.default_recall_layer == ContextLayer::L0
+                    && *top_score >= budget.auto_expand_l1_threshold as f64
+                {
+                    if let Ok(l1_val) = client.read_content(top_uri, "l1").await {
+                        let l1_text = l1_val
+                            .as_str()
+                            .or_else(|| l1_val.get("content").and_then(Value::as_str))
+                            .or_else(|| l1_val.get("text").and_then(Value::as_str))
+                            .unwrap_or_default();
+                        if !l1_text.trim().is_empty() {
+                            let marker = format!(
+                                "\n\n--- Auto-Expanded L1 Overview ({top_uri} | score {top_score:.2}) ---\n"
+                            );
+                            expansion = Some(combined.len()..combined.len() + marker.len());
+                            combined.push_str(&marker);
+                            combined.push_str(l1_text);
                         }
                     }
                 }
             }
 
-            let budgeted = truncate_to_token_budget(&combined, budget.max_recall_tokens);
+            let text = truncate_to_token_budget(&combined, budget.max_recall_tokens);
+            let layer = if expansion
+                .is_some_and(|marker| text.get(marker.clone()) == combined.get(marker))
+            {
+                "l1"
+            } else {
+                budget.default_recall_layer.as_str()
+            };
             let wrapped = wrap_ifc_readonly(
-                &budgeted,
+                &text,
                 &format!("recall:{}", agent.as_str()),
                 "reference",
             );
             let approx_tokens = (wrapped.len() / 4) as i64;
 
             if let Some(db) = db {
-                let _ = db.record_event(&RecallEvent {
+                let evt = RecallEvent {
                     id: Uuid::new_v4().to_string(),
                     agent_id: agent.as_str().to_string(),
                     event_type: "recall".to_string(),
                     query: Some(query.to_string()),
-                    target_uri,
-                    layer: Some(effective_layer.as_str().to_string()),
+                    target_uri: top_hit.map(|(uri, _)| uri).or(target_uri),
+                    layer: Some(layer.to_string()),
                     tokens_used: approx_tokens,
                     latency_ms: start.elapsed().as_millis() as i64,
                     blocked_by_privacy: false,
                     created_at: Utc::now().timestamp(),
-                });
+                };
+                let _ = db.record_event_for_profile(&client.profile_key(), &evt);
             }
             Ok(wrapped)
         }
@@ -243,14 +285,14 @@ async fn handle_tool_call(agent: AgentId, params: &Value) -> Result<String, Stri
                 .unwrap_or(false);
 
             let cwd = std::env::current_dir().unwrap_or_default();
-            let route = resolve_route_for_agent(&policy, &cwd, Some(agent));
+            let route = resolve_route_for_agent(policy, &cwd, Some(agent));
             let base_prefix = if visibility == "private" {
                 route
                     .agent_private_memory_uri
-                    .clone()
-                    .unwrap_or_else(|| route.target_memory_uri.clone())
+                    .as_deref()
+                    .unwrap_or(&route.target_memory_uri)
             } else {
-                route.target_resource_uri.clone()
+                &route.target_resource_uri
             };
 
             let uri = args
@@ -258,16 +300,23 @@ async fn handle_tool_call(agent: AgentId, params: &Value) -> Result<String, Stri
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| {
+                    let base = base_prefix.trim_end_matches('/');
+                    let separator = match base {
+                        "viking:" => "//",
+                        "" => "",
+                        _ => "/",
+                    };
+                    let suffix = Uuid::new_v4().simple().to_string();
                     format!(
-                        "{}note-{}.md",
-                        base_prefix,
-                        Utc::now().format("%Y%m%d-%H%M%S")
+                        "{base}{separator}note-{}-{}.md",
+                        Utc::now().format("%Y%m%d-%H%M%S"),
+                        &suffix[..4],
                     )
                 });
 
             if !policy.global.capture_enabled {
                 if let Some(db) = db {
-                    let _ = db.record_event(&RecallEvent {
+                    let evt = RecallEvent {
                         id: Uuid::new_v4().to_string(),
                         agent_id: agent.as_str().to_string(),
                         event_type: "capture".to_string(),
@@ -278,7 +327,8 @@ async fn handle_tool_call(agent: AgentId, params: &Value) -> Result<String, Stri
                         latency_ms: start.elapsed().as_millis() as i64,
                         blocked_by_privacy: true,
                         created_at: Utc::now().timestamp(),
-                    });
+                    };
+                    let _ = db.record_event_for_profile(&client.profile_key(), &evt);
                 }
                 return Ok(
                     "Privacy Mode is enabled in OpenViking Desktop; memory write skipped."
@@ -286,7 +336,7 @@ async fn handle_tool_call(agent: AgentId, params: &Value) -> Result<String, Stri
                 );
             }
 
-            if is_protected_rule_path(&policy, &uri) {
+            if is_protected_rule_path(policy, &uri) {
                 return Err(format!(
                     "Write denied: '{}' is protected by routing.protected_rule_globs.",
                     uri
@@ -308,7 +358,7 @@ async fn handle_tool_call(agent: AgentId, params: &Value) -> Result<String, Stri
                 .await
                 .map_err(|e| e.to_string())?;
             if let Some(db) = db {
-                let _ = db.record_event(&RecallEvent {
+                let evt = RecallEvent {
                     id: Uuid::new_v4().to_string(),
                     agent_id: agent.as_str().to_string(),
                     event_type: "capture".to_string(),
@@ -319,7 +369,8 @@ async fn handle_tool_call(agent: AgentId, params: &Value) -> Result<String, Stri
                     latency_ms: start.elapsed().as_millis() as i64,
                     blocked_by_privacy: false,
                     created_at: Utc::now().timestamp(),
-                });
+                };
+                let _ = db.record_event_for_profile(&client.profile_key(), &evt);
             }
             Ok(serde_json::to_string_pretty(&res).unwrap_or_else(|_| "ok".to_string()))
         }
@@ -355,12 +406,12 @@ async fn handle_tool_call(agent: AgentId, params: &Value) -> Result<String, Stri
     }
 }
 
-fn extract_top_hit(val: &Value) -> Option<(String, f64)> {
+pub(crate) fn extract_top_hit(val: &Value) -> Option<(String, f64)> {
     let mut slices: Vec<&[Value]> = Vec::new();
     if let Some(items) = val.as_array() {
         slices.push(items);
     } else {
-        for key in ["items", "results", "memories", "resources", "skills"] {
+        for key in ["items", "results", "entries", "memories", "resources", "skills"] {
             if let Some(items) = val.get(key).and_then(|i| i.as_array()) {
                 slices.push(items);
             }
@@ -369,7 +420,7 @@ fn extract_top_hit(val: &Value) -> Option<(String, f64)> {
     let mut best: Option<(String, f64)> = None;
     for items in slices {
         for item in items {
-            let Some(uri) = item.get("uri").and_then(|u| u.as_str()) else {
+            let Some(uri) = item.get("uri").and_then(Value::as_str).filter(|uri| !uri.is_empty()) else {
                 continue;
             };
             let score = item

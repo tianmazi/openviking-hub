@@ -1,28 +1,24 @@
+use super::claude_code::{edit_mcp_server, json_path_exists, lock_configs, write_configs, ConfigFile};
 use crate::adapters::{AgentAdapter, AgentStatus, ConnectOptions};
-use crate::fs_util::atomic_write;
 use crate::platform::{probe_cli_version, PlatformPaths};
 use crate::policy::model::AgentId;
 use serde_json::json;
-use std::fs;
 use std::path::PathBuf;
 
 pub struct PiAdapter;
 
 impl PiAdapter {
-    fn extension_dir(paths: &PlatformPaths) -> PathBuf {
-        paths
-            .home
-            .join(".pi")
-            .join("extensions")
-            .join("openviking-bridge")
+    fn mcp_path(paths: &PlatformPaths) -> PathBuf {
+        paths.home.join(".pi/agent/mcp.json")
     }
 
-    fn manifest_path(paths: &PlatformPaths) -> PathBuf {
-        Self::extension_dir(paths).join("manifest.json")
+    fn extension_path(paths: &PlatformPaths) -> PathBuf {
+        paths.home.join(".pi/agent/extensions/openviking-bridge.js")
     }
 
     fn is_connected(paths: &PlatformPaths) -> bool {
-        Self::manifest_path(paths).is_file()
+        json_path_exists(Self::mcp_path(paths), &["mcpServers", "openviking"])
+            && Self::extension_path(paths).is_file()
     }
 }
 
@@ -47,12 +43,12 @@ impl AgentAdapter for PiAdapter {
             id: AgentId::Pi.as_str().to_string(),
             agent_id: AgentId::Pi,
             name: "pi Coding Agent".to_string(),
-            integration_mode: "Native Extension Bridge".to_string(),
+            integration_mode: "MCP + Lifecycle Extension".to_string(),
             installed,
             connected,
             detected_surfaces,
             binary_path: bin,
-            config_path: Some(Self::extension_dir(paths)),
+            config_path: Some(Self::mcp_path(paths)),
             version,
             warning: None,
             legacy_memory_files: self.scan_legacy_memories(paths),
@@ -60,88 +56,169 @@ impl AgentAdapter for PiAdapter {
     }
 
     fn connect(&self, paths: &PlatformPaths, opts: &ConnectOptions) -> Result<AgentStatus, String> {
-        let ext_dir = Self::extension_dir(paths);
-        fs::create_dir_all(&ext_dir).map_err(|e| e.to_string())?;
-
-        let manifest = json!({
-            "name": "openviking-bridge",
-            "version": env!("CARGO_PKG_VERSION"),
-            "entry": "index.mjs",
-            "bridge_binary": opts.bridge_binary.to_string_lossy(),
-            "tool_prefix": "openviking_",
-            "managed_by": "openviking-desktop"
-        });
-        let manifest_str = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
-        atomic_write(&ext_dir.join("manifest.json"), manifest_str.as_bytes(), false)
-            .map_err(|e| e.to_string())?;
-
-        let bridge_json =
-            serde_json::to_string(&opts.bridge_binary.to_string_lossy().to_string()).unwrap();
-        let entry_js = format!(
-            r#"// Managed by OpenViking Desktop — Native Extension Bridge for pi
-import {{ spawn }} from "node:child_process";
-
-const BRIDGE_BIN = {bridge_json};
-
-function callBridgeMcp(method, params = {{}}) {{
-  return new Promise((resolve, reject) => {{
-    const proc = spawn(BRIDGE_BIN, ["mcp", "--agent", "pi"], {{ stdio: ["pipe", "pipe", "pipe"] }});
-    let out = "";
-    proc.stdout.on("data", (chunk) => {{ out += chunk.toString(); }});
-    proc.on("error", reject);
-    proc.on("close", () => {{
-      const lines = out.trim().split("\n").filter(Boolean);
-      for (let i = lines.length - 1; i >= 0; i--) {{
-        try {{
-          const msg = JSON.parse(lines[i]);
-          if (msg.id === 1) return resolve(msg.result ?? msg.error);
-        }} catch {{}}
-      }}
-      resolve(null);
-    }});
-    proc.stdin.write(JSON.stringify({{ jsonrpc: "2.0", id: 1, method, params }}) + "\n");
-    proc.stdin.end();
-  }});
-}}
-
-export default async function registerOpenViking(pi) {{
-  const listed = await callBridgeMcp("tools/list");
-  const tools = listed?.tools ?? [];
-  for (const tool of tools) {{
-    pi.registerTool({{
-      name: `openviking_${{tool.name}}`,
-      description: tool.description,
-      parameters: tool.inputSchema,
-      async execute(args) {{
-        return callBridgeMcp("tools/call", {{ name: tool.name, arguments: args }});
-      }},
-    }});
-  }}
-}}
-"#,
-            bridge_json = bridge_json
-        );
-
-        atomic_write(&ext_dir.join("index.mjs"), entry_js.as_bytes(), false)
-            .map_err(|e| e.to_string())?;
-
+        let lock = lock_configs()?;
+        let mcp = ConfigFile::read(Self::mcp_path(paths))?;
+        let extension = ConfigFile::read(Self::extension_path(paths))?;
+        let bridge = opts.bridge_binary.to_string_lossy();
+        let mcp_content = edit_mcp_server(&mcp, Some(json!({
+            "command": bridge,
+            "args": ["mcp", "--agent", "pi"],
+            "exposure": "direct",
+            "description": "OpenViking shared memory recall and capture tools"
+        })))?;
+        let bridge_json = serde_json::to_string(&bridge).map_err(|e| e.to_string())?;
+        let extension_content = format!("const BRIDGE_BIN = {bridge_json};\n{LIFECYCLE_EXTENSION}");
+        write_configs("pi", &[
+            (&mcp, mcp_content.as_deref()),
+            (&extension, Some(&extension_content)),
+        ])?;
+        drop(lock);
         Ok(self.detect(paths))
     }
 
     fn disconnect(&self, paths: &PlatformPaths) -> Result<AgentStatus, String> {
-        let ext_dir = Self::extension_dir(paths);
-        if ext_dir.exists() {
-            fs::remove_dir_all(&ext_dir).map_err(|e| e.to_string())?;
+        let lock = lock_configs()?;
+        let mcp = ConfigFile::read(Self::mcp_path(paths))?;
+        let extension = ConfigFile::read(Self::extension_path(paths))?;
+        let mcp_content = edit_mcp_server(&mcp, None)?;
+        let legacy_dir = paths.home.join(".pi/extensions/openviking-bridge");
+        let manifest = ConfigFile::read(legacy_dir.join("manifest.json"))?;
+        let legacy_extension;
+        let mut edits = vec![(&mcp, mcp_content.as_deref()), (&extension, None)];
+        if manifest.json()?.get("managed_by").and_then(serde_json::Value::as_str)
+            == Some("openviking-desktop")
+        {
+            legacy_extension = ConfigFile::read(legacy_dir.join("index.mjs"))?;
+            edits.extend([(&legacy_extension, None), (&manifest, None)]);
         }
+        write_configs("pi", &edits)?;
+        drop(lock);
         Ok(self.detect(paths))
     }
 
     fn scan_legacy_memories(&self, paths: &PlatformPaths) -> Vec<PathBuf> {
-        let mut files = Vec::new();
-        let mem = paths.home.join(".pi").join("MEMORY.md");
-        if mem.is_file() {
-            files.push(mem);
-        }
-        files
+        [".pi/agent/MEMORY.md", ".pi/MEMORY.md"].iter()
+            .map(|path| paths.home.join(path))
+            .filter(|path| path.is_file())
+            .collect()
+    }
+}
+
+const LIFECYCLE_EXTENSION: &str = r#"import { execFileSync } from "node:child_process";
+
+function runHook(event, payload) {
+  try {
+    return execFileSync(BRIDGE_BIN, ["hook", event, "--agent", "pi"], {
+      input: JSON.stringify(payload),
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+      timeout: 30000,
+    }).trim();
+  } catch {
+    return "";
+  }
+}
+
+export default function (pi) {
+  const captured = new Set();
+
+  pi.on("before_agent_start", async (event, ctx) => {
+    captured.clear();
+    const recall = runHook("user-prompt-submit", { prompt: event.prompt, cwd: ctx.cwd });
+    if (recall && typeof event.systemPrompt === "string") {
+      return { systemPrompt: event.systemPrompt + "\n\n" + recall };
+    }
+  });
+
+  pi.on("agent_end", async (event, ctx) => {
+    for (const message of [...event.messages].reverse()) {
+      if (message.role !== "assistant") continue;
+      const text = message.content
+        .filter((block) => block.type === "text")
+        .map((block) => block.text)
+        .join("\n")
+        .trim();
+      if (!text) continue;
+      if (!captured.has(text)) {
+        captured.add(text);
+        runHook("stop", { last_assistant_message: text, cwd: ctx.cwd });
+      }
+      break;
+    }
+  });
+}
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn roundtrip_preserves_mcp_servers_and_unmanaged_files() {
+        let tmp = tempdir().unwrap();
+        let paths = PlatformPaths { home: tmp.path().to_path_buf() };
+        let mcp = PiAdapter::mcp_path(&paths);
+        let extension = PiAdapter::extension_path(&paths);
+        fs::create_dir_all(mcp.parent().unwrap()).unwrap();
+        let user = json!({ "mcpServers": { "magpie": { "command": "magpie", "exposure": "direct" } } });
+        fs::write(&mcp, user.to_string()).unwrap();
+        let legacy = tmp.path().join(".pi/extensions/openviking-bridge");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("manifest.json"), r#"{"managed_by":"openviking-desktop"}"#).unwrap();
+        fs::write(legacy.join("index.mjs"), "// old extension").unwrap();
+        fs::write(legacy.join("user.txt"), "preserve").unwrap();
+        fs::write(tmp.path().join(".pi/MEMORY.md"), "").unwrap();
+        fs::write(tmp.path().join(".pi/agent/MEMORY.md"), "").unwrap();
+
+        let opts = ConnectOptions {
+            bridge_binary: PathBuf::from("/test/ov-bridge"),
+            write_project_rules: false,
+            project_dir: None,
+        };
+        assert!(PiAdapter.connect(&paths, &opts).unwrap().connected);
+        let read_mcp = || serde_json::from_str::<Value>(&fs::read_to_string(&mcp).unwrap()).unwrap();
+        let connected = read_mcp();
+        assert_eq!(connected["mcpServers"]["magpie"], user["mcpServers"]["magpie"]);
+        assert_eq!(connected["mcpServers"]["openviking"], json!({
+            "command": "/test/ov-bridge",
+            "args": ["mcp", "--agent", "pi"],
+            "exposure": "direct",
+            "description": "OpenViking shared memory recall and capture tools"
+        }));
+        let js = fs::read_to_string(&extension).unwrap();
+        assert!(js.contains("before_agent_start") && js.contains("agent_end"));
+        assert!(!js.contains("registerTool"));
+        assert_eq!(PiAdapter.scan_legacy_memories(&paths).len(), 2);
+
+        assert!(!PiAdapter.disconnect(&paths).unwrap().connected);
+        assert_eq!(read_mcp(), user);
+        assert!(!extension.exists());
+        assert!(!legacy.join("manifest.json").exists());
+        assert!(!legacy.join("index.mjs").exists());
+        assert!(legacy.join("user.txt").is_file());
+
+        fs::write(legacy.join("manifest.json"), r#"{"managed_by":"other"}"#).unwrap();
+        fs::write(legacy.join("index.mjs"), "// user extension").unwrap();
+        PiAdapter.disconnect(&paths).unwrap();
+        assert!(legacy.join("manifest.json").is_file());
+        assert!(legacy.join("index.mjs").is_file());
+    }
+
+    #[test]
+    fn corrupt_mcp_config_preserves_existing_extension() {
+        let tmp = tempdir().unwrap();
+        let paths = PlatformPaths { home: tmp.path().to_path_buf() };
+        let mcp = PiAdapter::mcp_path(&paths);
+        let extension = PiAdapter::extension_path(&paths);
+        fs::create_dir_all(extension.parent().unwrap()).unwrap();
+        fs::write(&mcp, "{invalid").unwrap();
+        fs::write(&extension, "// keep").unwrap();
+        let error = PiAdapter.disconnect(&paths).unwrap_err();
+        assert!(error.contains(&mcp.display().to_string()));
+        assert_eq!(fs::read_to_string(extension).unwrap(), "// keep");
     }
 }

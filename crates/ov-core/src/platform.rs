@@ -1,4 +1,6 @@
+use crate::fs_util::atomic_write_with_mode;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -83,22 +85,25 @@ impl PlatformPaths {
             ));
         };
 
-        let needs_copy = match (fs::metadata(&src), fs::metadata(&dest)) {
-            (Ok(sm), Ok(dm)) => sm.len() != dm.len(),
-            (Ok(_), Err(_)) => true,
-            _ => false,
+        let source_bytes = fs::read(&src).map_err(|e| e.to_string())?;
+        let same_hash = match fs::read(&dest) {
+            Ok(bytes) => Sha256::digest(&source_bytes) == Sha256::digest(&bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e.to_string()),
         };
 
-        if needs_copy {
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
-            fs::copy(&src, &dest).map_err(|e| e.to_string())?;
+        if !same_hash {
+            atomic_write_with_mode(&dest, &source_bytes, Some(0o755))
+                .map_err(|e| e.to_string())?;
+        } else {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let perms = fs::Permissions::from_mode(0o755);
-                fs::set_permissions(&dest, perms).map_err(|e| e.to_string())?;
+                let mode = fs::metadata(&dest).map_err(|e| e.to_string())?.permissions().mode();
+                if mode & 0o7777 != 0o755 {
+                    fs::set_permissions(&dest, fs::Permissions::from_mode(0o755))
+                        .map_err(|e| e.to_string())?;
+                }
             }
         }
         Ok(dest)

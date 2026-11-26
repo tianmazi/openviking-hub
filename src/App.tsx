@@ -81,8 +81,14 @@ export default function App() {
   const handleSaveProfiles = async (next: ProfileStore) => {
     await api.saveProfiles(next);
     setProfiles(next);
-    const st = await api.getServerStatus();
+    const [st, chgs, rns] = await Promise.all([
+      api.getServerStatus(),
+      api.listPendingChanges(),
+      api.listDreamingRuns(),
+    ]);
     setServerStatus(st);
+    setChanges(chgs);
+    setRuns(rns);
     pushToast(
       st.reachable ? "success" : "info",
       st.reachable
@@ -107,8 +113,8 @@ export default function App() {
     );
   };
 
-  const handleConnectAgent = async (id: AgentId, writeRules: boolean) => {
-    const updated = await api.connectAgent(id, writeRules);
+  const handleConnectAgent = async (id: AgentId, writeRules: boolean, projectDir?: string) => {
+    const updated = await api.connectAgent(id, writeRules, projectDir);
     setAgents((prev) => prev.map((a) => (a.agent_id === id ? updated : a)));
   };
 
@@ -157,9 +163,11 @@ export default function App() {
     const report = await api.applyAcceptedChanges();
     setChanges(await api.listPendingChanges());
     setRuns(await api.listDreamingRuns());
+    const hasFailed = report.failed_items.length > 0;
     pushToast(
-      report.conflict_ids.length > 0 ? "info" : "success",
-      `已提交 ${report.applied_ids.length} 项变更，冲突拦截 ${report.conflict_ids.length} 项`,
+      hasFailed ? "error" : report.conflict_ids.length > 0 ? "info" : "success",
+      `已提交 ${report.applied_ids.length} 项，冲突 ${report.conflict_ids.length} 项` +
+        (hasFailed ? `，失败 ${report.failed_items.length} 项` : ""),
     );
     return report;
   };

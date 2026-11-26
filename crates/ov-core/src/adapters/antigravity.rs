@@ -1,9 +1,11 @@
+use super::claude_code::{
+    edit_mcp_server, hook_command, json_path_exists, lock_configs, prune_bridge_hooks,
+    write_configs, ConfigFile, HOOK_EVENTS,
+};
 use crate::adapters::{AgentAdapter, AgentStatus, ConnectOptions};
-use crate::fs_util::{atomic_write, backup_file};
 use crate::platform::{probe_cli_version, PlatformPaths};
 use crate::policy::model::AgentId;
-use serde_json::{json, Value};
-use std::fs;
+use serde_json::json;
 use std::path::PathBuf;
 
 pub struct AntigravityAdapter;
@@ -66,12 +68,60 @@ impl AntigravityAdapter {
         None
     }
 
+    fn edit_configs(
+        paths: &PlatformPaths,
+        bridge: Option<&str>,
+        rule: Option<&ConfigFile>,
+    ) -> Result<(), String> {
+        let mcp = ConfigFile::read(Self::mcp_config_path(paths))?;
+        let hooks = ConfigFile::read(Self::hooks_config_path(paths))?;
+        let mcp_content = edit_mcp_server(&mcp, bridge.map(|command| json!({
+            "command": command,
+            "args": ["mcp", "--agent", "antigravity"],
+            "disabled": false,
+            "timeoutSeconds": 60
+        })))?;
+        let hooks_content = Self::edit_hooks(&hooks, bridge)?;
+        let rule_content;
+        let mut edits = vec![(&mcp, mcp_content.as_deref()), (&hooks, hooks_content.as_deref())];
+        if let Some(rule) = rule {
+            let existing = rule.original.as_deref().unwrap_or_default();
+            if !existing.contains("openviking-desktop:start") {
+                rule_content = format!("{existing}{PROJECT_RULE_BLOCK}");
+                edits.push((rule, Some(rule_content.as_str())));
+            }
+        }
+        write_configs("antigravity", &edits)
+    }
+
+    fn edit_hooks(file: &ConfigFile, bridge: Option<&str>) -> Result<Option<String>, String> {
+        let mut root = file.json()?;
+        let mut changed = false;
+        for (event, _) in HOOK_EVENTS {
+            if root.get(event).is_some_and(serde_json::Value::is_array) {
+                changed |= prune_bridge_hooks(&mut root, event, file, false)?;
+            }
+        }
+        if let Some(bridge) = bridge {
+            let agent = AgentId::Antigravity;
+            root.insert("openviking".to_string(), json!({
+                "SessionStart": [hook_command(bridge, "session-start", agent)],
+                "PreInvocation": [hook_command(bridge, "pre-invocation", agent)],
+                "Stop": [hook_command(bridge, "stop", agent)]
+            }));
+            changed = true;
+        } else {
+            changed |= root.remove("openviking").is_some();
+        }
+        if !changed {
+            return Ok(file.original.clone());
+        }
+        serde_json::to_string_pretty(&root).map(Some).map_err(|e| file.invalid(e))
+    }
+
     fn is_connected(paths: &PlatformPaths) -> bool {
-        fs::read_to_string(Self::mcp_config_path(paths))
-            .ok()
-            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-            .and_then(|v| v.get("mcpServers")?.get("openviking").cloned())
-            .is_some()
+        json_path_exists(Self::mcp_config_path(paths), &["mcpServers", "openviking"])
+            && json_path_exists(Self::hooks_config_path(paths), &["openviking"])
     }
 }
 
@@ -124,129 +174,20 @@ impl AgentAdapter for AntigravityAdapter {
     }
 
     fn connect(&self, paths: &PlatformPaths, opts: &ConnectOptions) -> Result<AgentStatus, String> {
-        let bridge = opts.bridge_binary.to_string_lossy().to_string();
-
-        // 1. Merge global MCP config into ~/.gemini/config/mcp_config.json
-        let mcp_path = Self::mcp_config_path(paths);
-        backup_file("antigravity", &mcp_path).map_err(|e| e.to_string())?;
-        let mut root: Value = if mcp_path.exists() {
-            let raw = fs::read_to_string(&mcp_path).map_err(|e| e.to_string())?;
-            serde_json::from_str(&raw).unwrap_or_else(|_| json!({}))
-        } else {
-            json!({})
-        };
-        if !root.is_object() {
-            root = json!({});
-        }
-        let servers = root
-            .as_object_mut()
-            .unwrap()
-            .entry("mcpServers")
-            .or_insert_with(|| json!({}));
-        if !servers.is_object() {
-            *servers = json!({});
-        }
-        servers.as_object_mut().unwrap().insert(
-            "openviking".to_string(),
-            json!({
-                "command": bridge,
-                "args": ["mcp", "--agent", "antigravity"],
-                "disabled": false,
-                "timeoutSeconds": 60
-            }),
-        );
-        let serialized = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
-        atomic_write(&mcp_path, serialized.as_bytes(), false).map_err(|e| e.to_string())?;
-
-        // 2. Merge global Hooks into ~/.gemini/config/hooks.json (Antigravity 2.0 standard)
-        let hooks_path = Self::hooks_config_path(paths);
-        backup_file("antigravity", &hooks_path).map_err(|e| e.to_string())?;
-        let mut hooks_root: Value = if hooks_path.exists() {
-            let raw = fs::read_to_string(&hooks_path).map_err(|e| e.to_string())?;
-            serde_json::from_str(&raw).unwrap_or_else(|_| json!({}))
-        } else {
-            json!({})
-        };
-        if !hooks_root.is_object() {
-            hooks_root = json!({});
-        }
-        let hooks_obj = hooks_root.as_object_mut().unwrap();
-        for (event_name, cli_event) in [
-            ("SessionStart", "session-start"),
-            ("UserPromptSubmit", "user-prompt-submit"),
-            ("Stop", "stop"),
-        ] {
-            let cmd = format!("\"{}\" hook {} --agent antigravity", bridge, cli_event);
-            hooks_obj.insert(
-                event_name.to_string(),
-                json!([
-                    {
-                        "matcher": "",
-                        "hooks": [
-                            {
-                                "type": "command",
-                                "command": cmd
-                            }
-                        ]
-                    }
-                ]),
-            );
-        }
-        let hooks_str = serde_json::to_string_pretty(&hooks_root).map_err(|e| e.to_string())?;
-        atomic_write(&hooks_path, hooks_str.as_bytes(), false).map_err(|e| e.to_string())?;
-
-        // 3. Optional project rule block
-        if opts.write_project_rules {
-            if let Some(proj) = &opts.project_dir {
-                let rule_file = proj.join(".agents").join("rules").join("openviking-memory.md");
-                let existing = fs::read_to_string(&rule_file).unwrap_or_default();
-                if !existing.contains("openviking-desktop:start") {
-                    let updated = format!("{}{}", existing, PROJECT_RULE_BLOCK);
-                    atomic_write(&rule_file, updated.as_bytes(), false)
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-        }
-
+        let lock = lock_configs()?;
+        let rule_path = opts.project_dir.as_ref().filter(|_| opts.write_project_rules)
+            .map(|proj| proj.join(".agents/rules/openviking-memory.md"));
+        let rule = rule_path.map(ConfigFile::read).transpose()?;
+        let bridge = opts.bridge_binary.to_string_lossy();
+        Self::edit_configs(paths, Some(&bridge), rule.as_ref())?;
+        drop(lock);
         Ok(self.detect(paths))
     }
 
     fn disconnect(&self, paths: &PlatformPaths) -> Result<AgentStatus, String> {
-        let mcp_path = Self::mcp_config_path(paths);
-        if mcp_path.exists() {
-            backup_file("antigravity", &mcp_path).map_err(|e| e.to_string())?;
-            if let Ok(raw) = fs::read_to_string(&mcp_path) {
-                if let Ok(mut root) = serde_json::from_str::<Value>(&raw) {
-                    if let Some(servers) = root.get_mut("mcpServers").and_then(|v| v.as_object_mut())
-                    {
-                        servers.remove("openviking");
-                    }
-                    let out = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
-                    atomic_write(&mcp_path, out.as_bytes(), false).map_err(|e| e.to_string())?;
-                }
-            }
-        }
-
-        let hooks_path = Self::hooks_config_path(paths);
-        if hooks_path.exists() {
-            backup_file("antigravity", &hooks_path).map_err(|e| e.to_string())?;
-            if let Ok(raw) = fs::read_to_string(&hooks_path) {
-                if let Ok(mut root) = serde_json::from_str::<Value>(&raw) {
-                    if let Some(obj) = root.as_object_mut() {
-                        for key in ["SessionStart", "UserPromptSubmit", "Stop"] {
-                            if let Some(val) = obj.get(key) {
-                                if val.to_string().contains("ov-bridge") {
-                                    obj.remove(key);
-                                }
-                            }
-                        }
-                    }
-                    let out = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
-                    atomic_write(&hooks_path, out.as_bytes(), false).map_err(|e| e.to_string())?;
-                }
-            }
-        }
-
+        let lock = lock_configs()?;
+        Self::edit_configs(paths, None, None)?;
+        drop(lock);
         Ok(self.detect(paths))
     }
 
@@ -263,6 +204,8 @@ impl AgentAdapter for AntigravityAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
+    use std::fs;
     use tempfile::tempdir;
 
     #[test]
@@ -277,13 +220,55 @@ mod tests {
             write_project_rules: false,
             project_dir: None,
         };
-        let status = adapter.connect(&paths, &opts).unwrap();
-        assert!(status.connected);
-        let hooks = fs::read_to_string(paths.home.join(".gemini/config/hooks.json")).unwrap();
-        assert!(hooks.contains("ov-bridge"));
-        assert!(hooks.contains("hook session-start --agent antigravity"));
+        let path = AntigravityAdapter::hooks_config_path(&paths);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let user = json!({ "type": "command", "command": "user hook" });
+        let legacy = json!({
+            "user": { "Stop": [user] },
+            "SessionStart": [
+                { "matcher": "", "hooks": [user, { "command": "/old/ov-bridge" }] }
+            ],
+            "UserPromptSubmit": [{ "command": "/old/ov-bridge" }]
+        });
+        fs::write(&path, legacy.to_string()).unwrap();
+        let mcp_path = AntigravityAdapter::mcp_config_path(&paths);
+        fs::write(&mcp_path, r#"{"mcpServers":{"user":{"command":"user-mcp"}}}"#).unwrap();
+
+        for _ in 0..2 {
+            assert!(adapter.connect(&paths, &opts).unwrap().connected);
+        }
+        let read_hooks = || serde_json::from_str::<Value>(&fs::read_to_string(&path).unwrap()).unwrap();
+        let retained = json!({
+            "user": { "Stop": [user] },
+            "SessionStart": [{ "matcher": "", "hooks": [user] }]
+        });
+        let mut hooks = read_hooks();
+        assert_eq!(hooks["openviking"], json!({
+            "SessionStart": [{ "type": "command", "command": "\"/usr/local/bin/ov-bridge\" hook session-start --agent antigravity" }],
+            "PreInvocation": [{ "type": "command", "command": "\"/usr/local/bin/ov-bridge\" hook pre-invocation --agent antigravity" }],
+            "Stop": [{ "type": "command", "command": "\"/usr/local/bin/ov-bridge\" hook stop --agent antigravity" }]
+        }));
+        hooks.as_object_mut().unwrap().remove("openviking");
+        assert_eq!(hooks, retained);
 
         let after = adapter.disconnect(&paths).unwrap();
         assert!(!after.connected);
+        assert_eq!(read_hooks(), retained);
+        assert!(json_path_exists(mcp_path, &["mcpServers", "user"]));
+    }
+
+    #[test]
+    fn invalid_hooks_leave_mcp_untouched() {
+        let tmp = tempdir().unwrap();
+        let paths = PlatformPaths { home: tmp.path().to_path_buf() };
+        let mcp = AntigravityAdapter::mcp_config_path(&paths);
+        let hooks = AntigravityAdapter::hooks_config_path(&paths);
+        fs::create_dir_all(hooks.parent().unwrap()).unwrap();
+        fs::write(&mcp, "{}\n").unwrap();
+        fs::write(&hooks, "[]").unwrap();
+        let error = AntigravityAdapter::edit_configs(&paths, Some("/test/ov-bridge"), None).unwrap_err();
+        assert!(error.contains(&hooks.display().to_string()));
+        assert_eq!(fs::read_to_string(mcp).unwrap(), "{}\n");
+        assert_eq!(fs::read_to_string(hooks).unwrap(), "[]");
     }
 }

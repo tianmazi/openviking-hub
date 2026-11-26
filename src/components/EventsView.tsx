@@ -29,9 +29,25 @@ export function EventsView({ agents, captureEnabled }: EventsViewProps) {
 
   useEffect(() => {
     load();
+    const timer = window.setInterval(load, 5000);
+    return () => window.clearInterval(timer);
   }, [agentFilter]);
 
   const observer = (status?.observer ?? {}) as Record<string, unknown>;
+  const components = (observer.components ?? {}) as Record<
+    string,
+    { is_healthy?: boolean; has_errors?: boolean }
+  >;
+  const queueLabel = components.queue
+    ? components.queue.is_healthy
+      ? "healthy"
+      : "degraded"
+    : String(observer.queue ?? "idle");
+  const vikingdbLabel = components.vikingdb
+    ? components.vikingdb.is_healthy
+      ? "healthy"
+      : "degraded"
+    : String(observer.vikingdb ?? "ready");
   const totalTokens = events.reduce((acc, e) => acc + e.tokens_used, 0);
 
   return (
@@ -76,7 +92,7 @@ export function EventsView({ agents, captureEnabled }: EventsViewProps) {
           <div className="min-w-0">
             <div className="text-[11px] text-zinc-400">Observer (Queue / VikingDB)</div>
             <div className="text-xs font-mono text-zinc-100 truncate">
-              {String(observer.queue ?? "idle")} / {String(observer.vikingdb ?? "ready")}
+              {queueLabel} / {vikingdbLabel}
             </div>
           </div>
         </div>

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { FilePlus2, FileText, Folder, Inbox, Save, Search, Trash2 } from "lucide-react";
 import { api } from "../lib/tauri";
 import type { ContextLayer, LayeredContent } from "../types/openviking";
@@ -16,6 +16,10 @@ export function ExplorerView() {
     Array<{ name: string; uri: string; isDir?: boolean; size?: number }>
   >([]);
   const [selectedUri, setSelectedUri] = useState<string | null>(null);
+  const [loadedUri, setLoadedUri] = useState<string | null>(null);
+  const [loadingLayer, setLoadingLayer] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [layers, setLayers] = useState<LayeredContent | null>(null);
   const [activeLayer, setActiveLayer] = useState<ContextLayer>("l2");
   const [draftL2, setDraftL2] = useState("");
@@ -24,6 +28,7 @@ export function ExplorerView() {
   const [searchQuery, setSearchQuery] = useState("");
   const [newFileName, setNewFileName] = useState("");
   const [showNewInput, setShowNewInput] = useState(false);
+  const readReqIdRef = useRef(0);
 
   const loadList = async (uri: string) => {
     const list = await api.fsLs(uri);
@@ -37,21 +42,59 @@ export function ExplorerView() {
   }, [scopeUri]);
 
   useEffect(() => {
-    if (!selectedUri) return;
-    api.readUriLayers(selectedUri).then((data) => {
-      setLayers(data);
-      setDraftL2(data.l2);
-      setSavedNotice(null);
-    });
+    const reqId = ++readReqIdRef.current;
+    if (!selectedUri) {
+      setLoadedUri(null);
+      setLayers(null);
+      setDraftL2("");
+      setLoadError(null);
+      setSaveError(null);
+      setLoadingLayer(false);
+      return;
+    }
+    const targetUri = selectedUri;
+    setLoadedUri(null);
+    setLoadError(null);
+    setSaveError(null);
+    setSavedNotice(null);
+    setLoadingLayer(true);
+    api
+      .readUriLayers(targetUri)
+      .then((data) => {
+        if (readReqIdRef.current !== reqId) return;
+        setLayers(data);
+        setDraftL2(data.l2);
+        setLoadedUri(targetUri);
+        setLoadError(null);
+      })
+      .catch((err) => {
+        if (readReqIdRef.current !== reqId) return;
+        setLayers(null);
+        setDraftL2("");
+        setLoadedUri(null);
+        setLoadError(`读取失败（已锁定保存防覆盖）：${String(err)}`);
+      })
+      .finally(() => {
+        if (readReqIdRef.current === reqId) setLoadingLayer(false);
+      });
   }, [selectedUri]);
 
+  const canSaveL2 =
+    Boolean(selectedUri) && loadedUri === selectedUri && !loadingLayer && !loadError && !saving;
+
   const handleSave = async () => {
-    if (!selectedUri) return;
+    if (!selectedUri || loadedUri !== selectedUri || loadingLayer || loadError) return;
+    const targetUri = selectedUri;
     setSaving(true);
+    setSaveError(null);
     try {
-      await api.writeUriContent(selectedUri, draftL2);
-      setLayers((prev) => (prev ? { ...prev, l2: draftL2 } : prev));
-      setSavedNotice("已写回远端并触发语义索引刷新");
+      await api.writeUriContent(targetUri, draftL2);
+      if (loadedUri === targetUri) {
+        setLayers((prev) => (prev ? { ...prev, l2: draftL2 } : prev));
+        setSavedNotice("已写回远端并触发语义索引刷新");
+      }
+    } catch (err) {
+      setSaveError(`保存失败（可重试）：${String(err)}`);
     } finally {
       setSaving(false);
     }
@@ -221,17 +264,27 @@ export function ExplorerView() {
             {activeLayer === "l2" && (
               <button
                 onClick={handleSave}
-                disabled={saving || !selectedUri}
+                disabled={!canSaveL2}
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-xs font-medium text-white disabled:opacity-50"
               >
                 <Save className="w-3.5 h-3.5" />
-                {saving ? "保存中..." : "保存 L2"}
+                {saving ? "保存中..." : loadingLayer ? "加载中..." : "保存 L2"}
               </button>
             )}
           </div>
         </div>
 
         <div className="flex-1 p-5 overflow-y-auto">
+          {loadError && (
+            <div className="mb-3 px-3 py-2 rounded-lg bg-rose-500/10 border border-rose-500/25 text-xs text-rose-300">
+              {loadError}
+            </div>
+          )}
+          {saveError && (
+            <div className="mb-3 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/25 text-xs text-amber-200">
+              {saveError}
+            </div>
+          )}
           {savedNotice && (
             <div className="mb-3 px-3 py-2 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-xs text-emerald-300">
               {savedNotice}
@@ -240,8 +293,10 @@ export function ExplorerView() {
           {activeLayer === "l2" ? (
             <textarea
               value={draftL2}
+              disabled={!selectedUri || loadedUri !== selectedUri || loadingLayer || Boolean(loadError)}
               onChange={(e) => setDraftL2(e.target.value)}
-              className="w-full h-full min-h-[420px] bg-surface-1 border border-border-subtle rounded-xl p-4 font-mono text-xs text-zinc-200 leading-relaxed focus:outline-none focus:border-indigo-500/40 resize-none"
+              placeholder={loadingLayer ? "正在加载远端 L2 原文..." : "请选择左侧文件"}
+              className="w-full h-full min-h-[420px] bg-surface-1 border border-border-subtle rounded-xl p-4 font-mono text-xs text-zinc-200 leading-relaxed focus:outline-none focus:border-indigo-500/40 resize-none disabled:opacity-60"
             />
           ) : (
             <pre className="w-full bg-surface-1 border border-border-subtle rounded-xl p-4 font-mono text-xs text-zinc-300 whitespace-pre-wrap leading-relaxed">

@@ -175,7 +175,9 @@ pub async fn read_uri_layers(uri: String) -> Result<LayeredContent, String> {
     let client = OvClient::from_local_config().map_err(|e| e.to_string())?;
     let l0 = extract_text(client.read_content(&uri, "l0").await.ok());
     let l1 = extract_text(client.read_content(&uri, "l1").await.ok());
-    let l2 = extract_text(client.read_content(&uri, "l2").await.ok());
+    let l2 = extract_text(Some(
+        client.read_content(&uri, "l2").await.map_err(|e| e.to_string())?,
+    ));
     Ok(LayeredContent { uri, l0, l1, l2 })
 }
 
@@ -193,8 +195,9 @@ pub fn list_recall_events(
     agent_filter: Option<String>,
     limit: Option<usize>,
 ) -> Result<Vec<RecallEvent>, String> {
+    let client = OvClient::from_local_config().map_err(|e| e.to_string())?;
     let db = DesktopDb::open_default()?;
-    db.list_events(agent_filter.as_deref(), limit.unwrap_or(100))
+    db.list_events_for_profile(&client.profile_key(), agent_filter.as_deref(), limit.unwrap_or(100))
 }
 
 #[tauri::command]
@@ -207,16 +210,18 @@ pub async fn trigger_dreaming() -> Result<(DreamingRun, Vec<PendingMemoryChange>
 
 #[tauri::command]
 pub fn list_dreaming_runs(limit: Option<usize>) -> Result<Vec<DreamingRun>, String> {
+    let client = OvClient::from_local_config().map_err(|e| e.to_string())?;
     let db = DesktopDb::open_default()?;
-    db.list_runs(limit.unwrap_or(20))
+    db.list_runs_for_profile(&client.profile_key(), limit.unwrap_or(20))
 }
 
 #[tauri::command]
 pub fn list_pending_changes(
     status_filter: Option<String>,
 ) -> Result<Vec<PendingMemoryChange>, String> {
+    let client = OvClient::from_local_config().map_err(|e| e.to_string())?;
     let db = DesktopDb::open_default()?;
-    db.list_pending_changes(status_filter.as_deref())
+    db.list_pending_changes_for_profile(&client.profile_key(), status_filter.as_deref())
 }
 
 #[tauri::command]
@@ -225,8 +230,11 @@ pub fn update_change_decision(
     status: ReviewStatus,
     edited_after_content: Option<String>,
 ) -> Result<(), String> {
+    let client = OvClient::from_local_config().map_err(|e| e.to_string())?;
     let db = DesktopDb::open_default()?;
-    db.update_change_decision(&id, status, edited_after_content.as_deref())
+    db.update_change_decision_for_profile(
+        &client.profile_key(), &id, status, edited_after_content.as_deref(),
+    )
 }
 
 #[tauri::command]
@@ -246,8 +254,9 @@ pub async fn rollback_dreaming_run(run_id: String) -> Result<Value, String> {
 
 #[tauri::command]
 pub fn pin_memory_uri(uri: String) -> Result<(), String> {
+    let client = OvClient::from_local_config().map_err(|e| e.to_string())?;
     let db = DesktopDb::open_default()?;
-    db.pin_uri(&uri)
+    db.pin_uri_for_profile(&client.profile_key(), &uri)
 }
 
 fn extract_text(val: Option<Value>) -> String {

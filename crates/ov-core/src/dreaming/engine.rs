@@ -1,16 +1,16 @@
 use crate::dreaming::db::{DesktopDb, DreamingRun};
 use crate::dreaming::reflector::{reflect_inbox_route, reflect_merge};
 use crate::fs_util::sha256_hex;
-use crate::ov_client::{FindRequest, OvClient};
+use crate::ov_client::{snapshot_commit_id, FindRequest, OvClient, OvClientError};
 use crate::policy::model::{
     ChangeAction, MemoryCategory, PendingMemoryChange, PolicyConfig, ReviewStatus, RiskLevel,
 };
 use crate::policy::router::is_protected_rule_path;
 use crate::provenance::{is_write_gate_verified, render_with_provenance, MemoryProvenance};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,9 +29,21 @@ pub async fn run_dreaming(
     policy: &PolicyConfig,
     trigger_source: &str,
 ) -> Result<(DreamingRun, Vec<PendingMemoryChange>), String> {
+    let profile_key = client.profile_key();
+    let mut mem_root = "viking://~/memories/";
+    let mut mem_tree = client.tree(mem_root).await;
+    if matches!(&mem_tree, Err(e) if is_not_found(e)) {
+        mem_root = "viking://user/memories/";
+        mem_tree = client.tree(mem_root).await;
+    }
+    let mem_tree = match mem_tree {
+        Ok(tree) => Some(tree),
+        Err(e) if is_not_found(&e) => None,
+        Err(e) => return Err(e.to_string()),
+    };
+    let hit_stats = db.hit_stats_by_uri_for_profile(&profile_key)?;
     let run_id = format!("dream-{}", Uuid::new_v4().simple());
-    let mut run = db.create_run(&run_id, trigger_source)?;
-    let hit_stats = db.hit_stats_by_uri()?;
+    let mut run = db.create_run_for_profile(&profile_key, &run_id, trigger_source)?;
     let now = Utc::now().timestamp();
     let stale_cutoff = now - (policy.lifecycle.archival.stale_days as i64 * 86_400);
 
@@ -44,19 +56,32 @@ pub async fn run_dreaming(
         "wiki_compile": 0
     });
 
+    let project_root = "viking://resources/projects/";
     let available_projects: Vec<String> = client
-        .ls("viking://resources/projects/")
+        .ls(project_root)
         .await
-        .map(|v| extract_uri_entries(&v))
+        .map(|value| {
+            listing_entries(&value)
+                .into_iter()
+                .filter(|entry| is_directory(entry))
+                .filter_map(|entry| entry.get("uri").and_then(Value::as_str))
+                .filter(|uri| uri.starts_with(project_root) && *uri != project_root)
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        })
         .unwrap_or_default();
 
     // Analyzer 1: Inbox Sorter (uses optional LLM/CLI reflector when enabled)
     if let Ok(inbox_ls) = client.ls(&policy.routing.inbox_uri).await {
-        for entry in extract_uri_entries(&inbox_ls) {
-            if is_protected_rule_path(policy, &entry) || db.is_pinned(&entry)? {
+        for entry in listing_entries(&inbox_ls).into_iter().filter_map(file_uri) {
+            if is_protected_rule_path(policy, entry)
+                || db.is_pinned_for_profile(&profile_key, entry)?
+            {
                 continue;
             }
-            let content = read_text_safely(client, &entry).await;
+            let content = read_text(client, entry).await.ok();
             let base_hash = content.as_deref().map(sha256_hex);
             let file_name = entry.rsplit('/').next().unwrap_or("note.md");
             let fallback_dir = format!(
@@ -68,7 +93,7 @@ pub async fn run_dreaming(
             let (suggested_dest, rationale, reflector_label) = if let Some(ref raw) = content {
                 if let Some(res) = reflect_inbox_route(
                     &policy.lifecycle.dreaming,
-                    &entry,
+                    entry,
                     raw,
                     &available_projects,
                     &fallback_dir,
@@ -102,9 +127,9 @@ pub async fn run_dreaming(
                 created_at: now,
                 action: ChangeAction::MoveFromInbox,
                 risk_level: RiskLevel::Medium,
-                target_uri: entry.clone(),
+                target_uri: entry.to_string(),
                 destination_uri: Some(suggested_dest),
-                category: MemoryCategory::from_uri(&entry),
+                category: MemoryCategory::from_uri(entry),
                 base_hash,
                 before_content: content.clone(),
                 after_content: content,
@@ -117,7 +142,7 @@ pub async fn run_dreaming(
                 .to_string(),
                 status: ReviewStatus::Pending,
             };
-            db.insert_pending_change(&change)?;
+            db.insert_pending_change_for_profile(&profile_key, &change)?;
             staged.push(change);
             counts["inbox"] = json!(counts["inbox"].as_u64().unwrap_or(0) + 1);
         }
@@ -125,30 +150,26 @@ pub async fn run_dreaming(
 
     // Analyzer 2 & 3: Semantic Conflict/Dedupe Merger + Hot Promote (with Write-Gate) + Cold Archival
     let mut seen_merge_pairs: HashSet<(String, String)> = HashSet::new();
-    let (mem_root, mem_tree_res) = match client.tree("viking://~/memories/").await {
-        Ok(tree) => ("viking://~/memories/", Ok(tree)),
-        Err(_) => (
-            "viking://user/memories/",
-            client.tree("viking://user/memories/").await,
-        ),
-    };
-    if let Ok(mem_tree) = mem_tree_res {
-        for uri in extract_uri_entries(&mem_tree) {
-            if is_protected_rule_path(policy, &uri) || db.is_pinned(&uri)? {
+    if let Some(mem_tree) = mem_tree {
+        for item in listing_entries(&mem_tree) {
+            let Some(uri) = file_uri(item) else {
+                continue;
+            };
+            if is_protected_rule_path(policy, uri) || db.is_pinned_for_profile(&profile_key, uri)? {
                 continue;
             }
-            let category = MemoryCategory::from_uri(&uri);
-            let stat = hit_stats.get(&uri);
+            let category = MemoryCategory::from_uri(uri);
+            let stat = hit_stats.get(uri);
             let hit_count = stat.map(|s| s.hit_count).unwrap_or(0);
             let last_hit = stat.map(|s| s.last_hit_at).unwrap_or(0);
             let agents = stat.map(|s| s.agents.clone()).unwrap_or_default();
 
             // 3a. Hot memory promotion with Anti-Contagion Write-Gate
             if policy.lifecycle.dreaming.promote_hot_notes && hit_count >= 5 && agents.len() >= 2 {
-                let content = read_text_safely(client, &uri).await;
+                let content = read_text(client, uri).await.ok();
                 let gate_ok = content
                     .as_deref()
-                    .map(|raw| is_write_gate_verified(raw, hit_count as i64, agents.len()))
+                    .map(|raw| is_write_gate_verified(raw, i64::from(hit_count), agents.len()))
                     .unwrap_or(false);
                 if gate_ok {
                     let base_hash = content.as_deref().map(sha256_hex);
@@ -159,7 +180,7 @@ pub async fn run_dreaming(
                         created_at: now,
                         action: ChangeAction::PromoteToIndex,
                         risk_level: RiskLevel::Low,
-                        target_uri: uri.clone(),
+                        target_uri: uri.to_string(),
                         destination_uri: None,
                         category,
                         base_hash,
@@ -179,18 +200,24 @@ pub async fn run_dreaming(
                         .to_string(),
                         status: ReviewStatus::Pending,
                     };
-                    db.insert_pending_change(&change)?;
+                    db.insert_pending_change_for_profile(&profile_key, &change)?;
                     staged.push(change);
                     counts["promote"] = json!(counts["promote"].as_u64().unwrap_or(0) + 1);
                 }
             }
 
             // 3b. Cold memory archival check
+            let mod_time_ts = item
+                .get("modTime")
+                .and_then(Value::as_str)
+                .and_then(|time| DateTime::parse_from_rfc3339(time).ok())
+                .map(|time| time.timestamp());
             if policy.lifecycle.archival.enabled
                 && hit_count < policy.lifecycle.archival.min_hit_count
-                && last_hit < stale_cutoff
+                && ((hit_count > 0 && last_hit < stale_cutoff)
+                    || (hit_count == 0 && mod_time_ts.is_some_and(|ts| ts < stale_cutoff)))
             {
-                let content = read_text_safely(client, &uri).await;
+                let content = read_text(client, uri).await.ok();
                 let base_hash = content.as_deref().map(sha256_hex);
                 let file_name = uri.rsplit('/').next().unwrap_or("memory.md");
                 let dest = format!(
@@ -205,7 +232,7 @@ pub async fn run_dreaming(
                     created_at: now,
                     action: ChangeAction::Archive,
                     risk_level: RiskLevel::Low,
-                    target_uri: uri.clone(),
+                    target_uri: uri.to_string(),
                     destination_uri: Some(dest),
                     category,
                     base_hash,
@@ -218,19 +245,20 @@ pub async fn run_dreaming(
                     evidence_json: json!({
                         "hit_count": hit_count,
                         "last_hit_at": last_hit,
+                        "mod_time": mod_time_ts,
                         "agents": agents
                     })
                     .to_string(),
                     status: ReviewStatus::Pending,
                 };
-                db.insert_pending_change(&change)?;
+                db.insert_pending_change_for_profile(&profile_key, &change)?;
                 staged.push(change);
                 counts["archive"] = json!(counts["archive"].as_u64().unwrap_or(0) + 1);
             }
 
             // 2. Semantic conflict & dedupe merger (strictly mutable categories only)
             if policy.lifecycle.dreaming.dedupe_and_merge && policy.lifecycle.is_mutable(category) {
-                if let Some(content) = read_text_safely(client, &uri).await {
+                if let Ok(content) = read_text(client, uri).await {
                     let snippet: String = content.chars().take(240).collect();
                     if snippet.trim().len() >= 20 {
                         let scope = format!("{}{}/", mem_root, category.as_str());
@@ -243,26 +271,28 @@ pub async fn run_dreaming(
                             .await
                         {
                             for (other_uri, score) in extract_scored_uris(&found) {
-                                if other_uri == uri
+                                if other_uri.as_str() == uri
                                     || score < 0.85
                                     || is_protected_rule_path(policy, &other_uri)
                                 {
                                     continue;
                                 }
-                                let pair = if uri < other_uri {
-                                    (uri.clone(), other_uri.clone())
+                                let pair = if uri < other_uri.as_str() {
+                                    (uri.to_string(), other_uri.clone())
                                 } else {
-                                    (other_uri.clone(), uri.clone())
+                                    (other_uri.clone(), uri.to_string())
                                 };
                                 if !seen_merge_pairs.insert(pair) {
                                     continue;
                                 }
-                                let other_content =
-                                    read_text_safely(client, &other_uri).await.unwrap_or_default();
+                                let Ok(other_content) = read_text(client, &other_uri).await
+                                else {
+                                    continue;
+                                };
 
                                 let (merged_body, reflector_label) = match reflect_merge(
                                     &policy.lifecycle.dreaming,
-                                    &uri,
+                                    uri,
                                     &content,
                                     &other_uri,
                                     &other_content,
@@ -283,7 +313,7 @@ pub async fn run_dreaming(
                                     score as f32,
                                 );
                                 prov.updated_by = format!("dreaming:{}", reflector_label);
-                                prov.evidence_uris = vec![uri.clone(), other_uri.clone()];
+                                prov.evidence_uris = vec![uri.to_string(), other_uri.clone()];
                                 let merged_with_prov = render_with_provenance(&merged_body, &prov);
 
                                 let change = PendingMemoryChange {
@@ -293,7 +323,7 @@ pub async fn run_dreaming(
                                     created_at: now,
                                     action: ChangeAction::Merge,
                                     risk_level: RiskLevel::Medium,
-                                    target_uri: uri.clone(),
+                                    target_uri: uri.to_string(),
                                     destination_uri: Some(other_uri.clone()),
                                     category,
                                     base_hash: Some(sha256_hex(&content)),
@@ -313,7 +343,7 @@ pub async fn run_dreaming(
                                     .to_string(),
                                     status: ReviewStatus::Pending,
                                 };
-                                db.insert_pending_change(&change)?;
+                                db.insert_pending_change_for_profile(&profile_key, &change)?;
                                 staged.push(change);
                                 counts["merge"] = json!(counts["merge"].as_u64().unwrap_or(0) + 1);
                             }
@@ -334,8 +364,8 @@ pub async fn run_dreaming(
                 created_at: now,
                 action: ChangeAction::WikiCompile,
                 risk_level: RiskLevel::Low,
-                target_uri: "viking://resources/projects/".to_string(),
-                destination_uri: None,
+                target_uri: project_root.to_string(),
+                destination_uri: Some("viking://resources/desktop-dreaming-wiki/".to_string()),
                 category: MemoryCategory::Patterns,
                 base_hash: None,
                 before_content: None,
@@ -352,19 +382,15 @@ pub async fn run_dreaming(
                 .to_string(),
                 status: ReviewStatus::Pending,
             };
-            db.insert_pending_change(&change)?;
+            db.insert_pending_change_for_profile(&profile_key, &change)?;
             staged.push(change);
             counts["wiki_compile"] = json!(1);
         }
     }
 
     let summary_str = counts.to_string();
-    let final_status = if policy.lifecycle.dreaming.require_human_review {
-        "ready_for_review"
-    } else {
-        "applied"
-    };
-    db.update_run_status(&run_id, final_status, None, Some(&summary_str))?;
+    let final_status = "ready_for_review";
+    db.update_run_status_for_profile(&profile_key, &run_id, final_status, None, Some(&summary_str))?;
     run.status = final_status.to_string();
     run.summary_json = summary_str;
     run.finished_at = Some(Utc::now().timestamp());
@@ -372,7 +398,7 @@ pub async fn run_dreaming(
     Ok((run, staged))
 }
 
-/// Stage 4: Atomically commit all `accepted` changes:
+/// Stage 4: Claim and apply this profile's accepted changes:
 /// 1. Create remote snapshot (`POST /api/v1/snapshot/commit`) if enabled.
 /// 2. Verify SHA-256 `base_hash` against current remote content (optimistic concurrency).
 /// 3. Apply content writes, moves, or wiki compilation.
@@ -381,88 +407,125 @@ pub async fn apply_accepted_changes(
     db: &DesktopDb,
     policy: &PolicyConfig,
 ) -> Result<ApplyReport, String> {
-    let accepted = db.list_pending_changes(Some("accepted"))?;
-    if accepted.is_empty() {
-        return Ok(ApplyReport {
-            snapshot_id: None,
-            applied_ids: Vec::new(),
-            conflict_ids: Vec::new(),
-            failed_items: Vec::new(),
-        });
-    }
+    let profile_key = client.profile_key();
+    let claimed = db.claim_accepted_changes_for_profile(&profile_key)?;
+    let snapshot_paths: Vec<String> = claimed
+        .iter()
+        .flat_map(|change| match change.action {
+            ChangeAction::WikiCompile => change.destination_uri.iter().map(String::as_str).collect::<Vec<_>>(),
+            ChangeAction::MoveFromInbox | ChangeAction::Archive => {
+                std::iter::once(change.target_uri.as_str())
+                    .chain(change.destination_uri.as_deref())
+                    .collect()
+            }
+            _ => vec![change.target_uri.as_str()],
+        })
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
 
-    let mut snapshot_id: Option<String> = None;
-    if policy.lifecycle.dreaming.auto_snapshot_before_run {
+    let snapshot_id = if policy.lifecycle.dreaming.auto_snapshot_before_run && !claimed.is_empty() {
         let label = format!("dreaming-commit-{}", Utc::now().format("%Y%m%dT%H%M%SZ"));
-        if let Ok(snap) = client.snapshot_commit(&label, None).await {
-            snapshot_id = snap
-                .get("snapshot_id")
-                .or_else(|| snap.get("id"))
-                .or_else(|| snap.get("commit_id"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+        let snapshot = client
+            .snapshot_commit(&label, Some(snapshot_paths.clone()))
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|value| {
+                snapshot_commit_id(&value)
+                    .map(str::to_owned)
+                    .ok_or_else(|| "response contained no snapshot ID".to_string())
+            });
+        match snapshot {
+            Ok(id) => Some(id),
+            Err(e) => {
+                if let Err(release_err) = db.release_claim_for_profile(&profile_key, &claimed) {
+                    return Err(format!(
+                        "Snapshot failed: {e}; could not release claims: {release_err}"
+                    ));
+                }
+                return Err(format!("Snapshot failed: {e}"));
+            }
         }
-    }
+    } else {
+        None
+    };
 
     let mut applied_ids = Vec::new();
     let mut conflict_ids = Vec::new();
     let mut failed_items = Vec::new();
 
-    for chg in accepted {
-        if is_protected_rule_path(policy, &chg.target_uri) {
+    for (index, chg) in claimed.iter().enumerate() {
+        let matches_base = match (chg.action, chg.base_hash.as_deref()) {
+            (ChangeAction::WikiCompile, _) => true,
+            (_, Some(expected)) => match read_text(client, &chg.target_uri).await {
+                Ok(live) => sha256_hex(&live) == expected,
+                Err(error) => {
+                    db.release_claim_for_profile(&profile_key, std::slice::from_ref(chg))?;
+                    failed_items.push((chg.id.clone(), error));
+                    continue;
+                }
+            },
+            (_, None) => false,
+        };
+        let protection = check_write_protection(db, policy, &profile_key, chg);
+        let blocked = match protection {
+            Ok(blocked) => blocked,
+            Err(e) => {
+                db.release_claim_for_profile(&profile_key, &claimed[index..])?;
+                return Err(e);
+            }
+        };
+        if let Some(uri) = blocked {
+            db.finish_claimed_change_for_profile(
+                &profile_key,
+                chg,
+                None,
+                ReviewStatus::Conflict.as_str(),
+            )?;
             failed_items.push((
                 chg.id.clone(),
-                format!("Blocked: {} matches protected_rule_globs", chg.target_uri),
+                format!("Blocked: {uri} is protected or pinned"),
             ));
             continue;
         }
 
-        // Optimistic concurrency check
-        if let Some(expected_hash) = &chg.base_hash {
-            if let Some(live_content) = read_text_safely(client, &chg.target_uri).await {
-                if sha256_hex(&live_content) != *expected_hash {
-                    db.mark_change_applied(
-                        &chg.id,
-                        snapshot_id.as_deref(),
-                        ReviewStatus::Conflict,
-                    )?;
-                    conflict_ids.push(chg.id.clone());
-                    continue;
-                }
-            }
+        if !matches_base {
+            db.finish_claimed_change_for_profile(
+                &profile_key,
+                chg,
+                None,
+                ReviewStatus::Conflict.as_str(),
+            )?;
+            conflict_ids.push(chg.id.clone());
+            continue;
         }
 
-        let exec_res = match chg.action {
-            ChangeAction::Merge | ChangeAction::PromoteToIndex | ChangeAction::DemoteFromIndex => {
-                let body = chg.after_content.as_deref().unwrap_or("");
-                client.write_content(&chg.target_uri, body).await
-            }
-            ChangeAction::MoveFromInbox | ChangeAction::Archive => {
-                if let Some(dest) = &chg.destination_uri {
-                    client.mv(&chg.target_uri, dest).await
-                } else {
-                    Err(crate::ov_client::OvClientError::Config(
-                        "missing destination_uri".to_string(),
-                    ))
-                }
-            }
-            ChangeAction::WikiCompile => {
-                client
-                    .trigger_compile("desktop-dreaming-wiki", vec![chg.target_uri.clone()])
-                    .await
-            }
-        };
-
-        match exec_res {
-            Ok(_) => {
-                db.mark_change_applied(&chg.id, snapshot_id.as_deref(), ReviewStatus::Applied)?;
-                db.update_run_status(&chg.run_id, "applied", snapshot_id.as_deref(), None)?;
+        match execute_change(client, chg).await {
+            Ok(()) => {
+                db.finish_claimed_change_for_profile(
+                    &profile_key,
+                    chg,
+                    snapshot_id.as_deref(),
+                    ReviewStatus::Applied.as_str(),
+                )?;
                 applied_ids.push(chg.id.clone());
             }
             Err(e) => {
-                failed_items.push((chg.id.clone(), e.to_string()));
+                db.finish_claimed_change_for_profile(
+                    &profile_key,
+                    chg,
+                    snapshot_id.as_deref(),
+                    "failed",
+                )?;
+                failed_items.push((chg.id.clone(), e));
             }
         }
+    }
+
+    if snapshot_id.is_some() && !applied_ids.is_empty() && !snapshot_paths.is_empty() {
+        let post_label = format!("dreaming-applied-{}", Utc::now().format("%Y%m%dT%H%M%SZ"));
+        let _ = client.snapshot_commit(&post_label, Some(snapshot_paths)).await;
     }
 
     Ok(ApplyReport {
@@ -473,68 +536,171 @@ pub async fn apply_accepted_changes(
     })
 }
 
+fn check_write_protection<'a>(
+    db: &DesktopDb,
+    policy: &PolicyConfig,
+    profile_key: &str,
+    change: &'a PendingMemoryChange,
+) -> Result<Option<&'a str>, String> {
+    for uri in std::iter::once(change.target_uri.as_str()).chain(change.destination_uri.as_deref())
+    {
+        if is_protected_rule_path(policy, uri) || db.is_pinned_for_profile(profile_key, uri)? {
+            return Ok(Some(uri));
+        }
+    }
+    Ok(None)
+}
+
+async fn execute_change(client: &OvClient, change: &PendingMemoryChange) -> Result<(), String> {
+    let result = match change.action {
+        ChangeAction::Merge | ChangeAction::PromoteToIndex | ChangeAction::DemoteFromIndex => {
+            let body = change
+                .after_content
+                .as_deref()
+                .ok_or("missing after_content")?;
+            client.write_content(&change.target_uri, body).await
+        }
+        ChangeAction::MoveFromInbox | ChangeAction::Archive => {
+            let dest = change
+                .destination_uri
+                .as_deref()
+                .ok_or("missing destination_uri")?;
+            client.mv(&change.target_uri, dest).await
+        }
+        ChangeAction::WikiCompile => {
+            let dest = change
+                .destination_uri
+                .as_deref()
+                .ok_or("missing Wiki destination URI")?;
+            let evidence: Value =
+                serde_json::from_str(&change.evidence_json).map_err(|e| e.to_string())?;
+            let projects = evidence
+                .get("projects")
+                .and_then(Value::as_array)
+                .ok_or("missing Wiki source directories")?;
+            let sources = projects.iter().filter_map(Value::as_str).map(str::to_owned).collect();
+            client.trigger_compile(dest, sources).await
+        }
+    };
+    result.map(|_| ()).map_err(|e| e.to_string())
+}
+
 /// Roll back a previously applied Dreaming run via `POST /api/v1/snapshot/restore`.
 pub async fn rollback_dreaming_run(
     client: &OvClient,
     db: &DesktopDb,
     run_id: &str,
 ) -> Result<Value, String> {
+    let profile_key = client.profile_key();
     let run = db
         .get_run(run_id)?
         .ok_or_else(|| format!("Dreaming run not found: {}", run_id))?;
+    if run.profile_key.is_empty() || run.profile_key != profile_key {
+        return Err(format!("Run {run_id} does not belong to the active profile"));
+    }
+    if run.status == "applying" {
+        return Err(format!("Run {run_id} is applying changes"));
+    }
     let snap_id = run
         .snapshot_id
         .ok_or_else(|| format!("Run {} has no associated snapshot_id", run_id))?;
-    let res = client
-        .snapshot_restore(&snap_id)
-        .await
-        .map_err(|e| e.to_string())?;
-    db.update_run_status(run_id, "rolled_back", Some(&snap_id), None)?;
-    Ok(res)
-}
-
-async fn read_text_safely(client: &OvClient, uri: &str) -> Option<String> {
-    let val = client.read_content(uri, "l2").await.ok()?;
-    if let Some(s) = val.as_str() {
-        return Some(s.to_string());
-    }
-    val.get("content")
-        .or_else(|| val.get("text"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-}
-
-fn extract_uri_entries(val: &Value) -> Vec<String> {
-    let mut uris = Vec::new();
-    match val {
-        Value::Array(arr) => {
-            for item in arr {
-                uris.extend(extract_uri_entries(item));
-            }
+    let changes = db.list_applied_changes_for_run(&profile_key, run_id)?;
+    let mut scopes = BTreeSet::new();
+    for change in &changes {
+        let target = Some(change.target_uri.as_str());
+        let destination = change.destination_uri.as_deref();
+        let (source, destination) = match change.action {
+            ChangeAction::WikiCompile => (None, destination),
+            ChangeAction::MoveFromInbox | ChangeAction::Archive => (target, destination),
+            _ => (target, None),
+        };
+        for uri in source.into_iter().chain(destination) {
+            let scope = if change.action == ChangeAction::WikiCompile {
+                Some(uri.trim_end_matches('/'))
+            } else {
+                uri.trim_end_matches('/')
+                    .rsplit_once('/')
+                    .map(|(parent, _)| parent)
+            };
+            let scope = scope
+                .filter(|dir| dir.starts_with("viking://") && *dir != "viking://")
+                .ok_or_else(|| format!("Cannot determine restore scope for {uri}"))?;
+            scopes.insert(scope);
         }
-        Value::Object(map) => {
-            let is_dir = map.get("isDir").and_then(|v| v.as_bool()).unwrap_or(false)
-                || map
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .map(|t| t == "dir" || t == "directory")
-                    .unwrap_or(false);
-            if !is_dir {
-                if let Some(uri) = map.get("uri").and_then(|v| v.as_str()) {
-                    if uri.starts_with("viking://") {
-                        uris.push(uri.to_string());
+    }
+    if scopes.is_empty() {
+        return Err(format!("Run {run_id} has no applied restore scopes"));
+    }
+    let mut restored = Vec::with_capacity(scopes.len());
+    for scope in scopes {
+        let response = client
+            .snapshot_restore_scoped(&snap_id, Some(scope))
+            .await
+            .map_err(|e| format!("Restore failed for {scope}: {e}"))?;
+        restored.push(response);
+    }
+    db.update_run_status_for_profile(&profile_key, run_id, "rolled_back", Some(&snap_id), None)?;
+    match restored.len() {
+        1 => Ok(restored.remove(0)),
+        _ => Ok(Value::Array(restored)),
+    }
+}
+
+async fn read_text(client: &OvClient, uri: &str) -> Result<String, String> {
+    let val = client.read_content(uri, "l2").await.map_err(|e| e.to_string())?;
+    val.as_str()
+        .or_else(|| val.get("content").and_then(Value::as_str))
+        .or_else(|| val.get("text").and_then(Value::as_str))
+        .map(str::to_owned)
+        .ok_or_else(|| format!("Missing text content for {uri}"))
+}
+
+fn is_not_found(error: &OvClientError) -> bool {
+    matches!(error, OvClientError::Api { status, code, .. }
+        if *status == 404 || (code == "NOT_FOUND" && matches!(*status, 200..=299 | 400)))
+}
+
+fn listing_entries(value: &Value) -> Vec<&Value> {
+    fn collect<'a>(value: &'a Value, entries: &mut Vec<&'a Value>) {
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    collect(item, entries);
+                }
+            }
+            Value::Object(fields) => {
+                if fields.contains_key("uri") {
+                    entries.push(value);
+                }
+                for key in ["items", "entries", "children", "files", "results"] {
+                    if let Some(items) = fields.get(key) {
+                        collect(items, entries);
                     }
                 }
             }
-            for key in ["items", "entries", "children", "files", "results"] {
-                if let Some(sub) = map.get(key) {
-                    uris.extend(extract_uri_entries(sub));
-                }
-            }
+            Value::String(_) => entries.push(value),
+            _ => {}
         }
-        _ => {}
     }
-    uris
+
+    let mut entries = Vec::new();
+    collect(value, &mut entries);
+    entries
+}
+
+fn is_directory(entry: &Value) -> bool {
+    entry.get("isDir").and_then(Value::as_bool) == Some(true)
+        || matches!(entry.get("type").and_then(Value::as_str), Some("dir" | "directory"))
+}
+
+fn file_uri(entry: &Value) -> Option<&str> {
+    if is_directory(entry) {
+        return None;
+    }
+    entry
+        .get("uri")
+        .and_then(Value::as_str)
+        .or_else(|| entry.as_str())
 }
 
 fn extract_scored_uris(val: &Value) -> Vec<(String, f64)> {
@@ -542,7 +708,7 @@ fn extract_scored_uris(val: &Value) -> Vec<(String, f64)> {
     if let Some(items) = val.as_array() {
         slices.push(items);
     } else {
-        for key in ["items", "results", "memories", "resources", "skills"] {
+        for key in ["items", "results", "entries", "memories", "resources", "skills"] {
             if let Some(items) = val.get(key).and_then(|i| i.as_array()) {
                 slices.push(items);
             }

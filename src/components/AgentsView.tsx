@@ -16,7 +16,7 @@ interface AgentsViewProps {
   agents: AgentStatus[];
   wslDistros: WslDistroInfo[];
   onRefresh: () => void;
-  onConnect: (id: AgentId, writeRules: boolean) => Promise<void>;
+  onConnect: (id: AgentId, writeRules: boolean, projectDir?: string) => Promise<void>;
   onDisconnect: (id: AgentId) => Promise<void>;
   onImportLegacy: (localPath: string, agentId: AgentId) => Promise<void>;
   onConnectWsl: (distroName: string, homeUnc: string) => Promise<void>;
@@ -35,9 +35,19 @@ export function AgentsView({
 }: AgentsViewProps) {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [importingFile, setImportingFile] = useState<string | null>(null);
-  const [writeAntigravityRules, setWriteAntigravityRules] = useState(true);
+  const [writeAntigravityRules, setWriteAntigravityRules] = useState(false);
+  const [antigravityProjectDir, setAntigravityProjectDir] = useState("");
 
   const handleToggle = async (agent: AgentStatus) => {
+    if (
+      !agent.connected &&
+      agent.agent_id === "antigravity" &&
+      writeAntigravityRules &&
+      !antigravityProjectDir.trim()
+    ) {
+      onNotify("error", "勾选项目规则时请先填写项目目录路径。");
+      return;
+    }
     setBusyId(agent.id);
     try {
       if (agent.connected) {
@@ -47,6 +57,9 @@ export function AgentsView({
         await onConnect(
           agent.agent_id,
           agent.agent_id === "antigravity" ? writeAntigravityRules : false,
+          agent.agent_id === "antigravity" && writeAntigravityRules
+            ? antigravityProjectDir.trim()
+            : undefined,
         );
         onNotify("success", `已成功为 ${agent.name} 注入 ov-bridge 配置。`);
       }
@@ -164,15 +177,25 @@ export function AgentsView({
               )}
 
               {agent.agent_id === "antigravity" && !agent.connected && (
-                <label className="flex items-center gap-2 text-[11px] text-zinc-400 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={writeAntigravityRules}
-                    onChange={(e) => setWriteAntigravityRules(e.target.checked)}
-                    className="rounded border-zinc-600 bg-surface-2"
-                  />
-                  同时写入项目记忆协作规则（与全局 hooks.json 互补）
-                </label>
+                <div className="space-y-1.5">
+                  <label className="flex items-center gap-2 text-[11px] text-zinc-400 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={writeAntigravityRules}
+                      onChange={(e) => setWriteAntigravityRules(e.target.checked)}
+                      className="rounded border-zinc-600 bg-surface-2"
+                    />
+                    同时写入项目记忆协作规则（与全局 hooks.json 互补）
+                  </label>
+                  {writeAntigravityRules && (
+                    <input
+                      value={antigravityProjectDir}
+                      onChange={(e) => setAntigravityProjectDir(e.target.value)}
+                      placeholder="项目根目录绝对路径，例如 E:\git_work\my-project"
+                      className="w-full bg-surface-2 border border-border-subtle rounded-lg px-2.5 py-1.5 font-mono text-[11px] text-zinc-200 focus:outline-none focus:border-indigo-500/40"
+                    />
+                  )}
+                </div>
               )}
 
               {agent.legacy_memory_files.length > 0 && (

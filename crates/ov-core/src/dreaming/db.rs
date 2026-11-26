@@ -3,15 +3,17 @@ use crate::policy::model::{
     ChangeAction, MemoryCategory, PendingMemoryChange, ReviewStatus, RiskLevel,
 };
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DreamingRun {
     pub id: String,
+    #[serde(default)]
+    pub profile_key: String,
     pub trigger_source: String,
     pub status: String,
     pub snapshot_id: Option<String>,
@@ -46,6 +48,13 @@ pub struct UriHitStat {
 pub struct DesktopDb {
     conn: Mutex<Connection>,
 }
+
+const CHANGE_COLUMNS: &str =
+    "id, run_id, snapshot_id, action, risk_level, target_uri, destination_uri, category, base_hash,
+     before_content, after_content, rationale, evidence_json, status, created_at";
+
+const RUN_COLUMNS: &str =
+    "id, trigger_source, status, snapshot_id, started_at, finished_at, summary_json, profile_key";
 
 impl DesktopDb {
     pub fn open_default() -> Result<Self, String> {
@@ -82,12 +91,16 @@ impl DesktopDb {
     }
 
     fn init_schema(&self) -> Result<(), String> {
-        let conn = self.lock_conn()?;
-        conn.execute_batch(
+        let mut conn = self.lock_conn()?;
+        conn.execute_batch("PRAGMA journal_mode = WAL;")
+            .map_err(|e| e.to_string())?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        tx.execute_batch(
             r#"
-            PRAGMA journal_mode = WAL;
             CREATE TABLE IF NOT EXISTS dreaming_runs (
                 id TEXT PRIMARY KEY,
+                profile_key TEXT NOT NULL DEFAULT '',
                 trigger_source TEXT NOT NULL,
                 status TEXT NOT NULL,
                 snapshot_id TEXT,
@@ -98,6 +111,7 @@ impl DesktopDb {
 
             CREATE TABLE IF NOT EXISTS pending_memory_changes (
                 id TEXT PRIMARY KEY,
+                profile_key TEXT NOT NULL DEFAULT '',
                 run_id TEXT NOT NULL,
                 snapshot_id TEXT,
                 action TEXT NOT NULL,
@@ -116,6 +130,7 @@ impl DesktopDb {
 
             CREATE TABLE IF NOT EXISTS recall_events (
                 id TEXT PRIMARY KEY,
+                profile_key TEXT NOT NULL DEFAULT '',
                 agent_id TEXT NOT NULL,
                 event_type TEXT NOT NULL,
                 query TEXT,
@@ -129,18 +144,61 @@ impl DesktopDb {
 
             CREATE TABLE IF NOT EXISTS pinned_uris (
                 uri TEXT PRIMARY KEY,
+                profile_key TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS scoped_pinned_uris (
+                profile_key TEXT NOT NULL,
+                uri TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (profile_key, uri)
+            );
+
+            CREATE TABLE IF NOT EXISTS kv_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );
             "#,
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        for table in ["dreaming_runs", "pending_memory_changes", "recall_events", "pinned_uris"] {
+            let has_profile: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = 'profile_key')",
+                [table],
+                |row| row.get(0),
+            ).map_err(|e| e.to_string())?;
+            if !has_profile {
+                tx.execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN profile_key TEXT NOT NULL DEFAULT ''"),
+                    [],
+                ).map_err(|e| e.to_string())?;
+            }
+        }
+        tx.execute_batch(
+            "INSERT OR IGNORE INTO scoped_pinned_uris (profile_key, uri, created_at)
+             SELECT profile_key, uri, created_at FROM pinned_uris;
+             CREATE INDEX IF NOT EXISTS recall_events_profile_created
+                 ON recall_events (profile_key, created_at);
+             CREATE INDEX IF NOT EXISTS dreaming_runs_profile_started
+                 ON dreaming_runs (profile_key, started_at);
+             CREATE INDEX IF NOT EXISTS pending_changes_profile_status
+                 ON pending_memory_changes (profile_key, status);
+             CREATE INDEX IF NOT EXISTS pending_changes_profile_run
+                 ON pending_memory_changes (profile_key, run_id);",
+        ).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
     }
 
     pub fn record_event(&self, evt: &RecallEvent) -> Result<(), String> {
+        self.record_event_for_profile("", evt)
+    }
+
+    pub fn record_event_for_profile(&self, profile_key: &str, evt: &RecallEvent) -> Result<(), String> {
         let conn = self.lock_conn()?;
         conn.execute(
-            "INSERT INTO recall_events (id, agent_id, event_type, query, target_uri, layer, tokens_used, latency_ms, blocked_by_privacy, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO recall_events (id, agent_id, event_type, query, target_uri, layer, tokens_used, latency_ms, blocked_by_privacy, created_at, profile_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 evt.id,
                 evt.agent_id,
@@ -152,61 +210,54 @@ impl DesktopDb {
                 evt.latency_ms,
                 if evt.blocked_by_privacy { 1 } else { 0 },
                 evt.created_at,
+                profile_key,
             ],
         )
         .map_err(|e| e.to_string())?;
         Ok(())
     }
 
-    pub fn list_events(
+    pub fn list_events_for_profile(
         &self,
+        profile_key: &str,
         agent_filter: Option<&str>,
         limit: usize,
     ) -> Result<Vec<RecallEvent>, String> {
         let conn = self.lock_conn()?;
-        let mut results = Vec::new();
-        if let Some(agent) = agent_filter {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, agent_id, event_type, query, target_uri, layer, tokens_used, latency_ms, blocked_by_privacy, created_at
-                     FROM recall_events WHERE agent_id = ?1 ORDER BY created_at DESC LIMIT ?2",
-                )
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map(params![agent, limit as i64], map_event_row)
-                .map_err(|e| e.to_string())?;
-            for r in rows {
-                results.push(r.map_err(|e| e.to_string())?);
-            }
-        } else {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, agent_id, event_type, query, target_uri, layer, tokens_used, latency_ms, blocked_by_privacy, created_at
-                     FROM recall_events ORDER BY created_at DESC LIMIT ?1",
-                )
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map(params![limit as i64], map_event_row)
-                .map_err(|e| e.to_string())?;
-            for r in rows {
-                results.push(r.map_err(|e| e.to_string())?);
-            }
-        }
-        Ok(results)
+        let mut stmt = conn.prepare(
+            "SELECT id, agent_id, event_type, query, target_uri, layer, tokens_used, latency_ms, blocked_by_privacy, created_at
+             FROM recall_events WHERE profile_key = ?1 AND (?2 IS NULL OR agent_id = ?2)
+             ORDER BY created_at DESC LIMIT ?3",
+        ).map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(params![profile_key, agent_filter, limit as i64], map_event_row)
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
     }
 
-    pub fn hit_stats_by_uri(&self) -> Result<HashMap<String, UriHitStat>, String> {
+    pub fn count_sessions_since(&self, profile_key: &str, since: i64) -> Result<i64, String> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM recall_events
+             WHERE profile_key = ?1 AND created_at > ?2 AND blocked_by_privacy = 0
+                   AND event_type IN ('hook_stop', 'capture')",
+            params![profile_key, since],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())
+    }
+
+    pub fn hit_stats_by_uri_for_profile(&self, profile_key: &str) -> Result<HashMap<String, UriHitStat>, String> {
         let conn = self.lock_conn()?;
         let mut stmt = conn
             .prepare(
                 "SELECT target_uri, COUNT(*), MAX(created_at), GROUP_CONCAT(DISTINCT agent_id)
-                 FROM recall_events WHERE target_uri IS NOT NULL AND event_type = 'recall'
+                 FROM recall_events WHERE profile_key = ?1 AND target_uri IS NOT NULL
+                 AND event_type = 'recall' AND blocked_by_privacy = 0
                  GROUP BY target_uri",
             )
             .map_err(|e| e.to_string())?;
         let mut map = HashMap::new();
         let rows = stmt
-            .query_map([], |row| {
+            .query_map([profile_key], |row| {
                 let uri: String = row.get(0)?;
                 let count: u32 = row.get(1)?;
                 let last_hit_at: i64 = row.get(2)?;
@@ -232,17 +283,18 @@ impl DesktopDb {
         Ok(map)
     }
 
-    pub fn create_run(&self, id: &str, trigger_source: &str) -> Result<DreamingRun, String> {
+    pub fn create_run_for_profile(&self, profile_key: &str, id: &str, trigger_source: &str) -> Result<DreamingRun, String> {
         let conn = self.lock_conn()?;
         let now = Utc::now().timestamp();
         conn.execute(
-            "INSERT INTO dreaming_runs (id, trigger_source, status, started_at, summary_json)
-             VALUES (?1, ?2, 'running', ?3, '{}')",
-            params![id, trigger_source, now],
+            "INSERT INTO dreaming_runs (id, trigger_source, status, started_at, profile_key)
+             VALUES (?1, ?2, 'running', ?3, ?4)",
+            params![id, trigger_source, now, profile_key],
         )
         .map_err(|e| e.to_string())?;
         Ok(DreamingRun {
             id: id.to_string(),
+            profile_key: profile_key.to_string(),
             trigger_source: trigger_source.to_string(),
             status: "running".to_string(),
             snapshot_id: None,
@@ -252,8 +304,9 @@ impl DesktopDb {
         })
     }
 
-    pub fn update_run_status(
+    pub fn update_run_status_for_profile(
         &self,
+        profile_key: &str,
         run_id: &str,
         status: &str,
         snapshot_id: Option<&str>,
@@ -267,70 +320,35 @@ impl DesktopDb {
                  snapshot_id = COALESCE(?2, snapshot_id),
                  summary_json = COALESCE(?3, summary_json),
                  finished_at = ?4
-             WHERE id = ?5",
-            params![status, snapshot_id, summary_json, now, run_id],
+             WHERE id = ?5 AND profile_key = ?6",
+            params![status, snapshot_id, summary_json, now, run_id, profile_key],
         )
         .map_err(|e| e.to_string())?;
         Ok(())
     }
 
-    pub fn list_runs(&self, limit: usize) -> Result<Vec<DreamingRun>, String> {
+    pub fn list_runs_for_profile(&self, profile_key: &str, limit: usize) -> Result<Vec<DreamingRun>, String> {
         let conn = self.lock_conn()?;
         let mut stmt = conn
-            .prepare(
-                "SELECT id, trigger_source, status, snapshot_id, started_at, finished_at, summary_json
-                 FROM dreaming_runs ORDER BY started_at DESC LIMIT ?1",
-            )
+            .prepare(&format!("SELECT {RUN_COLUMNS} FROM dreaming_runs
+                WHERE profile_key = ?1 ORDER BY started_at DESC LIMIT ?2"))
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map(params![limit as i64], |row| {
-                Ok(DreamingRun {
-                    id: row.get(0)?,
-                    trigger_source: row.get(1)?,
-                    status: row.get(2)?,
-                    snapshot_id: row.get(3)?,
-                    started_at: row.get(4)?,
-                    finished_at: row.get(5)?,
-                    summary_json: row.get(6)?,
-                })
-            })
+            .query_map(params![profile_key, limit as i64], map_run_row)
             .map_err(|e| e.to_string())?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(|e| e.to_string())?);
-        }
-        Ok(out)
+        rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
     }
 
     pub fn get_run(&self, run_id: &str) -> Result<Option<DreamingRun>, String> {
         let conn = self.lock_conn()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, trigger_source, status, snapshot_id, started_at, finished_at, summary_json
-                 FROM dreaming_runs WHERE id = ?1",
-            )
-            .map_err(|e| e.to_string())?;
-        let mut rows = stmt
-            .query_map(params![run_id], |row| {
-                Ok(DreamingRun {
-                    id: row.get(0)?,
-                    trigger_source: row.get(1)?,
-                    status: row.get(2)?,
-                    snapshot_id: row.get(3)?,
-                    started_at: row.get(4)?,
-                    finished_at: row.get(5)?,
-                    summary_json: row.get(6)?,
-                })
-            })
-            .map_err(|e| e.to_string())?;
-        if let Some(r) = rows.next() {
-            Ok(Some(r.map_err(|e| e.to_string())?))
-        } else {
-            Ok(None)
-        }
+        conn.query_row(
+            &format!("SELECT {RUN_COLUMNS} FROM dreaming_runs WHERE id = ?1"),
+            [run_id],
+            map_run_row,
+        ).optional().map_err(|e| e.to_string())
     }
 
-    pub fn insert_pending_change(&self, c: &PendingMemoryChange) -> Result<(), String> {
+    pub fn insert_pending_change_for_profile(&self, profile_key: &str, c: &PendingMemoryChange) -> Result<(), String> {
         let conn = self.lock_conn()?;
         let action = serde_json::to_string(&c.action)
             .unwrap()
@@ -344,8 +362,8 @@ impl DesktopDb {
         let status = c.status.as_str();
         conn.execute(
             "INSERT INTO pending_memory_changes
-             (id, run_id, snapshot_id, action, risk_level, target_uri, destination_uri, category, base_hash, before_content, after_content, rationale, evidence_json, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             (id, run_id, snapshot_id, action, risk_level, target_uri, destination_uri, category, base_hash, before_content, after_content, rationale, evidence_json, status, created_at, profile_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 c.id,
                 c.run_id,
@@ -361,105 +379,284 @@ impl DesktopDb {
                 c.rationale,
                 c.evidence_json,
                 status,
-                c.created_at
+                c.created_at,
+                profile_key,
             ],
         )
         .map_err(|e| e.to_string())?;
         Ok(())
     }
 
-    pub fn list_pending_changes(
+    pub fn list_pending_changes_for_profile(
         &self,
+        profile_key: &str,
         status_filter: Option<&str>,
     ) -> Result<Vec<PendingMemoryChange>, String> {
         let conn = self.lock_conn()?;
-        let sql = if status_filter.is_some() {
-            "SELECT id, run_id, snapshot_id, action, risk_level, target_uri, destination_uri, category, base_hash, before_content, after_content, rationale, evidence_json, status, created_at
-             FROM pending_memory_changes WHERE status = ?1 ORDER BY created_at DESC"
-        } else {
-            "SELECT id, run_id, snapshot_id, action, risk_level, target_uri, destination_uri, category, base_hash, before_content, after_content, rationale, evidence_json, status, created_at
-             FROM pending_memory_changes ORDER BY created_at DESC"
-        };
-        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-        let mut out = Vec::new();
-        if let Some(st) = status_filter {
-            let rows = stmt
-                .query_map(params![st], map_change_row)
-                .map_err(|e| e.to_string())?;
-            for r in rows {
-                out.push(r.map_err(|e| e.to_string())?);
-            }
-        } else {
-            let rows = stmt
-                .query_map([], map_change_row)
-                .map_err(|e| e.to_string())?;
-            for r in rows {
-                out.push(r.map_err(|e| e.to_string())?);
-            }
-        }
-        Ok(out)
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {CHANGE_COLUMNS} FROM pending_memory_changes
+             WHERE profile_key = ?1 AND (?2 IS NULL OR status = ?2 OR
+                   (?2 = 'conflict' AND status = 'failed'))
+             ORDER BY created_at DESC",
+        )).map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(params![profile_key, status_filter], map_change_row)
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
     }
 
+    pub(crate) fn list_applied_changes_for_run(
+        &self,
+        profile_key: &str,
+        run_id: &str,
+    ) -> Result<Vec<PendingMemoryChange>, String> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {CHANGE_COLUMNS} FROM pending_memory_changes
+             WHERE profile_key = ?1 AND run_id = ?2 AND status = 'applied'",
+        )).map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(params![profile_key, run_id], map_change_row)
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
+    }
+
+    pub fn claim_accepted_changes_for_profile(
+        &self,
+        profile_key: &str,
+    ) -> Result<Vec<PendingMemoryChange>, String> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let mut changes = {
+            let mut stmt = tx.prepare(&format!(
+                "UPDATE pending_memory_changes SET status = 'applying'
+                 WHERE status = 'accepted' AND profile_key = ?1 AND profile_key != ''
+                 RETURNING {CHANGE_COLUMNS}",
+            )).map_err(|e| e.to_string())?;
+            let rows = stmt.query_map([profile_key], map_change_row)
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+        };
+        if !changes.is_empty() {
+            tx.execute(
+                "UPDATE dreaming_runs SET status = 'applying'
+                 WHERE profile_key = ?1 AND id IN (
+                     SELECT run_id FROM pending_memory_changes
+                     WHERE profile_key = ?1 AND status = 'applying'
+                 )",
+                [profile_key],
+            ).map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        changes.sort_unstable_by(|a, b| b.created_at.cmp(&a.created_at).then(a.id.cmp(&b.id)));
+        Ok(changes)
+    }
+
+    pub(crate) fn release_claim_for_profile(
+        &self,
+        profile_key: &str,
+        changes: &[PendingMemoryChange],
+    ) -> Result<(), String> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let mut runs = HashSet::new();
+        for change in changes {
+            tx.execute(
+                "UPDATE pending_memory_changes SET status = 'accepted'
+                 WHERE profile_key = ?1 AND id = ?2 AND status = 'applying'",
+                params![profile_key, change.id],
+            ).map_err(|e| e.to_string())?;
+            runs.insert(change.run_id.as_str());
+        }
+        for run_id in runs {
+            refresh_run_outcomes(&tx, profile_key, run_id).map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// Legacy entry point for trusted local callers that already hold a change ID.
     pub fn update_change_decision(
         &self,
         id: &str,
         status: ReviewStatus,
         edited_after_content: Option<&str>,
     ) -> Result<(), String> {
+        self.write_change_decision(None, id, status, edited_after_content)
+    }
+
+    pub fn update_change_decision_for_profile(
+        &self,
+        profile_key: &str,
+        id: &str,
+        status: ReviewStatus,
+        edited_after_content: Option<&str>,
+    ) -> Result<(), String> {
+        self.write_change_decision(Some(profile_key), id, status, edited_after_content)
+    }
+
+    fn write_change_decision(
+        &self,
+        profile_key: Option<&str>,
+        id: &str,
+        status: ReviewStatus,
+        edited_after_content: Option<&str>,
+    ) -> Result<(), String> {
+        if !matches!(status, ReviewStatus::Pending | ReviewStatus::Accepted | ReviewStatus::Rejected) {
+            return Err("Invalid review decision".into());
+        }
         let conn = self.lock_conn()?;
-        if let Some(after) = edited_after_content {
-            conn.execute(
-                "UPDATE pending_memory_changes SET status = ?1, after_content = ?2 WHERE id = ?3",
-                params![status.as_str(), after, id],
-            )
-            .map_err(|e| e.to_string())?;
-        } else {
-            conn.execute(
-                "UPDATE pending_memory_changes SET status = ?1 WHERE id = ?2",
-                params![status.as_str(), id],
-            )
-            .map_err(|e| e.to_string())?;
+        let updated = conn.execute(
+            "UPDATE pending_memory_changes
+             SET status = ?1, after_content = COALESCE(?2, after_content)
+             WHERE id = ?3 AND (?4 IS NULL OR profile_key = ?4)
+                   AND status IN ('pending', 'accepted', 'rejected')",
+            params![status.as_str(), edited_after_content, id, profile_key],
+        ).map_err(|e| e.to_string())?;
+        if updated == 0 {
+            return Err(format!("Change {id} is missing or no longer open for review"));
         }
         Ok(())
     }
 
-    pub fn mark_change_applied(
+    pub(crate) fn finish_claimed_change_for_profile(
         &self,
-        id: &str,
+        profile_key: &str,
+        change: &PendingMemoryChange,
         snapshot_id: Option<&str>,
-        status: ReviewStatus,
+        status: &str,
     ) -> Result<(), String> {
-        let conn = self.lock_conn()?;
-        conn.execute(
-            "UPDATE pending_memory_changes SET status = ?1, snapshot_id = ?2 WHERE id = ?3",
-            params![status.as_str(), snapshot_id, id],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(())
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let updated = tx.execute(
+            "UPDATE pending_memory_changes SET status = ?1, snapshot_id = ?2
+             WHERE id = ?3 AND profile_key = ?4 AND status = 'applying'",
+            params![status, snapshot_id, change.id, profile_key],
+        ).map_err(|e| e.to_string())?;
+        if updated != 1 {
+            return Err(format!("Lost claim for change {}", change.id));
+        }
+        refresh_run_outcomes(&tx, profile_key, &change.run_id).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
     }
 
-    pub fn pin_uri(&self, uri: &str) -> Result<(), String> {
+    pub fn pin_uri_for_profile(&self, profile_key: &str, uri: &str) -> Result<(), String> {
         let conn = self.lock_conn()?;
         let now = Utc::now().timestamp();
         conn.execute(
-            "INSERT OR REPLACE INTO pinned_uris (uri, created_at) VALUES (?1, ?2)",
-            params![uri, now],
+            "INSERT OR REPLACE INTO scoped_pinned_uris (profile_key, uri, created_at) VALUES (?1, ?2, ?3)",
+            params![profile_key, uri, now],
         )
         .map_err(|e| e.to_string())?;
         Ok(())
     }
 
-    pub fn is_pinned(&self, uri: &str) -> Result<bool, String> {
+    pub fn is_pinned_for_profile(&self, profile_key: &str, uri: &str) -> Result<bool, String> {
         let conn = self.lock_conn()?;
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pinned_uris WHERE uri = ?1",
-                params![uri],
-                |row| row.get(0),
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scoped_pinned_uris
+             WHERE uri = ?2 AND (profile_key = ?1 OR profile_key = ''))",
+            params![profile_key, uri],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())
+    }
+
+    pub fn get_kv(&self, key: &str) -> Result<Option<String>, String> {
+        self.lock_conn()?.query_row(
+            "SELECT value FROM kv_state WHERE key = ?1",
+            [key],
+            |row| row.get(0),
+        ).optional().map_err(|e| e.to_string())
+    }
+
+    pub fn set_kv(&self, key: &str, value: &str) -> Result<(), String> {
+        self.lock_conn()?.execute(
+            "INSERT INTO kv_state (key, value) VALUES (?1, ?2)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Recover claims left stuck in `applying` after an unexpected app exit.
+    pub fn recover_stale_claims(&self) -> Result<usize, String> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let runs: Vec<(String, String)> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT DISTINCT profile_key, run_id FROM pending_memory_changes
+                     WHERE status = 'applying'",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?
+        };
+        let recovered = tx
+            .execute(
+                "UPDATE pending_memory_changes SET status = 'accepted' WHERE status = 'applying'",
+                [],
             )
             .map_err(|e| e.to_string())?;
-        Ok(count > 0)
+        for (profile_key, run_id) in runs {
+            refresh_run_outcomes(&tx, &profile_key, &run_id).map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(recovered)
     }
+
+    pub fn claim_schedule_slot(&self, profile_key: &str, timestamp: i64) -> Result<bool, String> {
+        let changed = self.lock_conn()?.execute(
+            "INSERT INTO kv_state (key, value) VALUES (?1, ?2)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value
+             WHERE CAST(kv_state.value AS INTEGER) < ?2",
+            params![format!("dreaming.schedule.{profile_key}"), timestamp],
+        ).map_err(|e| e.to_string())?;
+        Ok(changed == 1)
+    }
+}
+
+fn refresh_run_outcomes(conn: &Connection, profile_key: &str, run_id: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "WITH outcomes AS (
+            SELECT COUNT(*) FILTER (WHERE status = 'applying') AS applying,
+                   COUNT(*) FILTER (WHERE status IN ('pending', 'accepted')) AS review,
+                   COUNT(*) FILTER (WHERE status = 'failed') AS failed,
+                   COUNT(*) FILTER (WHERE status = 'conflict') AS conflicts,
+                   COUNT(*) FILTER (WHERE status = 'applied') AS applied,
+                   (SELECT snapshot_id FROM pending_memory_changes
+                    WHERE run_id = ?1 AND profile_key = ?2
+                      AND status = 'applied' AND snapshot_id IS NOT NULL
+                    ORDER BY rowid ASC LIMIT 1) AS snapshot
+            FROM pending_memory_changes WHERE run_id = ?1 AND profile_key = ?2
+         )
+         UPDATE dreaming_runs SET
+            status = (SELECT CASE WHEN applying > 0 THEN 'applying'
+                                  WHEN failed > 0 OR (conflicts > 0 AND applied > 0) THEN 'partial_failure'
+                                  WHEN conflicts > 0 THEN 'conflict'
+                                  WHEN review > 0 THEN 'ready_for_review'
+                                  WHEN applied > 0 THEN 'applied'
+                                  ELSE 'ready_for_review' END FROM outcomes),
+            snapshot_id = (SELECT snapshot FROM outcomes),
+            finished_at = ?3
+         WHERE id = ?1 AND profile_key = ?2",
+        params![run_id, profile_key, Utc::now().timestamp()],
+    )?;
+    Ok(())
+}
+
+fn map_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DreamingRun> {
+    Ok(DreamingRun {
+        id: row.get(0)?,
+        trigger_source: row.get(1)?,
+        status: row.get(2)?,
+        snapshot_id: row.get(3)?,
+        started_at: row.get(4)?,
+        finished_at: row.get(5)?,
+        summary_json: row.get(6)?,
+        profile_key: row.get(7)?,
+    })
 }
 
 fn map_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecallEvent> {
@@ -490,8 +687,12 @@ fn map_change_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingMemoryChan
         .unwrap_or(RiskLevel::Medium);
     let category: MemoryCategory = serde_json::from_str(&format!("\"{}\"", cat_str))
         .unwrap_or(MemoryCategory::Patterns);
-    let status: ReviewStatus = serde_json::from_str(&format!("\"{}\"", status_str))
-        .unwrap_or(ReviewStatus::Pending);
+    let status = match status_str.as_str() {
+        "applying" => ReviewStatus::Accepted,
+        "failed" => ReviewStatus::Conflict,
+        _ => serde_json::from_str(&format!("\"{}\"", status_str))
+            .unwrap_or(ReviewStatus::Pending),
+    };
 
     Ok(PendingMemoryChange {
         id: row.get(0)?,
@@ -523,15 +724,10 @@ mod tests {
         assert_send_sync::<DesktopDb>();
     }
 
-    #[test]
-    fn test_sqlite_dreaming_lifecycle() {
-        let db = DesktopDb::open_in_memory().unwrap();
-        let run = db.create_run("run-1", "manual").unwrap();
-        assert_eq!(run.status, "running");
-
-        let change = PendingMemoryChange {
-            id: "chg-1".to_string(),
-            run_id: "run-1".to_string(),
+    fn archive_change(id: &str, run_id: &str) -> PendingMemoryChange {
+        PendingMemoryChange {
+            id: id.to_string(),
+            run_id: run_id.to_string(),
             snapshot_id: None,
             created_at: Utc::now().timestamp(),
             action: ChangeAction::Archive,
@@ -545,17 +741,136 @@ mod tests {
             rationale: "Stale for 50 days".to_string(),
             evidence_json: "{}".to_string(),
             status: ReviewStatus::Pending,
-        };
-        db.insert_pending_change(&change).unwrap();
-        let listed = db.list_pending_changes(Some("pending")).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_sqlite_dreaming_lifecycle() {
+        let db = DesktopDb::open_in_memory().unwrap();
+        let run = db.create_run_for_profile("a", "run-1", "manual").unwrap();
+        assert_eq!(run.status, "running");
+        let change = archive_change("chg-1", &run.id);
+        db.insert_pending_change_for_profile("a", &change).unwrap();
+        let listed = db.list_pending_changes_for_profile("a", Some("pending")).unwrap();
         assert_eq!(listed.len(), 1);
 
-        db.update_change_decision("chg-1", ReviewStatus::Accepted, None)
+        db.update_change_decision_for_profile("a", "chg-1", ReviewStatus::Accepted, None)
             .unwrap();
-        let accepted = db.list_pending_changes(Some("accepted")).unwrap();
-        assert_eq!(accepted.len(), 1);
+        let claimed = db.claim_accepted_changes_for_profile("a").unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert!(db.update_change_decision("chg-1", ReviewStatus::Accepted, None).is_err());
+        db.release_claim_for_profile("a", &claimed).unwrap();
+        let claimed = db.claim_accepted_changes_for_profile("a").unwrap();
+        db.finish_claimed_change_for_profile("a", &claimed[0], None, "conflict")
+            .unwrap();
+        let resolved = db.get_run(&run.id).unwrap().unwrap();
+        assert_eq!(resolved.status, "conflict");
+        assert_eq!(resolved.snapshot_id, None);
+    }
 
-        db.pin_uri("viking://user/memories/entities/old.md").unwrap();
-        assert!(db.is_pinned("viking://user/memories/entities/old.md").unwrap());
+    #[test]
+    fn profiles_isolate_runs_changes_pins_and_events() {
+        let db = DesktopDb::open_in_memory().unwrap();
+        let run = db.create_run_for_profile("a", "run-a", "manual").unwrap();
+        let mut change = archive_change("chg-a", &run.id);
+        change.status = ReviewStatus::Accepted;
+        db.insert_pending_change_for_profile("a", &change).unwrap();
+        db.pin_uri_for_profile("a", &change.target_uri).unwrap();
+
+        assert!(db.list_runs_for_profile("b", 5).unwrap().is_empty());
+        assert!(db.list_pending_changes_for_profile("b", None).unwrap().is_empty());
+        assert!(db.update_change_decision_for_profile("b", &change.id, ReviewStatus::Rejected, None).is_err());
+        assert!(db.claim_accepted_changes_for_profile("b").unwrap().is_empty());
+        assert!(!db.is_pinned_for_profile("b", &change.target_uri).unwrap());
+        db.pin_uri_for_profile("b", &change.target_uri).unwrap();
+        assert!(db.is_pinned_for_profile("a", &change.target_uri).unwrap());
+        assert!(db.is_pinned_for_profile("b", &change.target_uri).unwrap());
+
+        let mut event = RecallEvent {
+            id: "recall-a".into(),
+            agent_id: "agent".into(),
+            event_type: "recall".into(),
+            query: None,
+            target_uri: Some(change.target_uri.clone()),
+            layer: None,
+            tokens_used: 0,
+            latency_ms: 0,
+            blocked_by_privacy: false,
+            created_at: 10,
+        };
+        db.record_event_for_profile("a", &event).unwrap();
+        event.id = "legacy-recall".into();
+        db.record_event(&event).unwrap();
+        assert_eq!(db.list_events_for_profile("a", Some("agent"), 10).unwrap().len(), 1);
+        assert!(db.list_events_for_profile("b", None, 10).unwrap().is_empty());
+        assert_eq!(db.hit_stats_by_uri_for_profile("a").unwrap()[&change.target_uri].hit_count, 1);
+        assert!(db.hit_stats_by_uri_for_profile("b").unwrap().is_empty());
+
+        event.id = "hook-a".into();
+        event.event_type = "hook_stop".into();
+        db.record_event_for_profile("a", &event).unwrap();
+        event.id = "capture-a".into();
+        event.event_type = "capture".into();
+        event.blocked_by_privacy = true;
+        db.record_event_for_profile("a", &event).unwrap();
+        assert_eq!(db.count_sessions_since("a", 0).unwrap(), 1);
+        assert_eq!(db.count_sessions_since("b", 0).unwrap(), 0);
+        assert_eq!(db.count_sessions_since("a", 10).unwrap(), 0);
+    }
+
+    #[test]
+    fn accepted_changes_are_claimed_once_across_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("desktop.db");
+        let db = DesktopDb::open(&path).unwrap();
+        let other = DesktopDb::open(&path).unwrap();
+        let mut change = archive_change("claim-a", "run-a");
+        change.status = ReviewStatus::Accepted;
+        db.insert_pending_change_for_profile("a", &change).unwrap();
+        change.id = "legacy-change".into();
+        db.insert_pending_change_for_profile("", &change).unwrap();
+
+        let gate = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let thread = scope.spawn(|| {
+                gate.wait();
+                other.claim_accepted_changes_for_profile("a").unwrap()
+            });
+            gate.wait();
+            let first_claim = db.claim_accepted_changes_for_profile("a").unwrap();
+            let second_claim = thread.join().unwrap();
+            assert_eq!(first_claim.len() + second_claim.len(), 1);
+        });
+        assert!(db.claim_accepted_changes_for_profile("").unwrap().is_empty());
+        assert_eq!(db.list_pending_changes_for_profile("", Some("accepted")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn legacy_schema_migrates_and_schedule_claim_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("desktop.db");
+        let legacy = Connection::open(&path).unwrap();
+        legacy.execute_batch(
+            "CREATE TABLE dreaming_runs (id TEXT PRIMARY KEY, started_at INTEGER);
+             CREATE TABLE pending_memory_changes (id TEXT PRIMARY KEY, run_id TEXT, status TEXT);
+             CREATE TABLE recall_events (id TEXT PRIMARY KEY, created_at INTEGER);
+             CREATE TABLE pinned_uris (uri TEXT PRIMARY KEY, created_at INTEGER NOT NULL);
+             INSERT INTO pinned_uris VALUES ('viking://legacy', 1);",
+        ).unwrap();
+        drop(legacy);
+
+        let db = DesktopDb::open(&path).unwrap();
+        assert!(db.is_pinned_for_profile("", "viking://legacy").unwrap());
+        assert!(db.is_pinned_for_profile("a", "viking://legacy").unwrap());
+        assert!(db.claim_schedule_slot("a", 100).unwrap());
+        drop(db);
+
+        let db = DesktopDb::open(&path).unwrap();
+        assert!(!db.claim_schedule_slot("a", 100).unwrap());
+        assert!(!db.claim_schedule_slot("a", 99).unwrap());
+        assert!(db.claim_schedule_slot("b", 100).unwrap());
+        assert!(db.claim_schedule_slot("a", 101).unwrap());
+        db.set_kv("example", "value").unwrap();
+        assert_eq!(db.get_kv("example").unwrap().as_deref(), Some("value"));
     }
 }

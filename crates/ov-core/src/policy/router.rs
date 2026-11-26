@@ -32,7 +32,7 @@ pub fn resolve_route_for_agent(
     if policy.routing.respect_project_policy_file {
         if let Some((uri, slug)) = read_project_policy_uri(cwd) {
             return ResolvedRoute {
-                target_resource_uri: uri,
+                target_resource_uri: with_trailing_slash(&uri),
                 target_memory_uri: USER_MEMORIES_URI.to_string(),
                 agent_private_memory_uri: agent_private,
                 matched_source: RouteMatchSource::ProjectPolicyFile,
@@ -57,7 +57,7 @@ pub fn resolve_route_for_agent(
                 .and_then(|s| s.to_str())
                 .map(|s| s.to_string());
             return ResolvedRoute {
-                target_resource_uri: mapping.resource_uri.clone(),
+                target_resource_uri: with_trailing_slash(&mapping.resource_uri),
                 target_memory_uri: USER_MEMORIES_URI.to_string(),
                 agent_private_memory_uri: agent_private,
                 matched_source: RouteMatchSource::ManualMapping,
@@ -84,13 +84,21 @@ pub fn resolve_route_for_agent(
 
     // 4. Fallback to inbox
     ResolvedRoute {
-        target_resource_uri: policy.routing.inbox_uri.clone(),
+        target_resource_uri: with_trailing_slash(&policy.routing.inbox_uri),
         target_memory_uri: USER_MEMORIES_URI.to_string(),
         agent_private_memory_uri: agent_private,
         matched_source: RouteMatchSource::InboxFallback,
         is_fallback_inbox: true,
         project_slug: None,
     }
+}
+
+fn with_trailing_slash(uri: &str) -> String {
+    let uri = uri.trim();
+    if uri.is_empty() || uri == "viking://" {
+        return uri.to_string();
+    }
+    format!("{}/", uri.trim_end_matches('/'))
 }
 
 /// Check if a file path or URI matches any user-protected rule glob (e.g., `CLAUDE.md`, `AGENTS.md`).
@@ -106,8 +114,11 @@ pub fn is_protected_rule_path(policy: &PolicyConfig, candidate: &str) -> bool {
     };
     let normalized = candidate
         .trim_start_matches("viking://")
-        .trim_start_matches("~/");
-    set.is_match(normalized) || set.is_match(Path::new(normalized).file_name().unwrap_or_default())
+        .trim_start_matches("~/")
+        .replace('\\', "/");
+    let normalized = normalized.trim_end_matches('/');
+    set.is_match(normalized)
+        || normalized.match_indices('/').any(|(index, _)| set.is_match(&normalized[index + 1..]))
 }
 
 fn read_project_policy_uri(cwd: &Path) -> Option<(String, Option<String>)> {
@@ -177,13 +188,38 @@ mod tests {
             parse_repo_slug("https://github.com/volcengine/OpenViking/").as_deref(),
             Some("openviking")
         );
+        assert_eq!(
+            parse_repo_slug("https://github.com/volcengine/OpenViking").as_deref(),
+            Some("openviking")
+        );
     }
 
     #[test]
     fn test_protected_rule_globs() {
         let policy = PolicyConfig::default();
+        assert!(is_protected_rule_path(&policy, "CLAUDE.md"));
+        assert!(is_protected_rule_path(
+            &policy,
+            "viking://resources/projects/demo/CLAUDE.md"
+        ));
+        assert!(is_protected_rule_path(
+            &policy,
+            "viking://resources/projects/demo/CLAUDE.md/"
+        ));
         assert!(is_protected_rule_path(&policy, "viking://resources/projects/foo/CLAUDE.md"));
         assert!(is_protected_rule_path(&policy, "AGENTS.md"));
+        assert!(is_protected_rule_path(
+            &policy,
+            "viking://resources/projects/demo/.agents/rules/foo.md"
+        ));
+        assert!(!is_protected_rule_path(
+            &policy,
+            "viking://resources/projects/demo/other.agents/rules/foo.md"
+        ));
+        assert!(!is_protected_rule_path(
+            &policy,
+            "viking://user/memories/preferences/git.md"
+        ));
         assert!(!is_protected_rule_path(&policy, "viking://~/memories/preferences/style.md"));
     }
 
@@ -192,7 +228,7 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join("RESOURCE_POLICY.md"),
-            "---\nresource_uri: viking://resources/projects/custom-app/\n---\n",
+            "---\nresource_uri: viking://resources/projects/custom-app\n---\n",
         )
         .unwrap();
         let policy = PolicyConfig::default();
@@ -203,5 +239,7 @@ mod tests {
             route.agent_private_memory_uri.as_deref(),
             Some("viking://agent/codex/memories/")
         );
+        assert_eq!(route.target_memory_uri, USER_MEMORIES_URI);
+        assert!(!route.is_fallback_inbox);
     }
 }

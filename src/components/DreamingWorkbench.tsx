@@ -177,10 +177,16 @@ export function DreamingWorkbench({
     setBanner(null);
     try {
       const report = await onApplyAccepted();
+      const failedSummary =
+        report.failed_items.length > 0
+          ? `，失败 ${report.failed_items.length} 项（${report.failed_items.map(([id, msg]) => `${id}: ${msg}`).join("; ")}）`
+          : "";
       setBanner(
-        `提交完成：应用 ${report.applied_ids.length} 项，冲突拦截 ${report.conflict_ids.length} 项` +
+        `提交完成：应用 ${report.applied_ids.length} 项，冲突拦截 ${report.conflict_ids.length} 项${failedSummary}` +
           (report.snapshot_id ? `（Snapshot: ${report.snapshot_id}）` : ""),
       );
+    } catch (e) {
+      setBanner(`提交出错（请刷新确认远端状态）：${String(e)}`);
     } finally {
       setBusy(false);
     }
