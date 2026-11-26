@@ -179,7 +179,6 @@ impl DesktopDb {
                 state TEXT NOT NULL DEFAULT 'idle',
                 claimed_at INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT,
-                task_id TEXT,
                 PRIMARY KEY (profile_key, session_key)
             );
             CREATE TABLE IF NOT EXISTS capture_outbox (

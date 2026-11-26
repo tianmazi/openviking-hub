@@ -28,6 +28,7 @@ struct MockState {
     fail_snapshot: bool,
     fail_content_read: bool,
     fail_session_commit: bool,
+    fail_append_after_write: bool,
     session_messages: Vec<String>,
     session_peers: Vec<Option<String>>,
     session_configs: Vec<Value>,
@@ -224,7 +225,16 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                         let mut guard = st.lock().unwrap();
                         guard.session_messages.push(body_json["content"].as_str().unwrap().to_string());
                         guard.session_peers.push(body_json["peer_id"].as_str().map(str::to_owned));
-                        json!({ "status": "ok", "result": {} })
+                        if guard.fail_append_after_write {
+                            status = "500 Internal Server Error";
+                            json!({"status":"error","message":"append response failed"})
+                        } else {
+                            json!({ "status": "ok", "result": {} })
+                        }
+                    }
+                    ("GET", "/api/v1/sessions/e2e-session") => {
+                        let guard = st.lock().unwrap();
+                        json!({"status":"ok","result":{"session_id":"e2e-session","total_message_count":guard.session_messages.len()}})
                     }
                     ("POST", "/api/v1/sessions/e2e-session/commit") => {
                         let mut guard = st.lock().unwrap();
@@ -519,8 +529,8 @@ async fn e2e_hook_outputs_and_stop_capture() {
     assert_eq!(db.capture_health(&client.profile_key()).unwrap().pending, 2);
     let text = hook::execute_hook("stop", agent, &input, &policy, &client, Some(&db)).await;
     assert_eq!(db.capture_health(&client.profile_key()).unwrap().pending, 2);
-    assert_eq!(ov_core::capture::sync_capture(&db, &client).await.unwrap(), 1);
-    assert_eq!(ov_core::capture::sync_capture(&db, &client).await.unwrap(), 0);
+    assert_eq!(ov_core::capture::sync_capture(&db, &client, 0, false).await.unwrap(), 1);
+    assert_eq!(ov_core::capture::sync_capture(&db, &client, 0, false).await.unwrap(), 0);
     assert_eq!(db.capture_health(&client.profile_key()).unwrap().extraction_tasks,
         vec![("capture-task".to_string(),"accepted".to_string())]);
     ov_core::capture::refresh_extraction_tasks(&db,&client).await.unwrap();
@@ -685,18 +695,18 @@ async fn e2e_dreaming_reflector_routes_inbox_and_adds_merge_provenance() {
 
 
 #[tokio::test]
-async fn e2e_unconfirmed_commit_never_replays_messages() {
+async fn e2e_failed_commit_can_retry_without_replaying_messages() {
     let state = Arc::new(Mutex::new(MockState::default()));
     let url = start_mock_openviking_server(state.clone()).await;
     let client = test_client(&url, "work");
     let db = DesktopDb::open_in_memory().unwrap();
     let (_, messages) = ov_core::capture::collect(&json!({"messages":[{"role":"assistant","content":"one decision"}]}));
-    db.enqueue_capture(&client.profile_key(),"session","codex","viking://resources/projects/demo/",&messages).unwrap();
+    db.enqueue_capture(&client.profile_key(),"session","codex","viking://resources/projects/demo/",None,&messages,false).unwrap();
     state.lock().unwrap().fail_session_commit = true;
-    assert!(ov_core::capture::sync_capture(&db,&client).await.is_err());
-    assert_eq!(db.capture_health(&client.profile_key()).unwrap().uncertain_sessions,1);
+    assert!(ov_core::capture::sync_capture(&db,&client,0,false).await.is_err());
+    assert_eq!(db.capture_health(&client.profile_key()).unwrap().uncertain_sessions,0);
     state.lock().unwrap().fail_session_commit = false;
-    assert_eq!(ov_core::capture::sync_capture(&db,&client).await.unwrap(),0);
+    assert_eq!(ov_core::capture::sync_capture(&db,&client,0,false).await.unwrap(),1);
     assert_eq!(state.lock().unwrap().session_messages.len(),1);
 }
 
@@ -709,12 +719,32 @@ async fn e2e_capture_threshold_and_forced_flush() {
     let db = DesktopDb::open_in_memory().unwrap();
     let (_, messages) = ov_core::capture::collect(&json!({"messages":[{"role":"assistant","content":"small batch"}]}));
     let profile = client.profile_key();
-    db.enqueue_scoped_capture(&profile,"session","codex","viking://resources/projects/demo/",Some("project-demo"),&messages,false).unwrap();
-    assert_eq!(ov_core::capture::sync_capture_at_threshold(&db,&client,100).await.unwrap(),0);
+    db.enqueue_capture(&profile,"session","codex","viking://resources/projects/demo/",Some("project-demo"),&messages,false).unwrap();
+    assert_eq!(ov_core::capture::sync_capture(&db,&client,100,false).await.unwrap(),0);
     assert_eq!(db.capture_health(&profile).unwrap().pending,1);
-    db.enqueue_scoped_capture(&profile,"session","codex","viking://resources/projects/demo/",Some("project-demo"),&[],true).unwrap();
-    assert_eq!(ov_core::capture::sync_capture_at_threshold(&db,&client,100).await.unwrap(),1);
+    db.enqueue_capture(&profile,"session","codex","viking://resources/projects/demo/",Some("project-demo"),&[],true).unwrap();
+    assert_eq!(ov_core::capture::sync_capture(&db,&client,100,false).await.unwrap(),1);
     let guard = state.lock().unwrap();
     assert_eq!(guard.session_peers,vec![Some("project-demo".to_string())]);
     assert_eq!(guard.session_commits,1);
+}
+
+
+#[tokio::test]
+async fn e2e_manual_sync_reconciles_append_acknowledgement_loss() {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let url = start_mock_openviking_server(state.clone()).await;
+    let client = test_client(&url, "work");
+    let db = DesktopDb::open_in_memory().unwrap();
+    let (_,messages) = ov_core::capture::collect(&json!({"messages":[{"role":"assistant","content":"decision"}]}));
+    let profile = client.profile_key();
+    db.enqueue_capture(&profile,"session","codex","viking://resources/projects/demo/",None,&messages,false).unwrap();
+    state.lock().unwrap().fail_append_after_write = true;
+    assert!(ov_core::capture::sync_capture(&db,&client,0,false).await.is_err());
+    assert_eq!(db.capture_health(&profile).unwrap().uncertain_sessions,1);
+    state.lock().unwrap().fail_append_after_write = false;
+    assert_eq!(ov_core::capture::sync_capture(&db,&client,0,false).await.unwrap(),0);
+    assert_eq!(ov_core::capture::sync_capture(&db,&client,0,true).await.unwrap(),1);
+    assert_eq!(db.capture_health(&profile).unwrap().uncertain_sessions,0);
+    assert_eq!(state.lock().unwrap().session_messages.len(),1);
 }

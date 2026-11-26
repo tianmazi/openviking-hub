@@ -477,6 +477,10 @@ impl OvClient {
 
     // ---- Session APIs ----
 
+    pub async fn get_session(&self, session_id: &str) -> Result<Value, OvClientError> {
+        self.get_json(&format!("/api/v1/sessions/{session_id}"), &[("auto_create","false")]).await
+    }
+
     pub async fn create_session(&self, metadata: Value) -> Result<Value, OvClientError> {
         self.post_json("/api/v1/sessions", &metadata).await
     }

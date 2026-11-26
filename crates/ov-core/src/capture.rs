@@ -20,8 +20,7 @@ fn text(payload: &Value, keys: &[&str]) -> Option<String> {
         .find(|value| !value.trim().is_empty()).map(str::to_owned)
 }
 
-/// Strip previously injected reference blocks and omit obvious credential-bearing lines.
-/// Raw transcripts are never stored in the outbox.
+/// Remove injected references and redact explicit credential values, not technical prose.
 fn sanitize(input: &str) -> String {
     let mut remaining = input;
     let mut clean = String::new();
@@ -34,12 +33,34 @@ fn sanitize(input: &str) -> String {
         remaining = &remaining[start + end + "</openviking_memory_reference>".len()..];
     }
     clean.push_str(remaining);
-    clean.lines().filter(|line| {
-        let lower = line.to_ascii_lowercase();
-        !["api_key", "api-key", "apikey", "authorization:", "bearer ", "password",
-          "secret_key", "private key", "sk-", "ghp_", "github_pat_", "access_token",
-          "refresh_token", "client_secret"].iter().any(|marker| lower.contains(marker))
-    }).collect::<Vec<_>>().join("\n").trim().chars().take(12000).collect()
+    clean.lines().map(redact_credentials).collect::<Vec<_>>()
+        .join("\n").trim().chars().take(12000).collect()
+}
+
+fn redact_credentials(line: &str) -> String {
+    if let Some(index) = line.find([':', '=']) {
+        let key = line[..index].trim().trim_matches(['"', '\'']).to_ascii_lowercase();
+        if matches!(key.as_str(), "authorization" | "api_key" | "api-key" | "apikey"
+            | "password" | "secret_key" | "access_token" | "refresh_token" | "client_secret") {
+            let value = line[index + 1..].trim();
+            if !value.is_empty() {
+                let redacted = if key == "authorization" && value.to_ascii_lowercase().starts_with("bearer ") {
+                    "Bearer [REDACTED]"
+                } else {
+                    "[REDACTED]"
+                };
+                return format!("{} {redacted}", &line[..=index]);
+            }
+        }
+    }
+    line.split_inclusive(char::is_whitespace).map(|word| {
+        let token = word.trim_matches(|c: char| c.is_whitespace() || c == '\u{60}' || "\"'(),;[]{}".contains(c));
+        if token.len() >= 20 && ["sk-", "ghp_", "github_pat_"].iter().any(|prefix| token.starts_with(prefix)) {
+            word.replace(token, "[REDACTED]")
+        } else {
+            word.to_owned()
+        }
+    }).collect::<Vec<_>>().concat()
 }
 
 fn message(entry: &Value, ordinal: usize) -> Option<CapturedMessage> {
@@ -114,16 +135,12 @@ struct Session {
     resource_uri: String,
     remote_id: Option<String>,
     peer_id: Option<String>,
+    needs_reconciliation: bool,
 }
 
 impl DesktopDb {
     /// The unique message key is the durable capture watermark. Enqueueing is atomic.
     pub fn enqueue_capture(&self, profile: &str, session: &str, agent: &str,
-        uri: &str, messages: &[CapturedMessage]) -> Result<usize, String> {
-        self.enqueue_scoped_capture(profile,session,agent,uri,None,messages,false)
-    }
-
-    pub fn enqueue_scoped_capture(&self, profile: &str, session: &str, agent: &str,
         uri: &str, peer: Option<&str>, messages: &[CapturedMessage], flush: bool) -> Result<usize,String> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
@@ -142,22 +159,22 @@ impl DesktopDb {
         Ok(added)
     }
 
-    fn claim_capture(&self, profile: &str, threshold: u64) -> Result<Option<Session>, String> {
+    fn claim_capture(&self, profile: &str, threshold: u64, reconcile: bool) -> Result<Option<Session>, String> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
         // A crashed process may have completed a remote write. Never blindly replay it.
         let now = Utc::now().timestamp();
         tx.execute("UPDATE capture_sessions SET state='unknown',last_error='Interrupted sync; reconcile remote session before retry' WHERE profile_key=?1 AND state='sending' AND claimed_at<?2",
             params![profile,now-3600]).map_err(|e| e.to_string())?;
-        let session = tx.query_row("SELECT session_key,agent,resource_uri,remote_id,peer_id FROM capture_sessions s
-            WHERE profile_key=?1 AND state='idle' AND EXISTS (SELECT 1 FROM capture_outbox o
+        let session = tx.query_row("SELECT session_key,agent,resource_uri,remote_id,peer_id,state FROM capture_sessions s
+            WHERE profile_key=?1 AND (state='idle' OR (?3 AND state='unknown')) AND EXISTS (SELECT 1 FROM capture_outbox o
                 WHERE o.profile_key=s.profile_key AND o.session_key=s.session_key AND o.state IN ('pending','sent'))
             AND (s.flush_requested=1 OR ?2=0 OR EXISTS (SELECT 1 FROM capture_outbox o
                 WHERE o.profile_key=s.profile_key AND o.session_key=s.session_key AND o.state='sent')
                 OR (SELECT COALESCE(SUM(length(CAST(content AS BLOB))),0) FROM capture_outbox o
                 WHERE o.profile_key=s.profile_key AND o.session_key=s.session_key AND o.state='pending') >= ?2)
             ORDER BY (SELECT MIN(seq) FROM capture_outbox o WHERE o.profile_key=s.profile_key AND o.session_key=s.session_key AND o.state IN ('pending','sent')) LIMIT 1",
-            params![profile,threshold.min(i64::MAX as u64 / 4) as i64 * 4], |r| Ok(Session {key:r.get(0)?,agent:r.get(1)?,resource_uri:r.get(2)?,remote_id:r.get(3)?,peer_id:r.get(4)?}))
+            params![profile,threshold.min(i64::MAX as u64 / 4) as i64 * 4,reconcile], |r| Ok(Session {key:r.get(0)?,agent:r.get(1)?,resource_uri:r.get(2)?,remote_id:r.get(3)?,peer_id:r.get(4)?,needs_reconciliation:r.get::<_,String>(5)?=="unknown"}))
             .optional().map_err(|e| e.to_string())?;
         if let Some(s) = &session {
             tx.execute("UPDATE capture_sessions SET state='sending',claimed_at=?3 WHERE profile_key=?1 AND session_key=?2",
@@ -165,6 +182,14 @@ impl DesktopDb {
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(session)
+    }
+
+    pub fn has_capture_work(&self, profile: &str) -> Result<bool, String> {
+        self.lock_conn()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM capture_sessions s JOIN capture_outbox o
+             ON s.profile_key=o.profile_key AND s.session_key=o.session_key
+             WHERE s.profile_key=?1 AND s.state='idle' AND o.state IN ('pending','sent'))",
+            [profile], |row| row.get(0)).map_err(|e| e.to_string())
     }
 
     fn capture_rows(&self, profile: &str, session: &str) -> Result<Vec<(i64,String,String)>, String> {
@@ -195,34 +220,76 @@ impl DesktopDb {
     }
 }
 
-fn retryable(error: &OvClientError) -> bool {
-    matches!(error, OvClientError::Http(e) if e.is_connect())
+fn write_rejected(error: &OvClientError) -> bool {
+    match error {
+        OvClientError::Http(e) => e.is_connect(),
+        OvClientError::Api { status, .. } => matches!(*status, 400 | 401 | 403 | 404 | 405 | 413 | 415 | 422 | 429),
+        _ => false,
+    }
 }
 
-/// Drain the active profile only. Each message acknowledged by the server is checkpointed
-/// before the next write; a failed commit does not cause message replay.
+/// Manual sync can resume an interrupted, exclusively Hub-owned session after
+/// the previous request has settled. At most one append was unacknowledged.
+async fn reconcile_session(db: &DesktopDb, client: &OvClient, profile: &str,
+    session: &Session) -> Result<Option<String>, String> {
+    let remote = session.remote_id.as_deref().unwrap_or(&session.key);
+    let local_count: i64 = db.lock_conn()?.query_row(
+        "SELECT COUNT(*) FROM capture_outbox WHERE profile_key=?1 AND session_key=?2 AND state IN ('sent','committed')",
+        params![profile,session.key], |row| row.get(0)).map_err(|e| e.to_string())?;
+    let info = match client.get_session(remote).await {
+        Ok(info) => info,
+        Err(OvClientError::Api {status:404,..}) if session.remote_id.is_none() && local_count==0 => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    let count = info["total_message_count"].as_i64()
+        .ok_or("Remote session has no total_message_count; cannot reconcile automatically")?;
+    if count == local_count + 1 {
+        let changed = db.lock_conn()?.execute(
+            "UPDATE capture_outbox SET state='sent' WHERE seq=(SELECT MIN(seq) FROM capture_outbox
+             WHERE profile_key=?1 AND session_key=?2 AND state='pending')",
+            params![profile,session.key]).map_err(|e| e.to_string())?;
+        if changed != 1 { return Err("Remote session count differs from local capture".into()); }
+    } else if count != local_count {
+        return Err("Remote session count differs from local capture".into());
+    }
+    let id = text(&info, &["session_id"]).unwrap_or_else(|| remote.to_owned());
+    db.lock_conn()?.execute("UPDATE capture_sessions SET remote_id=?3 WHERE profile_key=?1 AND session_key=?2",
+        params![profile,session.key,id]).map_err(|e| e.to_string())?;
+    Ok(Some(id))
+}
+
+/// Refresh only within one overall time budget, not a timeout per task.
 pub async fn refresh_extraction_tasks(db: &DesktopDb, client: &OvClient) -> Result<(), String> {
     let profile = client.profile_key();
-    for (task, status) in db.capture_health(&profile)?.extraction_tasks {
-        if matches!(status.as_str(), "completed" | "failed" | "cancelled") { continue; }
-        if let Ok(Ok(result)) = tokio::time::timeout(std::time::Duration::from_secs(3), client.get_task(&task)).await {
+    let tasks = db.capture_health(&profile)?.extraction_tasks;
+    let refresh = async {
+        for (task, status) in tasks {
+            if matches!(status.as_str(), "completed" | "failed" | "cancelled") { continue; }
+            let Ok(result) = client.get_task(&task).await else { break; };
             if let Some(status) = result["status"].as_str() {
                 db.lock_conn()?.execute("UPDATE capture_tasks SET status=?3 WHERE profile_key=?1 AND task_id=?2",
                     params![profile,task,status]).map_err(|e| e.to_string())?;
             }
         }
-    }
-    Ok(())
+        Ok::<(),String>(())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(3), refresh).await.unwrap_or(Ok(()))
 }
 
-pub async fn sync_capture(db: &DesktopDb, client: &OvClient) -> Result<usize,String> {
-    sync_capture_at_threshold(db,client,0).await
-}
-
-pub async fn sync_capture_at_threshold(db: &DesktopDb, client: &OvClient, threshold: u64) -> Result<usize,String> {
+/// Checkpoint each acknowledged append. Retrying commit never replays messages.
+pub async fn sync_capture(db: &DesktopDb, client: &OvClient, threshold: u64, reconcile: bool) -> Result<usize,String> {
     let profile = client.profile_key();
     let mut committed = 0;
-    while let Some(session) = db.claim_capture(&profile,threshold)? {
+    while let Some(mut session) = db.claim_capture(&profile,threshold,reconcile)? {
+        if session.needs_reconciliation {
+            match reconcile_session(db,client,&profile,&session).await {
+                Ok(id) => session.remote_id = id,
+                Err(error) => {
+                    db.capture_state(&profile,&session.key,"unknown",Some("Remote session needs reconciliation"))?;
+                    return Err(error);
+                }
+            }
+        }
         let remote = match session.remote_id {
             Some(id) => id,
             None => {
@@ -241,7 +308,7 @@ pub async fn sync_capture_at_threshold(db: &DesktopDb, client: &OvClient, thresh
                     id
                 },
                 Err(error) => {
-                    db.capture_state(&profile,&session.key,if retryable(&error) {"idle"} else {"unknown"},Some("Session creation failed"))?;
+                    db.capture_state(&profile,&session.key,if write_rejected(&error) {"idle"} else {"unknown"},Some("Session creation failed"))?;
                     return Err(error.to_string());
                 }
                 }
@@ -249,7 +316,7 @@ pub async fn sync_capture_at_threshold(db: &DesktopDb, client: &OvClient, thresh
         };
         for (seq,role,content) in db.capture_rows(&profile,&session.key)? {
             if let Err(error) = client.add_session_message_for_peer(&remote,&role,&content,session.peer_id.as_deref()).await {
-                db.capture_state(&profile,&session.key,if retryable(&error) {"idle"} else {"unknown"},Some("Message delivery failed"))?;
+                db.capture_state(&profile,&session.key,if write_rejected(&error) {"idle"} else {"unknown"},Some("Message delivery failed"))?;
                 return Err(error.to_string());
             }
             db.lock_conn()?.execute("UPDATE capture_outbox SET state='sent' WHERE seq=?1",[seq]).map_err(|e| e.to_string())?;
@@ -265,10 +332,10 @@ pub async fn sync_capture_at_threshold(db: &DesktopDb, client: &OvClient, thresh
                     tx.execute("INSERT OR IGNORE INTO capture_tasks(profile_key,task_id) VALUES (?1,?2)",
                         params![profile,task_id]).map_err(|e| e.to_string())?;
                 }
-                tx.execute("UPDATE capture_sessions SET state='idle',last_error=NULL,task_id=?3,
+                tx.execute("UPDATE capture_sessions SET state='idle',last_error=NULL,
                     flush_requested=CASE WHEN EXISTS (SELECT 1 FROM capture_outbox o WHERE o.profile_key=?1 AND o.session_key=?2 AND o.state='pending') THEN flush_requested ELSE 0 END
                     WHERE profile_key=?1 AND session_key=?2",
-                    params![profile,session.key,task]).map_err(|e| e.to_string())?;
+                    params![profile,session.key]).map_err(|e| e.to_string())?;
                 tx.commit().map_err(|e| e.to_string())?;
                 drop(conn);
                 db.record_event_for_profile(&profile, &RecallEvent {
@@ -280,8 +347,8 @@ pub async fn sync_capture_at_threshold(db: &DesktopDb, client: &OvClient, thresh
                 committed += 1;
             }
             Err(error) => {
-                // A connection failure is safe to retry. A response or timeout may hide a commit.
-                db.capture_state(&profile,&session.key,if retryable(&error) {"idle"} else {"unknown"},Some("Commit not confirmed"))?;
+                // OpenViking archives only live messages; a repeated empty commit is a no-op.
+                db.capture_state(&profile,&session.key,"idle",Some("Commit failed; retry sync"))?;
                 return Err(error.to_string());
             }
         }
@@ -301,17 +368,26 @@ mod tests {
         let (session,messages) = collect(&payload);
         assert_eq!(session.as_deref(),Some("one"));
         assert_eq!(messages.len(),2);
-        assert_eq!(messages[0].content,"Fix payment");
+        assert_eq!(messages[0].content,"Fix payment\nAuthorization: Bearer [REDACTED]");
         assert_eq!(messages[1].content,"Fixed");
+    }
+
+    #[test]
+    fn technical_prose_survives_credential_redaction() {
+        let prose = "Password fields use BCrypt\nRefresh token expires after 7 days\nTask-based architecture\nUse access_token for authentication";
+        assert_eq!(sanitize(prose),prose);
+        assert_eq!(sanitize("api_key=actual-secret"),"api_key= [REDACTED]");
+        assert_eq!(sanitize("Use sk-example"),"Use sk-example");
+        assert_eq!(sanitize("token ghp_abcdefghijklmnopqrstuvwxyz"),"token [REDACTED]");
     }
 
     #[test]
     fn enqueue_is_incremental_and_profile_scoped() {
         let db = DesktopDb::open_in_memory().unwrap();
         let (_,messages) = collect(&json!({"messages":[{"role":"user","content":"one"},{"role":"assistant","content":"two"}]}));
-        assert_eq!(db.enqueue_capture("a","session","codex","viking://resources/p/",&messages).unwrap(),2);
-        assert_eq!(db.enqueue_capture("a","session","codex","viking://resources/p/",&messages).unwrap(),0);
-        assert_eq!(db.enqueue_capture("b","session","codex","viking://resources/p/",&messages).unwrap(),2);
+        assert_eq!(db.enqueue_capture("a","session","codex","viking://resources/p/",None,&messages,false).unwrap(),2);
+        assert_eq!(db.enqueue_capture("a","session","codex","viking://resources/p/",None,&messages,false).unwrap(),0);
+        assert_eq!(db.enqueue_capture("b","session","codex","viking://resources/p/",None,&messages,false).unwrap(),2);
         assert_eq!(db.capture_health("a").unwrap().pending,2);
         assert_eq!(db.capture_health("b").unwrap().pending,2);
     }

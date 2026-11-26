@@ -30,9 +30,9 @@ enum Commands {
         #[arg(long, default_value = "claude-code")]
         agent: String,
     },
-    /// Print remote OpenViking server status and loaded policy summary as JSON.
+    /// Print local queue and policy status as JSON.
     Status,
-    /// Drain the active profile's durable capture queue.
+    /// Drain the active profile's queue. Manual sync reconciles uncertain writes after they settle.
     Sync { #[arg(long)] profile: Option<String> },
     /// Inspect the active profile's capture queue and connectivity.
     Doctor,
@@ -57,24 +57,28 @@ async fn main() -> anyhow::Result<()> {
             if policy.global.capture_enabled {
                 let db = ov_core::dreaming::db::DesktopDb::open_default().map_err(anyhow::Error::msg)?;
                 let threshold = if profile.is_some() {policy.global.capture_commit_tokens} else {0};
-                let count = ov_core::capture::sync_capture_at_threshold(&db, &client, threshold).await.map_err(anyhow::Error::msg)?;
+                let count = ov_core::capture::sync_capture(&db, &client, threshold, profile.is_none()).await.map_err(anyhow::Error::msg)?;
                 println!("{}", serde_json::json!({"committed_sessions":count}));
             }
         }
-        Commands::Doctor | Commands::Status => {
+        command @ (Commands::Doctor | Commands::Status) => {
             let client = OvClient::from_local_config()?;
-            let status = client.status().await;
-            let policy = PolicyStore::load_or_init().ok();
-            let capture = if let Ok(db) = ov_core::dreaming::db::DesktopDb::open_default() {
-                let _ = ov_core::capture::refresh_extraction_tasks(&db,&client).await;
-                db.capture_health(&client.profile_key()).ok()
-            } else { None };
-            let out = serde_json::json!({
-                "capture_queue": capture,
-                "agents": ov_core::adapters::AdapterRegistry::new().detect_all(),
-                "server": status,
-                "capture_enabled": policy.as_ref().map(|p| p.global.capture_enabled).unwrap_or(true),
+            let policy = PolicyStore::load_or_init()?;
+            let db = ov_core::dreaming::db::DesktopDb::open_default().map_err(anyhow::Error::msg)?;
+            let doctor = matches!(command, Commands::Doctor);
+            if doctor {
+                ov_core::capture::refresh_extraction_tasks(&db,&client).await.map_err(anyhow::Error::msg)?;
+            }
+            let mut out = serde_json::json!({
+                "capture_queue": db.capture_health(&client.profile_key()).map_err(anyhow::Error::msg)?,
+                "profile": client.profile_key(),
+                "server_url": client.base_url(),
+                "capture_enabled": policy.global.capture_enabled,
             });
+            if doctor {
+                out["server"] = serde_json::to_value(client.status().await)?;
+                out["agents"] = serde_json::to_value(ov_core::adapters::AdapterRegistry::new().detect_all())?;
+            }
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
     }

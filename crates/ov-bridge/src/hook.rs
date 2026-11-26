@@ -31,16 +31,25 @@ async fn local_hook(event: &str, agent: AgentId, payload: &Value) -> anyhow::Res
         return Ok(String::new());
     };
     let policy = PolicyStore::load_or_init()?;
-    let db = DesktopDb::open_default().ok();
+    let db = match DesktopDb::open_default() {
+        Ok(db) => Some(db),
+        Err(error) => { eprintln!("OpenViking local database: {error}"); None }
+    };
     let result = execute_hook(event, agent, payload, &policy, &client, db.as_ref()).await;
-    if policy.global.capture_enabled && matches!(event, "stop" | "pre-compact" | "session-end" | "session-start") {
+    if policy.global.capture_enabled && matches!(event, "stop" | "pre-compact" | "session-end" | "session-start")
+        && db.as_ref().is_some_and(|db| match db.has_capture_work(&client.profile_key()) {
+            Ok(ready) => ready,
+            Err(error) => { eprintln!("OpenViking capture queue: {error}"); false }
+        }) {
         // Short-lived independent worker; the desktop window need not be open.
         if let Ok(exe) = std::env::current_exe() {
             let mut command = ov_core::platform::silent_command(&exe.to_string_lossy());
             command.args(["sync", "--profile", &client.profile_key()])
                 .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
-            let _ = command.spawn();
+            if let Err(error) = command.spawn() {
+                eprintln!("OpenViking sync worker: {error}");
+            }
         }
     }
     Ok(result)
@@ -221,9 +230,13 @@ pub(crate) async fn execute_hook(
                 };
                 let flush = matches!(event,"pre-compact" | "session-end");
                 let session_key = sha256_hex(&format!("{}:{}:{}", agent.as_str(), route.target_resource_uri, runtime_id));
-                match db.enqueue_scoped_capture(&client.profile_key(), &session_key, agent.as_str(), &route.target_resource_uri, peer.as_deref(), &messages, flush) {
-                    Ok(0) | Err(_) => return String::new(),
-                    Ok(_) => {}
+                match db.enqueue_capture(&client.profile_key(), &session_key, agent.as_str(), &route.target_resource_uri, peer.as_deref(), &messages, flush) {
+                    Ok(0) => return String::new(),
+                    Ok(_) => {},
+                    Err(error) => {
+                        eprintln!("OpenViking capture enqueue: {error}");
+                        return String::new();
+                    }
                 }
                 evt.event_type = "capture_queued".to_string();
                 evt.layer = Some("l2".to_string());
