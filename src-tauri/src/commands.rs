@@ -58,6 +58,12 @@ pub fn save_profiles(store: ProfileStore) -> Result<ProfileStore, String> {
 }
 
 #[tauri::command]
+pub fn get_capture_health() -> Result<ov_core::capture::CaptureHealth, String> {
+    let client = ov_core::ov_client::OvClient::from_local_config().map_err(|e| e.to_string())?;
+    DesktopDb::open_default()?.capture_health(&client.profile_key())
+}
+
+#[tauri::command]
 pub fn detect_agents() -> Vec<AgentStatus> {
     AdapterRegistry::new().detect_all()
 }

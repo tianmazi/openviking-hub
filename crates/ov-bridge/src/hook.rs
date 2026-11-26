@@ -1,4 +1,4 @@
-use crate::mcp::{extract_top_hit, find_scopes, render_recall};
+use crate::mcp::{extract_top_hit, find_scopes, mark_injected, render_recall, unseen_recall};
 use chrono::Utc;
 use ov_core::dreaming::db::{DesktopDb, RecallEvent};
 use ov_core::ov_client::OvClient;
@@ -92,6 +92,15 @@ pub(crate) async fn execute_hook(
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let route = resolve_route_for_agent(policy, &cwd, Some(agent));
     let peer = project_peer(&route);
+    let recall_key = payload_text(payload, &["session_id", "sessionId", "conversationId", "transcript_path", "transcriptPath"])
+        .map(|session| format!("recall:{}:{}", client.profile_key(),
+            sha256_hex(&format!("{}:{}:{}", agent.as_str(), route.target_resource_uri, session))));
+    let ledger = if let (Some(db), Some(key)) = (db, &recall_key) {
+        if matches!(event, "session-start" | "pre-compact") {
+            let _ = db.set_kv(key, &Uuid::new_v4().to_string());
+        }
+        Some(format!("{}:{}", key, db.get_kv(key).ok().flatten().unwrap_or_default()))
+    } else { None };
     let mut evt = RecallEvent {
         id: Uuid::new_v4().to_string(),
         agent_id: agent.as_str().to_string(),
@@ -174,20 +183,14 @@ pub(crate) async fn execute_hook(
             if matches!(prompt.trim().to_lowercase().as_str(), "ok" | "yes" | "继续" | "可以" | "好的") {
                 return String::new();
             }
-            let recall_key = payload_text(payload, &["session_id", "sessionId", "transcript_path", "transcriptPath"])
-                .map(|session| format!("recall:{}:{}", client.profile_key(),
-                    sha256_hex(&format!("{}:{}:{}", agent.as_str(), route.target_resource_uri, session))));
-            let digest = sha256_hex(prompt);
-            if let (Some(db), Some(key)) = (db, &recall_key) {
-                if db.get_kv(key).ok().flatten().as_deref() == Some(digest.as_str()) {
-                    return String::new();
-                }
-            }
             let Ok(Ok(res)) = tokio::time::timeout(std::time::Duration::from_secs(3),
                 find_scopes(client, prompt, &route.target_resource_uri, peer.as_deref(), Some(5))).await
             else {
                 return String::new();
             };
+            let res = if let (Some(db), Some(key)) = (db, &ledger) {
+                unseen_recall(db, key, &res)
+            } else { res };
             let Some((top_uri, _)) = extract_top_hit(&res) else {
                 return String::new();
             };
@@ -195,8 +198,8 @@ pub(crate) async fn execute_hook(
             if let Some(db) = db {
                 let _ = db.record_recall_hits(&evt.id, &hits);
             }
-            if let (Some(db), Some(key)) = (db, &recall_key) {
-                let _ = db.set_kv(key, &digest);
+            if let (Some(db), Some(key)) = (db, &ledger) {
+                mark_injected(db, key, &res, &hits);
             }
             evt.target_uri = Some(top_uri);
             evt.query = Some(prompt.chars().take(120).collect());

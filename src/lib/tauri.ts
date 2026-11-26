@@ -1,6 +1,7 @@
 import type {
   AgentId,
   AgentStatus,
+  CaptureHealth,
   ApplyReport,
   DreamingRun,
   LayeredContent,
@@ -193,6 +194,10 @@ let previewChanges: PendingMemoryChange[] = [
 ];
 
 export const api = {
+  async getCaptureHealth(): Promise<CaptureHealth> {
+    if (isTauriRuntime()) return callTauri("get_capture_health");
+    return { pending: 0, sent: 0, uncertain_sessions: 0, extraction_tasks: [], last_error: null };
+  },
   async getServerStatus(): Promise<ServerStatus> {
     if (isTauriRuntime()) return callTauri("get_server_status");
     const active = previewProfiles.profiles[previewProfiles.active];

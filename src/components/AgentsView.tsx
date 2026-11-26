@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { api } from "../lib/tauri";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -10,7 +11,7 @@ import {
   Unplug,
   Upload,
 } from "lucide-react";
-import type { AgentId, AgentStatus, WslDistroInfo } from "../types/openviking";
+import type { AgentId, AgentStatus, CaptureHealth, WslDistroInfo } from "../types/openviking";
 
 interface AgentsViewProps {
   agents: AgentStatus[];
@@ -34,6 +35,13 @@ export function AgentsView({
   onNotify,
 }: AgentsViewProps) {
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [captureHealth, setCaptureHealth] = useState<CaptureHealth | null>(null);
+  useEffect(() => {
+    let active = true;
+    api.getCaptureHealth().then(value => { if (active) setCaptureHealth(value); })
+      .catch(() => { if (active) setCaptureHealth(null); });
+    return () => { active = false; };
+  }, [agents]);
   const [importingFile, setImportingFile] = useState<string | null>(null);
   const [writeAntigravityRules, setWriteAntigravityRules] = useState(false);
   const [antigravityProjectDir, setAntigravityProjectDir] = useState("");
@@ -112,6 +120,16 @@ export function AgentsView({
         </button>
       </div>
 
+      <section className="rounded-lg border border-border p-3 text-sm">
+        <h3 className="font-medium mb-2">当前 Profile · 记忆同步</h3>
+        {captureHealth ? (
+          <>
+            <p>待发送 {captureHealth.pending} · 已发送待归档 {captureHealth.sent} · 待核对会话 {captureHealth.uncertain_sessions}</p>
+            <p className="text-xs text-muted-foreground mt-1">最近记录的提取任务：{captureHealth.extraction_tasks.length} · 完成 {captureHealth.extraction_tasks.filter(([, status]) => status === "completed").length}</p>
+            {captureHealth.last_error && <p className="text-xs text-red-500 mt-1">{captureHealth.last_error}</p>}
+          </>
+        ) : <p className="text-muted-foreground">同步状态暂不可用</p>}
+      </section>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {agents.map((agent) => (
           <div

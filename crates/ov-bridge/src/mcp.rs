@@ -397,6 +397,31 @@ fn search_items(val: &Value) -> Vec<&Value> {
     items
 }
 
+fn recall_version(item: &Value) -> String {
+    let mut stable = item.clone();
+    if let Some(fields) = stable.as_object_mut() {
+        for field in ["score", "similarity", "rank"] { fields.remove(field); }
+    }
+    ov_core::fs_util::sha256_hex(&stable.to_string())
+}
+
+pub(crate) fn unseen_recall(db: &DesktopDb, session: &str, result: &Value) -> Value {
+    Value::Array(search_items(result).into_iter().filter(|item| {
+        let key = format!("{}:{}", session, ov_core::fs_util::sha256_hex(item["uri"].as_str().unwrap()));
+        db.get_kv(&key).ok().flatten().as_deref() != Some(recall_version(item).as_str())
+    }).cloned().collect())
+}
+
+pub(crate) fn mark_injected(db: &DesktopDb, session: &str, result: &Value, hits: &[(String,f64,bool)]) {
+    for item in search_items(result) {
+        let uri = item["uri"].as_str().unwrap();
+        if hits.iter().any(|(hit,_,injected)| hit == uri && *injected) {
+            let key = format!("{}:{}", session, ov_core::fs_util::sha256_hex(uri));
+            let _ = db.set_kv(&key, &recall_version(item));
+        }
+    }
+}
+
 fn score(item: &Value) -> f64 {
     item.get("score").or_else(|| item.get("similarity")).and_then(Value::as_f64).unwrap_or(0.0)
 }
@@ -442,6 +467,29 @@ pub(crate) async fn render_recall(client: &OvClient, result: &Value,
         }
     }
     (text,layer,hits)
+}
+
+#[cfg(test)]
+mod recall_version_tests {
+    use super::*;
+
+    #[test]
+    fn session_ledger_only_suppresses_injected_unchanged_hits() {
+        let db = DesktopDb::open_in_memory().unwrap();
+        let result = serde_json::json!([
+            {"uri":"viking://resources/a", "score":0.9, "abstract":"one"},
+            {"uri":"viking://resources/b", "score":0.8, "abstract":"two"}
+        ]);
+        mark_injected(&db, "session", &result, &[("viking://resources/a".into(),0.9,true),("viking://resources/b".into(),0.8,false)]);
+        let changed_score = serde_json::json!([
+            {"uri":"viking://resources/a", "score":0.5, "abstract":"one"},
+            {"uri":"viking://resources/b", "score":0.7, "abstract":"two"}
+        ]);
+        assert_eq!(search_items(&unseen_recall(&db,"session",&changed_score)).len(),1);
+        let changed = serde_json::json!([{"uri":"viking://resources/a","score":0.9,"abstract":"new"}]);
+        assert_eq!(search_items(&unseen_recall(&db,"session",&changed)).len(),1);
+        assert_eq!(search_items(&unseen_recall(&db,"other",&result)).len(),2);
+    }
 }
 
 pub fn truncate_to_token_budget(text: &str, max_tokens: usize) -> String {

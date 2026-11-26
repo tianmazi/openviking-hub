@@ -120,6 +120,12 @@ export function PolicyView({ policy, onSave }: PolicyViewProps) {
         </div>
       )}
 
+      <section className="rounded-lg border border-border p-4">
+        <label className="text-sm font-medium block mb-2">会话归档阈值（Token，0 表示每轮归档）</label>
+        <input type="number" min={0} step={1} value={draft.global.capture_commit_tokens ?? 0}
+          onChange={e => setDraft(prev => ({ ...prev, global: { ...prev.global, capture_commit_tokens: Math.max(0, Math.floor(Number(e.target.value))) } }))}
+          className="w-40 rounded border border-border bg-background p-2 text-sm" />
+      </section>
       {/* 1. Scope Router */}
       <section className="rounded-xl bg-surface-1 border border-border-subtle p-5 space-y-4">
         <h2 className="text-sm font-semibold text-zinc-100">1. 作用域路由与规则保护（Scope Router）</h2>

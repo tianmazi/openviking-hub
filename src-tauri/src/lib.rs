@@ -180,6 +180,7 @@ pub fn run() {
             commands::get_profiles,
             commands::save_profiles,
             commands::detect_agents,
+            commands::get_capture_health,
             commands::detect_wsl,
             commands::connect_wsl_agent,
             commands::connect_agent,

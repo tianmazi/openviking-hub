@@ -49,6 +49,14 @@ export interface ProfileStore {
   profiles: Record<string, OvProfile>;
 }
 
+export interface CaptureHealth {
+  pending: number;
+  sent: number;
+  uncertain_sessions: number;
+  extraction_tasks: [string, string][];
+  last_error: string | null;
+}
+
 export interface AgentStatus {
   id: string;
   agent_id: AgentId;
