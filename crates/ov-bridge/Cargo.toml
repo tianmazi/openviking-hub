@@ -1,0 +1,19 @@
+[package]
+name = "ov-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ov-bridge"
+path = "src/main.rs"
+
+[dependencies]
+ov-core = { path = "../ov-core" }
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+uuid.workspace = true

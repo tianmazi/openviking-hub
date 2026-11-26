@@ -1,0 +1,193 @@
+use crate::platform::{silent_command, PlatformPaths};
+use crate::policy::model::{PolicyConfig, ResolvedRoute, RouteMatchSource};
+use globset::{Glob, GlobSetBuilder};
+use std::fs;
+use std::path::Path;
+
+/// Resolve the target OpenViking resource and memory URIs for a given working directory.
+/// Precedence:
+/// 1. Project-local `RESOURCE_POLICY.md` (`resource_uri: viking://...`)
+/// 2. Explicit `routing.workspace_mappings`
+/// 3. Git remote repository auto-detection (`projects/<repo>/`)
+/// 4. Fallback to `routing.inbox_uri`
+pub fn resolve_route(policy: &PolicyConfig, cwd: &Path) -> ResolvedRoute {
+    // 1. Check project RESOURCE_POLICY.md
+    if policy.routing.respect_project_policy_file {
+        if let Some((uri, slug)) = read_project_policy_uri(cwd) {
+            return ResolvedRoute {
+                target_resource_uri: uri,
+                target_memory_uri: "viking://user/memories/".to_string(),
+                matched_source: RouteMatchSource::ProjectPolicyFile,
+                is_fallback_inbox: false,
+                project_slug: slug,
+            };
+        }
+    }
+
+    // 2. Manual workspace mappings
+    let paths = PlatformPaths::detect();
+    let canonical_cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    for mapping in &policy.routing.workspace_mappings {
+        let expanded = paths
+            .as_ref()
+            .map(|p| p.expand_tilde(&mapping.local_path))
+            .unwrap_or_else(|| mapping.local_path.clone());
+        let canonical_map = fs::canonicalize(&expanded).unwrap_or(expanded);
+        if canonical_cwd.starts_with(&canonical_map) {
+            let slug = canonical_map
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string());
+            return ResolvedRoute {
+                target_resource_uri: mapping.resource_uri.clone(),
+                target_memory_uri: "viking://user/memories/".to_string(),
+                matched_source: RouteMatchSource::ManualMapping,
+                is_fallback_inbox: false,
+                project_slug: slug,
+            };
+        }
+    }
+
+    // 3. Auto-detect Git repository remote
+    if policy.routing.auto_map_git_repo {
+        if let Some(repo_slug) = detect_git_repo_slug(cwd) {
+            let prefix = policy.global.default_visibility.resources_prefix();
+            return ResolvedRoute {
+                target_resource_uri: format!("{}/projects/{}/", prefix, repo_slug),
+                target_memory_uri: "viking://user/memories/".to_string(),
+                matched_source: RouteMatchSource::GitRemoteAuto,
+                is_fallback_inbox: false,
+                project_slug: Some(repo_slug),
+            };
+        }
+    }
+
+    // 4. Fallback to inbox
+    ResolvedRoute {
+        target_resource_uri: policy.routing.inbox_uri.clone(),
+        target_memory_uri: "viking://user/memories/".to_string(),
+        matched_source: RouteMatchSource::InboxFallback,
+        is_fallback_inbox: true,
+        project_slug: None,
+    }
+}
+
+/// Check if a file path or URI matches any user-protected rule glob (e.g., `CLAUDE.md`, `AGENTS.md`).
+pub fn is_protected_rule_path(policy: &PolicyConfig, candidate: &str) -> bool {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in &policy.routing.protected_rule_globs {
+        if let Ok(glob) = Glob::new(pattern) {
+            builder.add(glob);
+        }
+    }
+    let Ok(set) = builder.build() else {
+        return false;
+    };
+    let normalized = candidate
+        .trim_start_matches("viking://")
+        .trim_start_matches("~/");
+    set.is_match(normalized) || set.is_match(Path::new(normalized).file_name().unwrap_or_default())
+}
+
+fn read_project_policy_uri(cwd: &Path) -> Option<(String, Option<String>)> {
+    let policy_file = cwd.join("RESOURCE_POLICY.md");
+    let text = fs::read_to_string(policy_file).ok()?;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("resource_uri:") {
+            let uri = rest.trim().trim_matches('"').trim_matches('\'').to_string();
+            if uri.starts_with("viking://") {
+                let slug = uri
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .map(|s| s.to_string());
+                return Some((uri, slug));
+            }
+        }
+    }
+    None
+}
+
+fn detect_git_repo_slug(cwd: &Path) -> Option<String> {
+    let out = silent_command("git")
+        .args(["-C", &cwd.to_string_lossy(), "remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let remote = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    parse_repo_slug(&remote)
+}
+
+pub fn parse_repo_slug(remote: &str) -> Option<String> {
+    let trimmed = remote.trim().trim_end_matches('/').trim_end_matches(".git");
+    let last = trimmed.rsplit(['/', ':']).next()?;
+    let clean: String = last
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if clean.is_empty() {
+        None
+    } else {
+        Some(clean)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_protected_rule_globs() {
+        let policy = PolicyConfig::default();
+        assert!(is_protected_rule_path(&policy, "CLAUDE.md"));
+        assert!(is_protected_rule_path(
+            &policy,
+            "viking://resources/projects/demo/CLAUDE.md"
+        ));
+        assert!(is_protected_rule_path(&policy, "AGENTS.md"));
+        assert!(!is_protected_rule_path(
+            &policy,
+            "viking://user/memories/preferences/git.md"
+        ));
+    }
+
+    #[test]
+    fn test_project_policy_file_precedence() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("RESOURCE_POLICY.md"),
+            "---\nresource_uri: viking://resources/projects/custom-app/\n---\n",
+        )
+        .unwrap();
+        let policy = PolicyConfig::default();
+        let route = resolve_route(&policy, dir.path());
+        assert_eq!(route.matched_source, RouteMatchSource::ProjectPolicyFile);
+        assert_eq!(
+            route.target_resource_uri,
+            "viking://resources/projects/custom-app/"
+        );
+        assert!(!route.is_fallback_inbox);
+    }
+
+    #[test]
+    fn test_parse_repo_slug() {
+        assert_eq!(
+            parse_repo_slug("git@github.com:tianmazi/openviking-desktop.git").as_deref(),
+            Some("openviking-desktop")
+        );
+        assert_eq!(
+            parse_repo_slug("https://github.com/volcengine/OpenViking").as_deref(),
+            Some("openviking")
+        );
+    }
+}
