@@ -59,7 +59,7 @@
 ## 4. 浏览与编辑 `viking://` 记忆空间
 
 在 **「viking:// 记忆浏览器」** 中：
-1. 顶部可快速切换 **用户共享记忆**（`viking://~/memories/`）、**项目知识库**（`viking://resources/projects/`）和 **Inbox 待分拣区**（`viking://~/resources/inbox/`）。
+1. 顶部可快速切换 **用户共享记忆**（`viking://~/memories/`）、**项目知识库**（`viking://resources/projects/`）、**Inbox 待分拣区**（`viking://~/resources/inbox/`）与 **Agent 私有空间**（`viking://agent/`）。
 2. 可在搜索框输入自然语言关键词，直接调用远端语义搜索（`POST /api/v1/search/find`）定位条目。
 3. 点击 **「新建」** 可直接创建新的 Markdown 记忆；悬停条目可删除。
 4. 右侧检查器支持切换 **L0（~100 tokens 摘要）/ L1（~2k tokens 概览）/ L2（完整原文）**；在 L2 标签页可直接在线编辑 Markdown 并点击 **「保存 L2」** 写回远端并刷新语义索引。
@@ -78,6 +78,7 @@
      resource_uri: viking://resources/projects/my-service/
      ---
      ```
+   - **Agent 私有空间隔离 & IFC 防护**：开启后支持 `viking://agent/{id}/memories/` 私有记忆隔离；`ov-bridge` 写入自动附加 YAML Frontmatter 血统元数据，召回时统一包裹 `<openviking_memory_reference readonly="true">` 只读数据边界。
    - **规则只读保护**：列入 `protected_rule_globs`（默认含 `CLAUDE.md`、`AGENTS.md`、`.cursorrules`、`.agents/rules/**`）的文件会被强制禁止 AI 写入或 Dreaming 覆盖。
 2. **分层注入与 Token 预算**：
    - 可分别为 Claude Code / Codex / pi / Antigravity 拖动滑块设置最大召回 Token 预算和默认召回层级（`L0`/`L1`/`L2`）。

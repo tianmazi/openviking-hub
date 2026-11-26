@@ -1,10 +1,12 @@
 use crate::dreaming::db::{DesktopDb, DreamingRun};
+use crate::dreaming::reflector::{reflect_inbox_route, reflect_merge};
 use crate::fs_util::sha256_hex;
 use crate::ov_client::{FindRequest, OvClient};
 use crate::policy::model::{
     ChangeAction, MemoryCategory, PendingMemoryChange, PolicyConfig, ReviewStatus, RiskLevel,
 };
 use crate::policy::router::is_protected_rule_path;
+use crate::provenance::{is_write_gate_verified, render_with_provenance, MemoryProvenance};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -42,7 +44,13 @@ pub async fn run_dreaming(
         "wiki_compile": 0
     });
 
-    // Analyzer 1: Inbox Sorter
+    let available_projects: Vec<String> = client
+        .ls("viking://resources/projects/")
+        .await
+        .map(|v| extract_uri_entries(&v))
+        .unwrap_or_default();
+
+    // Analyzer 1: Inbox Sorter (uses optional LLM/CLI reflector when enabled)
     if let Ok(inbox_ls) = client.ls(&policy.routing.inbox_uri).await {
         for entry in extract_uri_entries(&inbox_ls) {
             if is_protected_rule_path(policy, &entry) || db.is_pinned(&entry)? {
@@ -51,11 +59,42 @@ pub async fn run_dreaming(
             let content = read_text_safely(client, &entry).await;
             let base_hash = content.as_deref().map(sha256_hex);
             let file_name = entry.rsplit('/').next().unwrap_or("note.md");
-            let suggested_dest = format!(
-                "{}/projects/general/{}",
-                policy.global.default_visibility.resources_prefix(),
-                file_name
+            let fallback_dir = format!(
+                "{}/projects/general/",
+                policy.global.default_visibility.resources_prefix()
             );
+            let default_dest = format!("{}{}", fallback_dir, file_name);
+
+            let (suggested_dest, rationale, reflector_label) = if let Some(ref raw) = content {
+                if let Some(res) = reflect_inbox_route(
+                    &policy.lifecycle.dreaming,
+                    &entry,
+                    raw,
+                    &available_projects,
+                    &fallback_dir,
+                )
+                .await
+                {
+                    (
+                        res.destination_uri,
+                        format!("{}（{}）", res.rationale, res.engine_label),
+                        res.engine_label,
+                    )
+                } else {
+                    (
+                        default_dest.clone(),
+                        format!("Inbox 中发现待分拣条目，建议归类至 {}", default_dest),
+                        "deterministic".to_string(),
+                    )
+                }
+            } else {
+                (
+                    default_dest.clone(),
+                    format!("Inbox 中发现待分拣条目，建议归类至 {}", default_dest),
+                    "deterministic".to_string(),
+                )
+            };
+
             let change = PendingMemoryChange {
                 id: format!("chg-{}", Uuid::new_v4().simple()),
                 run_id: run_id.clone(),
@@ -64,13 +103,18 @@ pub async fn run_dreaming(
                 action: ChangeAction::MoveFromInbox,
                 risk_level: RiskLevel::Medium,
                 target_uri: entry.clone(),
-                destination_uri: Some(suggested_dest.clone()),
+                destination_uri: Some(suggested_dest),
                 category: MemoryCategory::from_uri(&entry),
                 base_hash,
                 before_content: content.clone(),
                 after_content: content,
-                rationale: format!("Inbox 中发现待分拣条目，建议归类至 {}", suggested_dest),
-                evidence_json: json!({ "source": "inbox_sorter", "uri": entry }).to_string(),
+                rationale,
+                evidence_json: json!({
+                    "source": "inbox_sorter",
+                    "uri": entry,
+                    "reflector": reflector_label
+                })
+                .to_string(),
                 status: ReviewStatus::Pending,
             };
             db.insert_pending_change(&change)?;
@@ -79,7 +123,7 @@ pub async fn run_dreaming(
         }
     }
 
-    // Analyzer 2 & 3: Semantic Conflict/Dedupe Merger + Hot Promote + Cold Archival
+    // Analyzer 2 & 3: Semantic Conflict/Dedupe Merger + Hot Promote (with Write-Gate) + Cold Archival
     let mut seen_merge_pairs: HashSet<(String, String)> = HashSet::new();
     let (mem_root, mem_tree_res) = match client.tree("viking://~/memories/").await {
         Ok(tree) => ("viking://~/memories/", Ok(tree)),
@@ -99,39 +143,46 @@ pub async fn run_dreaming(
             let last_hit = stat.map(|s| s.last_hit_at).unwrap_or(0);
             let agents = stat.map(|s| s.agents.clone()).unwrap_or_default();
 
-            // 3a. Hot memory promotion: frequently recalled across >=2 distinct agents
+            // 3a. Hot memory promotion with Anti-Contagion Write-Gate
             if policy.lifecycle.dreaming.promote_hot_notes && hit_count >= 5 && agents.len() >= 2 {
                 let content = read_text_safely(client, &uri).await;
-                let base_hash = content.as_deref().map(sha256_hex);
-                let change = PendingMemoryChange {
-                    id: format!("chg-{}", Uuid::new_v4().simple()),
-                    run_id: run_id.clone(),
-                    snapshot_id: None,
-                    created_at: now,
-                    action: ChangeAction::PromoteToIndex,
-                    risk_level: RiskLevel::Low,
-                    target_uri: uri.clone(),
-                    destination_uri: None,
-                    category,
-                    base_hash,
-                    before_content: content.clone(),
-                    after_content: content,
-                    rationale: format!(
-                        "高频跨 Agent 记忆（共命中 {} 次，涉及 {}），建议晋升至顶层 L0/L1 启动索引。",
-                        hit_count,
-                        agents.join(" / ")
-                    ),
-                    evidence_json: json!({
-                        "hit_count": hit_count,
-                        "agents": agents,
-                        "last_hit_at": last_hit
-                    })
-                    .to_string(),
-                    status: ReviewStatus::Pending,
-                };
-                db.insert_pending_change(&change)?;
-                staged.push(change);
-                counts["promote"] = json!(counts["promote"].as_u64().unwrap_or(0) + 1);
+                let gate_ok = content
+                    .as_deref()
+                    .map(|raw| is_write_gate_verified(raw, hit_count as i64, agents.len()))
+                    .unwrap_or(false);
+                if gate_ok {
+                    let base_hash = content.as_deref().map(sha256_hex);
+                    let change = PendingMemoryChange {
+                        id: format!("chg-{}", Uuid::new_v4().simple()),
+                        run_id: run_id.clone(),
+                        snapshot_id: None,
+                        created_at: now,
+                        action: ChangeAction::PromoteToIndex,
+                        risk_level: RiskLevel::Low,
+                        target_uri: uri.clone(),
+                        destination_uri: None,
+                        category,
+                        base_hash,
+                        before_content: content.clone(),
+                        after_content: content,
+                        rationale: format!(
+                            "高频跨 Agent 记忆（共命中 {} 次，涉及 {}，已通过 Write-Gate 校验），建议晋升至顶层 L0/L1 启动索引。",
+                            hit_count,
+                            agents.join(" / ")
+                        ),
+                        evidence_json: json!({
+                            "hit_count": hit_count,
+                            "agents": agents,
+                            "last_hit_at": last_hit,
+                            "write_gate_passed": true
+                        })
+                        .to_string(),
+                        status: ReviewStatus::Pending,
+                    };
+                    db.insert_pending_change(&change)?;
+                    staged.push(change);
+                    counts["promote"] = json!(counts["promote"].as_u64().unwrap_or(0) + 1);
+                }
             }
 
             // 3b. Cold memory archival check
@@ -208,7 +259,33 @@ pub async fn run_dreaming(
                                 }
                                 let other_content =
                                     read_text_safely(client, &other_uri).await.unwrap_or_default();
-                                let merged = build_merged_markdown(&content, &other_content, &other_uri);
+
+                                let (merged_body, reflector_label) = match reflect_merge(
+                                    &policy.lifecycle.dreaming,
+                                    &uri,
+                                    &content,
+                                    &other_uri,
+                                    &other_content,
+                                )
+                                .await
+                                {
+                                    Some(res) => (res.content, res.engine_label),
+                                    None => (
+                                        build_merged_markdown(&content, &other_content, &other_uri),
+                                        "deterministic".to_string(),
+                                    ),
+                                };
+
+                                let mut prov = MemoryProvenance::new(
+                                    "dreaming",
+                                    "shared",
+                                    true,
+                                    score as f32,
+                                );
+                                prov.updated_by = format!("dreaming:{}", reflector_label);
+                                prov.evidence_uris = vec![uri.clone(), other_uri.clone()];
+                                let merged_with_prov = render_with_provenance(&merged_body, &prov);
+
                                 let change = PendingMemoryChange {
                                     id: format!("chg-{}", Uuid::new_v4().simple()),
                                     run_id: run_id.clone(),
@@ -221,16 +298,17 @@ pub async fn run_dreaming(
                                     category,
                                     base_hash: Some(sha256_hex(&content)),
                                     before_content: Some(content.clone()),
-                                    after_content: Some(merged),
+                                    after_content: Some(merged_with_prov),
                                     rationale: format!(
-                                        "检测到与 {} 语义高度重合（相似度 {:.2}），建议合并去重以消除潜在冲突。",
-                                        other_uri, score
+                                        "检测到与 {} 语义高度重合（相似度 {:.2}），已通过 {} 生成去重合并提案。",
+                                        other_uri, score, reflector_label
                                     ),
                                     evidence_json: json!({
                                         "source": "semantic_dedupe",
                                         "peer_uri": other_uri,
                                         "similarity": score,
-                                        "category": category.as_str()
+                                        "category": category.as_str(),
+                                        "reflector": reflector_label
                                     })
                                     .to_string(),
                                     status: ReviewStatus::Pending,
@@ -248,35 +326,35 @@ pub async fn run_dreaming(
 
     // Analyzer 4: Wiki Compile Proposal
     if policy.lifecycle.dreaming.compile_wiki {
-        if let Ok(proj_ls) = client.ls("viking://resources/projects/").await {
-            let projects = extract_uri_entries(&proj_ls);
-            if !projects.is_empty() {
-                let change = PendingMemoryChange {
-                    id: format!("chg-{}", Uuid::new_v4().simple()),
-                    run_id: run_id.clone(),
-                    snapshot_id: None,
-                    created_at: now,
-                    action: ChangeAction::WikiCompile,
-                    risk_level: RiskLevel::Low,
-                    target_uri: "viking://resources/projects/".to_string(),
-                    destination_uri: None,
-                    category: MemoryCategory::Patterns,
-                    base_hash: None,
-                    before_content: None,
-                    after_content: Some(format!(
-                        "触发 OpenViking Compile 任务，编译 {} 个项目目录为互联 Wiki。",
-                        projects.len()
-                    )),
-                    rationale: "将近期积累的项目文档与经验编译为结构化 Wiki，降低检索 Token 消耗。"
-                        .to_string(),
-                    evidence_json: json!({ "project_count": projects.len(), "projects": projects })
-                        .to_string(),
-                    status: ReviewStatus::Pending,
-                };
-                db.insert_pending_change(&change)?;
-                staged.push(change);
-                counts["wiki_compile"] = json!(1);
-            }
+        if !available_projects.is_empty() {
+            let change = PendingMemoryChange {
+                id: format!("chg-{}", Uuid::new_v4().simple()),
+                run_id: run_id.clone(),
+                snapshot_id: None,
+                created_at: now,
+                action: ChangeAction::WikiCompile,
+                risk_level: RiskLevel::Low,
+                target_uri: "viking://resources/projects/".to_string(),
+                destination_uri: None,
+                category: MemoryCategory::Patterns,
+                base_hash: None,
+                before_content: None,
+                after_content: Some(format!(
+                    "触发 OpenViking Compile 任务，编译 {} 个项目目录为互联 Wiki。",
+                    available_projects.len()
+                )),
+                rationale: "将近期积累的项目文档与经验编译为结构化 Wiki，降低检索 Token 消耗。"
+                    .to_string(),
+                evidence_json: json!({
+                    "project_count": available_projects.len(),
+                    "projects": available_projects
+                })
+                .to_string(),
+                status: ReviewStatus::Pending,
+            };
+            db.insert_pending_change(&change)?;
+            staged.push(change);
+            counts["wiki_compile"] = json!(1);
         }
     }
 
@@ -421,31 +499,42 @@ async fn read_text_safely(client: &OvClient, uri: &str) -> Option<String> {
         return Some(s.to_string());
     }
     val.get("content")
-        .and_then(|c| c.as_str())
+        .or_else(|| val.get("text"))
+        .and_then(|v| v.as_str())
         .map(|s| s.to_string())
 }
 
 fn extract_uri_entries(val: &Value) -> Vec<String> {
-    let mut out = Vec::new();
-    if let Some(arr) = val.as_array() {
-        for item in arr {
-            if let Some(uri) = item.get("uri").and_then(|u| u.as_str()) {
-                let is_dir = item.get("isDir").and_then(|b| b.as_bool()).unwrap_or(false);
-                if !is_dir {
-                    out.push(uri.to_string());
+    let mut uris = Vec::new();
+    match val {
+        Value::Array(arr) => {
+            for item in arr {
+                uris.extend(extract_uri_entries(item));
+            }
+        }
+        Value::Object(map) => {
+            let is_dir = map.get("isDir").and_then(|v| v.as_bool()).unwrap_or(false)
+                || map
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .map(|t| t == "dir" || t == "directory")
+                    .unwrap_or(false);
+            if !is_dir {
+                if let Some(uri) = map.get("uri").and_then(|v| v.as_str()) {
+                    if uri.starts_with("viking://") {
+                        uris.push(uri.to_string());
+                    }
                 }
-            } else if let Some(s) = item.as_str() {
-                out.push(s.to_string());
+            }
+            for key in ["items", "entries", "children", "files", "results"] {
+                if let Some(sub) = map.get(key) {
+                    uris.extend(extract_uri_entries(sub));
+                }
             }
         }
-    } else if let Some(items) = val.get("items").and_then(|i| i.as_array()) {
-        for item in items {
-            if let Some(uri) = item.get("uri").and_then(|u| u.as_str()) {
-                out.push(uri.to_string());
-            }
-        }
+        _ => {}
     }
-    out
+    uris
 }
 
 fn extract_scored_uris(val: &Value) -> Vec<(String, f64)> {

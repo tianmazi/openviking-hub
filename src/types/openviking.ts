@@ -1,6 +1,7 @@
 export type AgentId = "claude-code" | "codex" | "pi" | "antigravity";
 export type ContextLayer = "l0" | "l1" | "l2";
 export type VisibilityScope = "shared" | "private";
+export type ReflectorMode = "deterministic" | "local_cli" | "openai_compatible";
 export type MemoryCategory =
   | "profile"
   | "preferences"
@@ -91,6 +92,7 @@ export interface PolicyConfig {
   routing: {
     auto_map_git_repo: boolean;
     respect_project_policy_file: boolean;
+    isolate_agent_namespaces: boolean;
     inbox_uri: string;
     protected_rule_globs: string[];
     workspace_mappings: WorkspaceMapping[];
@@ -122,6 +124,11 @@ export interface PolicyConfig {
       compile_wiki: boolean;
       auto_snapshot_before_run: boolean;
       require_human_review: boolean;
+      reflector_mode: ReflectorMode;
+      reflector_cli_agent: string;
+      reflector_endpoint: string;
+      reflector_model: string;
+      reflector_api_key: string;
     };
   };
 }

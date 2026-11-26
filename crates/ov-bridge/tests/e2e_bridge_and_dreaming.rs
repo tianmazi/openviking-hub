@@ -245,7 +245,7 @@ async fn e2e_ov_bridge_mcp_and_dreaming_pipeline() {
             })
         )
         .unwrap();
-        // Normal remember write should succeed
+        // Normal remember write should succeed with YAML Frontmatter provenance
         writeln!(
             stdin,
             "{}",
@@ -260,6 +260,21 @@ async fn e2e_ov_bridge_mcp_and_dreaming_pipeline() {
             })
         )
         .unwrap();
+        // Private remember write should route into isolated agent namespace
+        writeln!(
+            stdin,
+            "{}",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "remember",
+                    "arguments": { "visibility": "private", "content": "Agent private scratchpad" }
+                }
+            })
+        )
+        .unwrap();
     }
 
     let output = child.wait_with_output().unwrap();
@@ -270,7 +285,7 @@ async fn e2e_ov_bridge_mcp_and_dreaming_pipeline() {
         .filter(|l| !l.trim().is_empty())
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    assert_eq!(responses.len(), 4);
+    assert_eq!(responses.len(), 5);
 
     // Verify L0 -> L1 auto-expansion fired in recall
     let recall_text = responses[1]["result"]["content"][0]["text"].as_str().unwrap();
@@ -283,12 +298,24 @@ async fn e2e_ov_bridge_mcp_and_dreaming_pipeline() {
     // Verify protected CLAUDE.md write was rejected
     assert_eq!(responses[2]["result"]["isError"], json!(true));
 
-    // Verify normal remember persisted to mock OpenViking
-    assert!(state
-        .lock()
-        .unwrap()
+    assert!(
+        recall_text.contains("<openviking_memory_reference") && recall_text.contains("readonly=\"true\""),
+        "Expected IFC readonly boundary in recall output"
+    );
+
+    // Verify normal remember persisted with YAML Frontmatter provenance
+    let guard = state.lock().unwrap();
+    let saved_editor = guard
         .files
-        .contains_key("viking://~/memories/preferences/editor.md"));
+        .get("viking://~/memories/preferences/editor.md")
+        .expect("editor.md must exist");
+    assert!(saved_editor.contains("source_agent: claude-code"));
+    assert!(saved_editor.contains("Prefer Rust + Tauri"));
+    assert!(
+        guard.files.keys().any(|k| k.starts_with("viking://agent/claude-code/memories/")),
+        "Expected private remember to route to isolated agent namespace"
+    );
+    drop(guard);
 
     // 2. Full Dreaming Stage-then-Commit + Optimistic Lock + Snapshot Rollback E2E
     let client = OvClient::new(&OvCliConfig {

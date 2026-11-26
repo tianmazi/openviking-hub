@@ -67,6 +67,7 @@ impl VisibilityScope {
 pub struct RoutingPolicy {
     pub auto_map_git_repo: bool,
     pub respect_project_policy_file: bool,
+    pub isolate_agent_namespaces: bool,
     pub inbox_uri: String,
     pub protected_rule_globs: Vec<String>,
     pub workspace_mappings: Vec<WorkspaceMapping>,
@@ -77,6 +78,7 @@ impl Default for RoutingPolicy {
         Self {
             auto_map_git_repo: true,
             respect_project_policy_file: true,
+            isolate_agent_namespaces: true,
             inbox_uri: "viking://~/resources/inbox/".to_string(),
             protected_rule_globs: vec![
                 "CLAUDE.md".to_string(),
@@ -360,6 +362,14 @@ impl Default for ArchivalPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReflectorMode {
+    Deterministic,
+    LocalCli,
+    OpenaiCompatible,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DreamingPolicy {
@@ -372,6 +382,11 @@ pub struct DreamingPolicy {
     pub compile_wiki: bool,
     pub auto_snapshot_before_run: bool,
     pub require_human_review: bool,
+    pub reflector_mode: ReflectorMode,
+    pub reflector_cli_agent: String,
+    pub reflector_endpoint: String,
+    pub reflector_model: String,
+    pub reflector_api_key: String,
 }
 
 impl Default for DreamingPolicy {
@@ -386,6 +401,11 @@ impl Default for DreamingPolicy {
             compile_wiki: true,
             auto_snapshot_before_run: true,
             require_human_review: true,
+            reflector_mode: ReflectorMode::Deterministic,
+            reflector_cli_agent: "auto".to_string(),
+            reflector_endpoint: "http://127.0.0.1:11434/v1".to_string(),
+            reflector_model: "qwen2.5:7b".to_string(),
+            reflector_api_key: String::new(),
         }
     }
 }
@@ -403,6 +423,7 @@ pub enum DreamingTrigger {
 pub struct ResolvedRoute {
     pub target_resource_uri: String,
     pub target_memory_uri: String,
+    pub agent_private_memory_uri: Option<String>,
     pub matched_source: RouteMatchSource,
     pub is_fallback_inbox: bool,
     pub project_slug: Option<String>,

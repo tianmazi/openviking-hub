@@ -49,6 +49,7 @@ let previewPolicy: PolicyConfig = {
   routing: {
     auto_map_git_repo: true,
     respect_project_policy_file: true,
+    isolate_agent_namespaces: true,
     inbox_uri: "viking://~/resources/inbox/",
     protected_rule_globs: [
       "CLAUDE.md",
@@ -115,6 +116,11 @@ let previewPolicy: PolicyConfig = {
       compile_wiki: true,
       auto_snapshot_before_run: true,
       require_human_review: true,
+      reflector_mode: "deterministic",
+      reflector_cli_agent: "auto",
+      reflector_endpoint: "http://127.0.0.1:11434/v1",
+      reflector_model: "qwen2.5:7b",
+      reflector_api_key: "",
     },
   },
 };
@@ -397,6 +403,13 @@ export const api = {
           isDir: false,
           size: 520,
         },
+      ];
+    }
+    if (uri === "viking://agent/") {
+      return [
+        { name: "claude-code/memories/", uri: "viking://agent/claude-code/memories/", isDir: true },
+        { name: "codex/memories/", uri: "viking://agent/codex/memories/", isDir: true },
+        { name: "antigravity/memories/", uri: "viking://agent/antigravity/memories/", isDir: true },
       ];
     }
     if (uri === "viking://~/resources/inbox/") {

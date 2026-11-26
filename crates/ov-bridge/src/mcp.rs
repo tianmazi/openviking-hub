@@ -2,8 +2,9 @@ use chrono::Utc;
 use ov_core::dreaming::db::{DesktopDb, RecallEvent};
 use ov_core::ov_client::{ContextSearchRequest, OvClient};
 use ov_core::policy::model::{AgentId, ContextLayer};
-use ov_core::policy::router::{is_protected_rule_path, resolve_route};
+use ov_core::policy::router::{is_protected_rule_path, resolve_route_for_agent};
 use ov_core::policy::store::PolicyStore;
+use ov_core::provenance::{render_with_provenance, wrap_ifc_readonly, MemoryProvenance};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 use std::time::Instant;
@@ -103,12 +104,14 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "remember",
-            "description": "Persist a durable user preference, project decision, or note into OpenViking (respects Privacy Mode and protected rule globs).",
+            "description": "Persist a durable user preference, project decision, or note into OpenViking with YAML Frontmatter provenance (respects Privacy Mode, namespace isolation, and protected rule globs).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "uri": { "type": "string", "description": "Optional target viking:// URI (auto-routed if omitted)" },
-                    "content": { "type": "string", "description": "Markdown content to store" }
+                    "content": { "type": "string", "description": "Markdown content to store" },
+                    "visibility": { "type": "string", "enum": ["shared", "private"], "description": "Use 'private' to isolate into this agent's private namespace when enabled" },
+                    "verified": { "type": "boolean", "description": "Optional verification flag for Write-Gate provenance" }
                 },
                 "required": ["content"]
             }
@@ -159,7 +162,7 @@ async fn handle_tool_call(agent: AgentId, params: &Value) -> Result<String, Stri
                 .and_then(|v| v.as_str())
                 .ok_or("Missing query")?;
             let cwd = std::env::current_dir().unwrap_or_default();
-            let route = resolve_route(&policy, &cwd);
+            let route = resolve_route_for_agent(&policy, &cwd, Some(agent));
             let target_uri = args
                 .get("target_uri")
                 .and_then(|v| v.as_str())
@@ -188,7 +191,9 @@ async fn handle_tool_call(agent: AgentId, params: &Value) -> Result<String, Stri
                             let l1_text = l1_val
                                 .as_str()
                                 .map(|s| s.to_string())
-                                .unwrap_or_else(|| serde_json::to_string_pretty(&l1_val).unwrap_or_default());
+                                .unwrap_or_else(|| {
+                                    serde_json::to_string_pretty(&l1_val).unwrap_or_default()
+                                });
                             combined.push_str(&format!(
                                 "\n\n--- Auto-Expanded L1 Overview ({} | score {:.2}) ---\n{}",
                                 top_uri, top_score, l1_text
@@ -199,8 +204,13 @@ async fn handle_tool_call(agent: AgentId, params: &Value) -> Result<String, Stri
                 }
             }
 
-            let text = truncate_to_token_budget(&combined, budget.max_recall_tokens);
-            let approx_tokens = (text.len() / 4) as i64;
+            let budgeted = truncate_to_token_budget(&combined, budget.max_recall_tokens);
+            let wrapped = wrap_ifc_readonly(
+                &budgeted,
+                &format!("recall:{}", agent.as_str()),
+                "reference",
+            );
+            let approx_tokens = (wrapped.len() / 4) as i64;
 
             if let Some(db) = db {
                 let _ = db.record_event(&RecallEvent {
@@ -216,15 +226,33 @@ async fn handle_tool_call(agent: AgentId, params: &Value) -> Result<String, Stri
                     created_at: Utc::now().timestamp(),
                 });
             }
-            Ok(text)
+            Ok(wrapped)
         }
         "remember" => {
             let content = args
                 .get("content")
                 .and_then(|v| v.as_str())
                 .ok_or("Missing content")?;
+            let visibility = args
+                .get("visibility")
+                .and_then(|v| v.as_str())
+                .unwrap_or("shared");
+            let verified = args
+                .get("verified")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
             let cwd = std::env::current_dir().unwrap_or_default();
-            let route = resolve_route(&policy, &cwd);
+            let route = resolve_route_for_agent(&policy, &cwd, Some(agent));
+            let base_prefix = if visibility == "private" {
+                route
+                    .agent_private_memory_uri
+                    .clone()
+                    .unwrap_or_else(|| route.target_memory_uri.clone())
+            } else {
+                route.target_resource_uri.clone()
+            };
+
             let uri = args
                 .get("uri")
                 .and_then(|v| v.as_str())
@@ -232,7 +260,7 @@ async fn handle_tool_call(agent: AgentId, params: &Value) -> Result<String, Stri
                 .unwrap_or_else(|| {
                     format!(
                         "{}note-{}.md",
-                        route.target_resource_uri,
+                        base_prefix,
                         Utc::now().format("%Y%m%d-%H%M%S")
                     )
                 });
@@ -265,8 +293,18 @@ async fn handle_tool_call(agent: AgentId, params: &Value) -> Result<String, Stri
                 ));
             }
 
+            let scope_label = if uri.starts_with("viking://agent/") {
+                "agent_private"
+            } else if visibility == "private" {
+                "private"
+            } else {
+                "shared"
+            };
+            let prov = MemoryProvenance::new(agent.as_str(), scope_label, verified, 0.85);
+            let enriched_content = render_with_provenance(content, &prov);
+
             let res = client
-                .write_content(&uri, content)
+                .write_content(&uri, &enriched_content)
                 .await
                 .map_err(|e| e.to_string())?;
             if let Some(db) = db {
@@ -277,7 +315,7 @@ async fn handle_tool_call(agent: AgentId, params: &Value) -> Result<String, Stri
                     query: None,
                     target_uri: Some(uri.clone()),
                     layer: Some("l2".to_string()),
-                    tokens_used: (content.len() / 4) as i64,
+                    tokens_used: (enriched_content.len() / 4) as i64,
                     latency_ms: start.elapsed().as_millis() as i64,
                     blocked_by_privacy: false,
                     created_at: Utc::now().timestamp(),
@@ -298,7 +336,12 @@ async fn handle_tool_call(agent: AgentId, params: &Value) -> Result<String, Stri
                 .read_content(uri, layer)
                 .await
                 .map_err(|e| e.to_string())?;
-            Ok(serde_json::to_string_pretty(&res).unwrap_or_default())
+            let raw = serde_json::to_string_pretty(&res).unwrap_or_default();
+            Ok(wrap_ifc_readonly(
+                &raw,
+                &format!("read_uri:{}", uri),
+                "reference",
+            ))
         }
         "list_uri" => {
             let uri = args

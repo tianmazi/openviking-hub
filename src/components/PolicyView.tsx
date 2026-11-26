@@ -7,6 +7,7 @@ import type {
   MemoryCategory,
   MutabilityMode,
   PolicyConfig,
+  ReflectorMode,
   VisibilityScope,
 } from "../types/openviking";
 
@@ -132,6 +133,19 @@ export function PolicyView({ policy, onSave }: PolicyViewProps) {
                 setDraft({
                   ...draft,
                   routing: { ...draft.routing, auto_map_git_repo: e.target.checked },
+                })
+              }
+            />
+          </label>
+          <label className="flex items-center justify-between p-3 rounded-lg bg-surface-2 border border-border-subtle">
+            <span>隔离各 Agent 私有空间（viking://agent/&#123;id&#125;/memories/）</span>
+            <input
+              type="checkbox"
+              checked={draft.routing.isolate_agent_namespaces}
+              onChange={(e) =>
+                setDraft({
+                  ...draft,
+                  routing: { ...draft.routing, isolate_agent_namespaces: e.target.checked },
                 })
               }
             />
@@ -558,6 +572,133 @@ export function PolicyView({ policy, onSave }: PolicyViewProps) {
             />
             定期触发 Wiki 编译（POST /api/v1/compile）
           </label>
+        </div>
+
+        <div className="pt-3 border-t border-border-subtle space-y-3">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-medium text-zinc-200">
+              Dreaming 语义反思器（睡眠期提纯引擎）
+            </span>
+            <span className="text-[11px] text-zinc-500">
+              用于 Inbox 智能项目归类与语义冲突消解（失败时自动降级纯程序模式）
+            </span>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+            <div className="space-y-1.5">
+              <label className="text-zinc-400">反思器模式</label>
+              <select
+                value={draft.lifecycle.dreaming.reflector_mode}
+                onChange={(e) =>
+                  setDraft({
+                    ...draft,
+                    lifecycle: {
+                      ...draft.lifecycle,
+                      dreaming: {
+                        ...draft.lifecycle.dreaming,
+                        reflector_mode: e.target.value as ReflectorMode,
+                      },
+                    },
+                  })
+                }
+                className="w-full bg-surface-2 border border-border-subtle rounded-lg px-3 py-2 text-zinc-200"
+              >
+                <option value="deterministic">纯程序确定性模式（零 Token）</option>
+                <option value="local_cli">复用本机 CLI Agent（claude / codex）</option>
+                <option value="openai_compatible">自定义 LLM 端点（Ollama / OpenAI）</option>
+              </select>
+            </div>
+
+            {draft.lifecycle.dreaming.reflector_mode === "local_cli" && (
+              <div className="space-y-1.5">
+                <label className="text-zinc-400">首选本机 CLI</label>
+                <select
+                  value={draft.lifecycle.dreaming.reflector_cli_agent}
+                  onChange={(e) =>
+                    setDraft({
+                      ...draft,
+                      lifecycle: {
+                        ...draft.lifecycle,
+                        dreaming: {
+                          ...draft.lifecycle.dreaming,
+                          reflector_cli_agent: e.target.value,
+                        },
+                      },
+                    })
+                  }
+                  className="w-full bg-surface-2 border border-border-subtle rounded-lg px-3 py-2 text-zinc-200"
+                >
+                  <option value="auto">自动探测（claude 优先，其次 codex）</option>
+                  <option value="claude-code">Claude Code (claude -p)</option>
+                  <option value="codex">Codex (codex exec)</option>
+                </select>
+              </div>
+            )}
+
+            {draft.lifecycle.dreaming.reflector_mode === "openai_compatible" && (
+              <>
+                <div className="space-y-1.5">
+                  <label className="text-zinc-400">OpenAI 兼容 Base URL</label>
+                  <input
+                    value={draft.lifecycle.dreaming.reflector_endpoint}
+                    onChange={(e) =>
+                      setDraft({
+                        ...draft,
+                        lifecycle: {
+                          ...draft.lifecycle,
+                          dreaming: {
+                            ...draft.lifecycle.dreaming,
+                            reflector_endpoint: e.target.value,
+                          },
+                        },
+                      })
+                    }
+                    placeholder="http://127.0.0.1:11434/v1"
+                    className="w-full bg-surface-2 border border-border-subtle rounded-lg px-3 py-2 font-mono text-zinc-200"
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <label className="text-zinc-400">模型名称 / API Key（可选）</label>
+                  <div className="flex gap-2">
+                    <input
+                      value={draft.lifecycle.dreaming.reflector_model}
+                      onChange={(e) =>
+                        setDraft({
+                          ...draft,
+                          lifecycle: {
+                            ...draft.lifecycle,
+                            dreaming: {
+                              ...draft.lifecycle.dreaming,
+                              reflector_model: e.target.value,
+                            },
+                          },
+                        })
+                      }
+                      placeholder="qwen2.5:7b"
+                      className="flex-1 bg-surface-2 border border-border-subtle rounded-lg px-2.5 py-2 font-mono text-zinc-200"
+                    />
+                    <input
+                      type="password"
+                      value={draft.lifecycle.dreaming.reflector_api_key}
+                      onChange={(e) =>
+                        setDraft({
+                          ...draft,
+                          lifecycle: {
+                            ...draft.lifecycle,
+                            dreaming: {
+                              ...draft.lifecycle.dreaming,
+                              reflector_api_key: e.target.value,
+                            },
+                          },
+                        })
+                      }
+                      placeholder="API Key"
+                      className="w-28 bg-surface-2 border border-border-subtle rounded-lg px-2.5 py-2 font-mono text-zinc-200"
+                    />
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
         </div>
       </section>
 

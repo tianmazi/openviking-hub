@@ -11,12 +11,12 @@
 
 - **远端多实例管理与实时观测**：托管 `~/.openviking/ovcli.conf` 与 `~/.openviking/profiles.json`，支持新增/编辑/切换多套远端 Profile（User Key 双头鉴权 `Authorization: Bearer` + `X-API-Key`）、实时连通性与延迟测试，以及远端 `observer/system`（Queue / VikingDB）观测面板与实时记忆信息流拓扑动效。
 - **多 Agent 桌面端 & CLI 统一接入、WSL 注入与一键回滚**：自动探测并配置 **Claude Code**（MCP + Hooks）、**Codex（Desktop App + CLI）**（`$CODEX_HOME/config.toml`，`toml_edit` 无损保留注释）、**pi**（原生扩展桥接）与 **Antigravity（反重力 2.0 Desktop App + IDE + CLI）**（全局 `~/.gemini/config/mcp_config.json` + `~/.gemini/config/hooks.json` 双文件注入）；支持 Windows WSL 发行版跨 UNC 路径一键注入（强制 LF 换行）及原生记忆文件（`CLAUDE.md`、`AGENTS.md` 等）一键冷启动导入，修改前自动备份至 `~/.openviking/backups/`。
-- **纯 Rust 单文件桥接（`ov-bridge`）**：作为 Tauri `externalBin` Sidecar 随安装包分发，启动时自动释放至 `~/.openviking/bin/`，同时承担 `stdio MCP Server`（含高分命中自动 L0 → L1 渐进式展开）与生命周期 `Hook`（`session-start` / `user-prompt-submit` / `stop`），彻底摆脱宿主机 Node.js、`npx.cmd`、Bash 或 Python 依赖。
+- **纯 Rust 单文件桥接（`ov-bridge`）**：作为 Tauri `externalBin` Sidecar 随安装包分发，启动时自动释放至 `~/.openviking/bin/`，同时承担 `stdio MCP Server`（含高分命中自动 L0 → L1 渐进式展开、**YAML Frontmatter 血统元数据写入**、**IFC `<openviking_memory_reference readonly="true">` 数据边界防劫持**）与生命周期 `Hook`（`session-start` 位置偏置结构化索引头 / `user-prompt-submit` / `stop`），彻底摆脱宿主机 Node.js、`npx.cmd`、Bash 或 Python 依赖。
 - **内置记忆治理策略引擎（`~/.openviking/policy.toml`）**：
   - **作用域路由（Scope Router）**：`RESOURCE_POLICY.md` > 手动目录映射 > Git Remote 自动识别 > `viking://~/resources/inbox/` 兜底，支持可视化维护 `workspace_mappings` 与 `protected_rule_globs`（`CLAUDE.md`、`AGENTS.md` 只读保护）。
   - **分层注入与六类记忆配额**：按 Agent 配置 `L0/L1/L2` 默认召回层级与最大 Token 预算，并可视化配置 `profile` / `preferences` / `entities` / `events` / `cases` / `patterns` 的独立配额与 `mutable` / `immutable` 策略。
   - **一键隐私模式**：系统托盘与侧边栏均支持秒切只读隐私模式，实时拦截自动捕获与写入。
-- **Dreaming 后台整理与 PR-Style 审核台**：支持 Cron 定时与 `SessionThreshold` 累计会话数触发，采用 **Stage-then-Commit** 流水线（Inbox 分拣、语义去重合并、高频跨 Agent 晋升、冷记忆归档、Wiki 编译），提供逐行 `+`/`-` 双列行号 Diff、审阅进度条、键盘流审批（`J/K/A/X/E/⌘↵`）、在线编辑终稿、SHA-256 `base_hash` 乐观锁防并发漂移、Commit 前自动创建 Snapshot（`POST /api/v1/snapshot/commit`）及一键回滚（`POST /api/v1/snapshot/restore`）。
+- **Dreaming 后台整理与 PR-Style 审核台**：支持 Cron 定时与 `SessionThreshold` 累计会话数触发，支持接入**本机 CLI Agent（`claude -p` / `codex exec`）或 OpenAI 兼容 LLM 反思器**进行语义冲突消解与 Inbox 智能项目归类（带纯程序确定性降级与 **Write-Gate 晋升门禁**），采用 **Stage-then-Commit** 流水线，提供逐行 `+`/`-` 双列行号 Diff、审阅进度条、键盘流审批（`J/K/A/X/E/⌘↵`）、在线编辑终稿、SHA-256 `base_hash` 乐观锁防并发漂移、Commit 前自动创建 Snapshot（`POST /api/v1/snapshot/commit`）及一键回滚（`POST /api/v1/snapshot/restore`）。
 
 ## 工程结构
 

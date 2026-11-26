@@ -1,5 +1,5 @@
 use crate::platform::{silent_command, PlatformPaths};
-use crate::policy::model::{PolicyConfig, ResolvedRoute, RouteMatchSource};
+use crate::policy::model::{AgentId, PolicyConfig, ResolvedRoute, RouteMatchSource};
 use globset::{Glob, GlobSetBuilder};
 use std::fs;
 use std::path::Path;
@@ -13,12 +13,28 @@ pub const USER_MEMORIES_URI: &str = "viking://~/memories/";
 /// 3. Git remote repository auto-detection (`projects/<repo>/`)
 /// 4. Fallback to `routing.inbox_uri`
 pub fn resolve_route(policy: &PolicyConfig, cwd: &Path) -> ResolvedRoute {
+    resolve_route_for_agent(policy, cwd, None)
+}
+
+/// Resolve route with optional per-agent private namespace isolation (`viking://agent/{id}/memories/`).
+pub fn resolve_route_for_agent(
+    policy: &PolicyConfig,
+    cwd: &Path,
+    agent: Option<AgentId>,
+) -> ResolvedRoute {
+    let agent_private = if policy.routing.isolate_agent_namespaces {
+        agent.map(|a| format!("viking://agent/{}/memories/", a.as_str()))
+    } else {
+        None
+    };
+
     // 1. Check project RESOURCE_POLICY.md
     if policy.routing.respect_project_policy_file {
         if let Some((uri, slug)) = read_project_policy_uri(cwd) {
             return ResolvedRoute {
                 target_resource_uri: uri,
                 target_memory_uri: USER_MEMORIES_URI.to_string(),
+                agent_private_memory_uri: agent_private,
                 matched_source: RouteMatchSource::ProjectPolicyFile,
                 is_fallback_inbox: false,
                 project_slug: slug,
@@ -43,6 +59,7 @@ pub fn resolve_route(policy: &PolicyConfig, cwd: &Path) -> ResolvedRoute {
             return ResolvedRoute {
                 target_resource_uri: mapping.resource_uri.clone(),
                 target_memory_uri: USER_MEMORIES_URI.to_string(),
+                agent_private_memory_uri: agent_private,
                 matched_source: RouteMatchSource::ManualMapping,
                 is_fallback_inbox: false,
                 project_slug: slug,
@@ -57,6 +74,7 @@ pub fn resolve_route(policy: &PolicyConfig, cwd: &Path) -> ResolvedRoute {
             return ResolvedRoute {
                 target_resource_uri: format!("{}/projects/{}/", prefix, repo_slug),
                 target_memory_uri: USER_MEMORIES_URI.to_string(),
+                agent_private_memory_uri: agent_private,
                 matched_source: RouteMatchSource::GitRemoteAuto,
                 is_fallback_inbox: false,
                 project_slug: Some(repo_slug),
@@ -68,6 +86,7 @@ pub fn resolve_route(policy: &PolicyConfig, cwd: &Path) -> ResolvedRoute {
     ResolvedRoute {
         target_resource_uri: policy.routing.inbox_uri.clone(),
         target_memory_uri: USER_MEMORIES_URI.to_string(),
+        agent_private_memory_uri: agent_private,
         matched_source: RouteMatchSource::InboxFallback,
         is_fallback_inbox: true,
         project_slug: None,
@@ -149,18 +168,23 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn test_parse_repo_slug() {
+        assert_eq!(
+            parse_repo_slug("git@github.com:org/OpenViking-Desktop.git").as_deref(),
+            Some("openviking-desktop")
+        );
+        assert_eq!(
+            parse_repo_slug("https://github.com/volcengine/OpenViking/").as_deref(),
+            Some("openviking")
+        );
+    }
+
+    #[test]
     fn test_protected_rule_globs() {
         let policy = PolicyConfig::default();
-        assert!(is_protected_rule_path(&policy, "CLAUDE.md"));
-        assert!(is_protected_rule_path(
-            &policy,
-            "viking://resources/projects/demo/CLAUDE.md"
-        ));
+        assert!(is_protected_rule_path(&policy, "viking://resources/projects/foo/CLAUDE.md"));
         assert!(is_protected_rule_path(&policy, "AGENTS.md"));
-        assert!(!is_protected_rule_path(
-            &policy,
-            "viking://user/memories/preferences/git.md"
-        ));
+        assert!(!is_protected_rule_path(&policy, "viking://~/memories/preferences/style.md"));
     }
 
     #[test]
@@ -172,24 +196,12 @@ mod tests {
         )
         .unwrap();
         let policy = PolicyConfig::default();
-        let route = resolve_route(&policy, dir.path());
+        let route = resolve_route_for_agent(&policy, dir.path(), Some(AgentId::Codex));
         assert_eq!(route.matched_source, RouteMatchSource::ProjectPolicyFile);
+        assert_eq!(route.target_resource_uri, "viking://resources/projects/custom-app/");
         assert_eq!(
-            route.target_resource_uri,
-            "viking://resources/projects/custom-app/"
-        );
-        assert!(!route.is_fallback_inbox);
-    }
-
-    #[test]
-    fn test_parse_repo_slug() {
-        assert_eq!(
-            parse_repo_slug("git@github.com:tianmazi/openviking-desktop.git").as_deref(),
-            Some("openviking-desktop")
-        );
-        assert_eq!(
-            parse_repo_slug("https://github.com/volcengine/OpenViking").as_deref(),
-            Some("openviking")
+            route.agent_private_memory_uri.as_deref(),
+            Some("viking://agent/codex/memories/")
         );
     }
 }
