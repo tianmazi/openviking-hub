@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { Activity, Cpu, Database, Layers, RefreshCw, ShieldOff } from "lucide-react";
 import { api } from "../lib/tauri";
-import type { RecallEvent, ServerStatus } from "../types/openviking";
+import type { AgentStatus, RecallEvent, ServerStatus } from "../types/openviking";
+import { MemoryFlowCanvas } from "./MemoryFlowCanvas";
 
 const AGENT_FILTERS = [
   { id: "", label: "全部 Agent" },
@@ -11,7 +12,12 @@ const AGENT_FILTERS = [
   { id: "antigravity", label: "Antigravity" },
 ];
 
-export function EventsView() {
+interface EventsViewProps {
+  agents: AgentStatus[];
+  captureEnabled: boolean;
+}
+
+export function EventsView({ agents, captureEnabled }: EventsViewProps) {
   const [agentFilter, setAgentFilter] = useState("");
   const [events, setEvents] = useState<RecallEvent[]>([]);
   const [status, setStatus] = useState<ServerStatus | null>(null);
@@ -29,7 +35,7 @@ export function EventsView() {
   const totalTokens = events.reduce((acc, e) => acc + e.tokens_used, 0);
 
   return (
-    <div className="h-full flex flex-col p-6 space-y-4 overflow-hidden">
+    <div className="h-full flex flex-col p-6 space-y-4 overflow-y-auto">
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-lg font-semibold text-zinc-100">实时召回事件流与远端观测</h1>
@@ -45,6 +51,14 @@ export function EventsView() {
           刷新
         </button>
       </div>
+
+      {/* Live Animated Data-Flow Beam Canvas */}
+      <MemoryFlowCanvas
+        agents={agents}
+        events={events}
+        captureEnabled={captureEnabled}
+        serverReachable={status?.reachable ?? false}
+      />
 
       {/* Observer & Runtime Telemetry Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
@@ -93,7 +107,7 @@ export function EventsView() {
         ))}
       </div>
 
-      <div className="flex-1 overflow-y-auto rounded-xl border border-border-subtle bg-surface-1 divide-y divide-border-subtle">
+      <div className="rounded-xl border border-border-subtle bg-surface-1 divide-y divide-border-subtle">
         {events.map((evt) => (
           <div key={evt.id} className="px-4 py-3 flex items-center justify-between gap-4 text-xs">
             <div className="min-w-0 space-y-1">

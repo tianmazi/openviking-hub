@@ -38,6 +38,11 @@ impl AgentAdapter for PiAdapter {
         let version = bin.as_deref().and_then(probe_cli_version);
         let connected = Self::is_connected(paths);
 
+        let mut detected_surfaces = Vec::new();
+        if installed {
+            detected_surfaces.push("CLI".to_string());
+        }
+
         AgentStatus {
             id: AgentId::Pi.as_str().to_string(),
             agent_id: AgentId::Pi,
@@ -45,6 +50,7 @@ impl AgentAdapter for PiAdapter {
             integration_mode: "Native Extension Bridge".to_string(),
             installed,
             connected,
+            detected_surfaces,
             binary_path: bin,
             config_path: Some(Self::extension_dir(paths)),
             version,
@@ -57,7 +63,6 @@ impl AgentAdapter for PiAdapter {
         let ext_dir = Self::extension_dir(paths);
         fs::create_dir_all(&ext_dir).map_err(|e| e.to_string())?;
 
-        // Cross-platform copy + manifest strategy (avoids Windows symlink Developer Mode requirement).
         let manifest = json!({
             "name": "openviking-bridge",
             "version": env!("CARGO_PKG_VERSION"),
@@ -70,7 +75,6 @@ impl AgentAdapter for PiAdapter {
         atomic_write(&ext_dir.join("manifest.json"), manifest_str.as_bytes(), false)
             .map_err(|e| e.to_string())?;
 
-        // Lightweight native pi extension that discovers tools dynamically from `ov-bridge mcp`.
         let bridge_json =
             serde_json::to_string(&opts.bridge_binary.to_string_lossy().to_string()).unwrap();
         let entry_js = format!(

@@ -60,14 +60,18 @@ export function DreamingWorkbench({
   const [busy, setBusy] = useState(false);
   const [banner, setBanner] = useState<string | null>(null);
 
+  const activeQueue = useMemo(
+    () => changes.filter((c) => c.status !== "applied"),
+    [changes],
+  );
+
   const visibleChanges = useMemo(
     () =>
-      changes.filter((c) => {
-        if (c.status === "applied") return false;
+      activeQueue.filter((c) => {
         if (filterAction === "all") return true;
         return c.action === filterAction;
       }),
-    [changes, filterAction],
+    [activeQueue, filterAction],
   );
 
   const selected = useMemo(
@@ -80,9 +84,33 @@ export function DreamingWorkbench({
     [changes],
   );
 
+  const reviewedCount = useMemo(
+    () =>
+      activeQueue.filter((c) => c.status === "accepted" || c.status === "rejected").length,
+    [activeQueue],
+  );
+
+  const reviewProgressPct =
+    activeQueue.length > 0 ? Math.round((reviewedCount / activeQueue.length) * 100) : 100;
+
   const diffLines = useMemo(() => {
     if (!selected) return [];
-    return computeLineDiff(selected.before_content ?? "", editedText);
+    const raw = computeLineDiff(selected.before_content ?? "", editedText);
+    let oldLine = 0;
+    let newLine = 0;
+    return raw.map((line) => {
+      if (line.type === "remove") {
+        oldLine += 1;
+        return { ...line, oldNum: oldLine, newNum: null as number | null };
+      }
+      if (line.type === "add") {
+        newLine += 1;
+        return { ...line, oldNum: null as number | null, newNum: newLine };
+      }
+      oldLine += 1;
+      newLine += 1;
+      return { ...line, oldNum: oldLine, newNum: newLine };
+    });
   }, [selected, editedText]);
 
   useEffect(() => {
@@ -215,27 +243,43 @@ export function DreamingWorkbench({
         </div>
       </div>
 
-      <div className="px-5 py-2 border-b border-border-subtle bg-surface-1/60 flex items-center gap-1.5 overflow-x-auto">
-        {[
-          { id: "all", label: `全部 (${visibleChanges.length})` },
-          { id: "merge", label: "冲突合并" },
-          { id: "move_from_inbox", label: "Inbox 分拣" },
-          { id: "promote_to_index", label: "热记忆晋升" },
-          { id: "archive", label: "冷记忆归档" },
-          { id: "wiki_compile", label: "Wiki 编译" },
-        ].map((f) => (
-          <button
-            key={f.id}
-            onClick={() => setFilterAction(f.id)}
-            className={`px-2.5 py-1 rounded-md text-[11px] border transition-colors ${
-              filterAction === f.id
-                ? "bg-indigo-500/15 text-indigo-300 border-indigo-500/30"
-                : "bg-surface-2 text-zinc-400 border-border-subtle hover:text-zinc-200"
-            }`}
-          >
-            {f.label}
-          </button>
-        ))}
+      {/* Filter Bar + Review Progress Bar */}
+      <div className="px-5 py-2 border-b border-border-subtle bg-surface-1/60 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-1.5 overflow-x-auto">
+          {[
+            { id: "all", label: `全部 (${activeQueue.length})` },
+            { id: "merge", label: "冲突合并" },
+            { id: "move_from_inbox", label: "Inbox 分拣" },
+            { id: "promote_to_index", label: "热记忆晋升" },
+            { id: "archive", label: "冷记忆归档" },
+            { id: "wiki_compile", label: "Wiki 编译" },
+          ].map((f) => (
+            <button
+              key={f.id}
+              onClick={() => setFilterAction(f.id)}
+              className={`px-2.5 py-1 rounded-md text-[11px] border transition-colors ${
+                filterAction === f.id
+                  ? "bg-indigo-500/15 text-indigo-300 border-indigo-500/30"
+                  : "bg-surface-2 text-zinc-400 border-border-subtle hover:text-zinc-200"
+              }`}
+            >
+              {f.label}
+            </button>
+          ))}
+        </div>
+
+        <div className="flex items-center gap-2.5 text-[11px] font-mono text-zinc-400 shrink-0">
+          <span>
+            审阅进度：{reviewedCount} / {activeQueue.length}
+          </span>
+          <div className="w-28 h-1.5 rounded-full bg-surface-2 overflow-hidden border border-border-subtle">
+            <div
+              className="h-full bg-emerald-400 transition-all duration-300"
+              style={{ width: `${reviewProgressPct}%` }}
+            />
+          </div>
+          <span className="text-emerald-300">{reviewProgressPct}%</span>
+        </div>
       </div>
 
       {banner && (
@@ -389,7 +433,7 @@ export function DreamingWorkbench({
                           diffLines.map((line, idx) => (
                             <div
                               key={idx}
-                              className={`px-4 py-1 whitespace-pre-wrap ${
+                              className={`flex items-start px-3 py-1 whitespace-pre-wrap ${
                                 line.type === "add"
                                   ? "bg-emerald-500/15 text-emerald-200"
                                   : line.type === "remove"
@@ -397,10 +441,16 @@ export function DreamingWorkbench({
                                     : "text-zinc-400"
                               }`}
                             >
-                              <span className="inline-block w-5 select-none opacity-70">
+                              <span className="w-8 shrink-0 text-right pr-2 text-[10px] text-zinc-500 select-none">
+                                {line.oldNum ?? ""}
+                              </span>
+                              <span className="w-8 shrink-0 text-right pr-2 text-[10px] text-zinc-500 select-none border-r border-white/[0.06] mr-2">
+                                {line.newNum ?? ""}
+                              </span>
+                              <span className="inline-block w-4 shrink-0 select-none opacity-70">
                                 {line.type === "add" ? "+" : line.type === "remove" ? "-" : " "}
                               </span>
-                              {line.text}
+                              <span className="flex-1 min-w-0 break-words">{line.text}</span>
                             </div>
                           ))
                         ) : (

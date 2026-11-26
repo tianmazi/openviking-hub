@@ -1,5 +1,15 @@
 import { useState } from "react";
-import { AlertTriangle, CheckCircle2, Plug, RefreshCw, Terminal, Unplug, Upload } from "lucide-react";
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Copy,
+  Monitor,
+  Plug,
+  RefreshCw,
+  Terminal,
+  Unplug,
+  Upload,
+} from "lucide-react";
 import type { AgentId, AgentStatus, WslDistroInfo } from "../types/openviking";
 
 interface AgentsViewProps {
@@ -9,6 +19,8 @@ interface AgentsViewProps {
   onConnect: (id: AgentId, writeRules: boolean) => Promise<void>;
   onDisconnect: (id: AgentId) => Promise<void>;
   onImportLegacy: (localPath: string, agentId: AgentId) => Promise<void>;
+  onConnectWsl: (distroName: string, homeUnc: string) => Promise<void>;
+  onNotify: (kind: "success" | "error" | "info", message: string) => void;
 }
 
 export function AgentsView({
@@ -18,39 +30,49 @@ export function AgentsView({
   onConnect,
   onDisconnect,
   onImportLegacy,
+  onConnectWsl,
+  onNotify,
 }: AgentsViewProps) {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [importingFile, setImportingFile] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [writeAntigravityRules, setWriteAntigravityRules] = useState(true);
 
   const handleToggle = async (agent: AgentStatus) => {
     setBusyId(agent.id);
-    setNotice(null);
     try {
       if (agent.connected) {
         await onDisconnect(agent.agent_id);
-        setNotice(`已安全卸载 ${agent.name} 接入配置（原配置已备份）。`);
+        onNotify("info", `已卸载 ${agent.name} 接入配置（原配置已备份至 ~/.openviking/backups/）。`);
       } else {
         await onConnect(
           agent.agent_id,
           agent.agent_id === "antigravity" ? writeAntigravityRules : false,
         );
-        setNotice(`已成功为 ${agent.name} 注入 ov-bridge 配置。`);
+        onNotify("success", `已成功为 ${agent.name} 注入 ov-bridge 配置。`);
       }
+    } catch (e) {
+      onNotify("error", `${agent.name} 操作失败：${String(e)}`);
     } finally {
       setBusyId(null);
     }
   };
 
+  const handleCopyPath = async (path: string) => {
+    try {
+      await navigator.clipboard.writeText(path);
+      onNotify("info", `已复制配置路径：${path}`);
+    } catch {
+      onNotify("info", `配置路径：${path}`);
+    }
+  };
+
   const handleImport = async (file: string, agentId: AgentId) => {
     setImportingFile(file);
-    setNotice(null);
     try {
       await onImportLegacy(file, agentId);
-      setNotice(`已将原生记忆文件 ${file} 冷启动导入至 OpenViking 远端空间。`);
+      onNotify("success", `已将原生记忆文件 ${file} 导入至远端 Inbox。`);
     } catch (e) {
-      setNotice(`导入失败：${String(e)}`);
+      onNotify("error", `导入失败：${String(e)}`);
     } finally {
       setImportingFile(null);
     }
@@ -62,9 +84,10 @@ export function AgentsView({
         <div>
           <h1 className="text-lg font-semibold text-zinc-100">本地 Agent 自动探测与接入</h1>
           <p className="text-xs text-zinc-400 mt-1">
-            通过内置纯 Rust 单文件 <code className="text-indigo-300 font-mono">ov-bridge</code>{" "}
-            统一接入 MCP 与生命周期 Hooks，修改任何配置前自动备份至{" "}
-            <code className="font-mono text-zinc-300">~/.openviking/backups/</code>。
+            同时支持{" "}
+            <strong className="text-zinc-200 font-medium">Desktop App 桌面端与 CLI</strong>
+            （Codex / Antigravity / Claude Code / pi），通过纯 Rust{" "}
+            <code className="text-indigo-300 font-mono">ov-bridge</code> 统一接入并自动备份。
           </p>
         </div>
         <button
@@ -76,12 +99,6 @@ export function AgentsView({
         </button>
       </div>
 
-      {notice && (
-        <div className="px-3.5 py-2.5 rounded-lg bg-indigo-500/10 border border-indigo-500/25 text-xs text-indigo-200">
-          {notice}
-        </div>
-      )}
-
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {agents.map((agent) => (
           <div
@@ -90,19 +107,39 @@ export function AgentsView({
           >
             <div className="space-y-2.5">
               <div className="flex items-start justify-between gap-2">
-                <div>
-                  <div className="flex items-center gap-2">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-1.5">
                     <h2 className="text-sm font-semibold text-zinc-100">{agent.name}</h2>
-                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-surface-2 text-zinc-400 border border-border-subtle">
-                      {agent.integration_mode}
-                    </span>
+                    {agent.detected_surfaces.map((surface) => (
+                      <span
+                        key={surface}
+                        className="inline-flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/25"
+                      >
+                        <Monitor className="w-2.5 h-2.5" />
+                        {surface}
+                      </span>
+                    ))}
                   </div>
-                  <p className="text-[11px] font-mono text-zinc-500 mt-1 truncate">
-                    {agent.config_path ?? "未检测到配置路径"}
-                  </p>
+                  <div className="text-[10px] font-mono text-zinc-500 mt-1">
+                    {agent.integration_mode}
+                  </div>
+                  {agent.config_path && (
+                    <div className="flex items-center gap-1.5 mt-1">
+                      <span className="text-[11px] font-mono text-zinc-400 truncate">
+                        {agent.config_path}
+                      </span>
+                      <button
+                        onClick={() => void handleCopyPath(agent.config_path!)}
+                        className="p-0.5 text-zinc-500 hover:text-zinc-200 shrink-0"
+                        title="复制配置文件路径"
+                      >
+                        <Copy className="w-3 h-3" />
+                      </button>
+                    </div>
+                  )}
                 </div>
                 <span
-                  className={`inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full border ${
+                  className={`inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full border shrink-0 ${
                     agent.connected
                       ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
                       : agent.installed
@@ -116,9 +153,7 @@ export function AgentsView({
               </div>
 
               {agent.version && (
-                <div className="text-[11px] text-zinc-400 font-mono">
-                  版本：{agent.version}
-                </div>
+                <div className="text-[11px] text-zinc-400 font-mono">版本：{agent.version}</div>
               )}
 
               {agent.warning && (
@@ -136,7 +171,7 @@ export function AgentsView({
                     onChange={(e) => setWriteAntigravityRules(e.target.checked)}
                     className="rounded border-zinc-600 bg-surface-2"
                   />
-                  接入时可选补全项目记忆协作规则（适配 MCP-Only 宿主）
+                  同时写入项目记忆协作规则（与全局 hooks.json 互补）
                 </label>
               )}
 
@@ -166,7 +201,7 @@ export function AgentsView({
             <div className="flex items-center justify-end gap-2 pt-2 border-t border-border-subtle">
               <button
                 disabled={busyId === agent.id}
-                onClick={() => handleToggle(agent)}
+                onClick={() => void handleToggle(agent)}
                 className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
                   agent.connected
                     ? "bg-surface-2 hover:bg-rose-500/20 hover:text-rose-300 text-zinc-300 border border-border-subtle"
@@ -200,12 +235,22 @@ export function AgentsView({
             {wslDistros.map((d) => (
               <div
                 key={d.name}
-                className="px-3 py-2 rounded-lg bg-surface-2 border border-border-subtle text-xs flex items-center justify-between"
+                className="px-3 py-2 rounded-lg bg-surface-2 border border-border-subtle text-xs flex items-center justify-between gap-2"
               >
-                <span className="font-mono text-zinc-200">{d.name}</span>
-                <span className="font-mono text-[11px] text-zinc-500 truncate max-w-[260px]">
-                  {d.home_unc ?? "UNC 路径待解析"}
-                </span>
+                <div className="min-w-0">
+                  <div className="font-mono text-zinc-200">{d.name}</div>
+                  <div className="font-mono text-[10px] text-zinc-500 truncate">
+                    {d.home_unc ?? "UNC 路径待解析"}
+                  </div>
+                </div>
+                {d.home_unc && (
+                  <button
+                    onClick={() => void onConnectWsl(d.name, d.home_unc!)}
+                    className="px-2.5 py-1 rounded-md bg-indigo-600 hover:bg-indigo-500 text-[11px] text-white shrink-0"
+                  >
+                    一键注入 WSL
+                  </button>
+                )}
               </div>
             ))}
           </div>

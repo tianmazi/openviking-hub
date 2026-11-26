@@ -55,6 +55,7 @@ export interface AgentStatus {
   integration_mode: string;
   installed: boolean;
   connected: boolean;
+  detected_surfaces: string[];
   binary_path?: string | null;
   config_path?: string | null;
   version?: string | null;

@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { Plus, Save, Trash2 } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { Plus, RotateCcw, Save, Trash2 } from "lucide-react";
 import type {
   AgentId,
   ContextLayer,
@@ -17,7 +17,7 @@ interface PolicyViewProps {
 
 const AGENT_LABELS: Record<AgentId, string> = {
   "claude-code": "Claude Code",
-  codex: "Codex CLI",
+  codex: "Codex (Desktop + CLI)",
   pi: "pi Coding Agent",
   antigravity: "Antigravity (反重力)",
 };
@@ -39,6 +39,15 @@ export function PolicyView({ policy, onSave }: PolicyViewProps) {
   const [newMapUri, setNewMapUri] = useState("viking://resources/projects/");
   const [newMapVis, setNewMapVis] = useState<VisibilityScope>("shared");
   const [newGlob, setNewGlob] = useState("");
+
+  useEffect(() => {
+    setDraft(policy);
+  }, [policy]);
+
+  const isDirty = useMemo(
+    () => JSON.stringify(draft) !== JSON.stringify(policy),
+    [draft, policy],
+  );
 
   const handleSave = async () => {
     setSaving(true);
@@ -85,7 +94,7 @@ export function PolicyView({ policy, onSave }: PolicyViewProps) {
   };
 
   return (
-    <div className="h-full overflow-y-auto p-6 space-y-6">
+    <div className="h-full overflow-y-auto p-6 pb-20 space-y-6 relative">
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-lg font-semibold text-zinc-100">内置记忆治理策略中心</h1>
@@ -96,11 +105,11 @@ export function PolicyView({ policy, onSave }: PolicyViewProps) {
         </div>
         <button
           onClick={handleSave}
-          disabled={saving}
-          className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-xs font-medium text-white"
+          disabled={saving || !isDirty}
+          className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-xs font-medium text-white transition-opacity"
         >
           <Save className="w-3.5 h-3.5" />
-          {saving ? "保存中..." : "保存策略"}
+          {saving ? "保存中..." : isDirty ? "保存更改" : "已同步"}
         </button>
       </div>
 
@@ -551,6 +560,35 @@ export function PolicyView({ policy, onSave }: PolicyViewProps) {
           </label>
         </div>
       </section>
+
+      {/* Sticky Dirty-State Unsaved Changes Bar */}
+      {isDirty && (
+        <div className="sticky bottom-3 z-20 mx-auto max-w-2xl rounded-xl bg-surface-2/95 backdrop-blur border border-indigo-500/40 shadow-2xl px-4 py-2.5 flex items-center justify-between gap-4 text-xs">
+          <span className="text-indigo-200 font-medium">
+            检测到未保存的策略修改，保存后将热同步至所有本地 Agent。
+          </span>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              onClick={() => {
+                setDraft(policy);
+                setMsg(null);
+              }}
+              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-surface-1 hover:bg-surface-3 border border-border-subtle text-zinc-300"
+            >
+              <RotateCcw className="w-3 h-3" />
+              放弃更改
+            </button>
+            <button
+              onClick={handleSave}
+              disabled={saving}
+              className="inline-flex items-center gap-1 px-3 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-medium"
+            >
+              <Save className="w-3 h-3" />
+              {saving ? "保存中..." : "保存生效"}
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

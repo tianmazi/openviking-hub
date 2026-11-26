@@ -17,6 +17,7 @@ pub struct AgentStatus {
     pub integration_mode: String,
     pub installed: bool,
     pub connected: bool,
+    pub detected_surfaces: Vec<String>,
     pub binary_path: Option<PathBuf>,
     pub config_path: Option<PathBuf>,
     pub version: Option<String>,

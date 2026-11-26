@@ -18,12 +18,11 @@ impl ClaudeCodeAdapter {
     }
 
     fn is_connected(paths: &PlatformPaths) -> bool {
-        let mcp_ok = fs::read_to_string(Self::mcp_config_path(paths))
+        fs::read_to_string(Self::mcp_config_path(paths))
             .ok()
             .and_then(|s| serde_json::from_str::<Value>(&s).ok())
             .and_then(|v| v.get("mcpServers")?.get("openviking").cloned())
-            .is_some();
-        mcp_ok
+            .is_some()
     }
 }
 
@@ -39,6 +38,11 @@ impl AgentAdapter for ClaudeCodeAdapter {
         let version = bin.as_deref().and_then(probe_cli_version);
         let connected = Self::is_connected(paths);
 
+        let mut detected_surfaces = Vec::new();
+        if bin.is_some() || dir_exists {
+            detected_surfaces.push("CLI".to_string());
+        }
+
         AgentStatus {
             id: AgentId::ClaudeCode.as_str().to_string(),
             agent_id: AgentId::ClaudeCode,
@@ -46,6 +50,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
             integration_mode: "MCP + Hooks".to_string(),
             installed,
             connected,
+            detected_surfaces,
             binary_path: bin,
             config_path: Some(Self::mcp_config_path(paths)),
             version,
@@ -57,7 +62,6 @@ impl AgentAdapter for ClaudeCodeAdapter {
     fn connect(&self, paths: &PlatformPaths, opts: &ConnectOptions) -> Result<AgentStatus, String> {
         let bridge = opts.bridge_binary.to_string_lossy().to_string();
 
-        // 1. Merge MCP entry into ~/.claude.json
         let mcp_path = Self::mcp_config_path(paths);
         backup_file("claude-code", &mcp_path).map_err(|e| e.to_string())?;
         let mut mcp_root: Value = if mcp_path.exists() {
@@ -88,7 +92,6 @@ impl AgentAdapter for ClaudeCodeAdapter {
         let serialized = serde_json::to_string_pretty(&mcp_root).map_err(|e| e.to_string())?;
         atomic_write(&mcp_path, serialized.as_bytes(), false).map_err(|e| e.to_string())?;
 
-        // 2. Merge lifecycle Hooks into ~/.claude/settings.json
         let settings_path = Self::settings_path(paths);
         backup_file("claude-code", &settings_path).map_err(|e| e.to_string())?;
         let mut settings_root: Value = if settings_path.exists() {

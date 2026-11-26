@@ -46,6 +46,7 @@ try {
   assert.match(jsCode, /viking:\/\//, "viking:// explorer must be present in bundle");
   assert.match(jsCode, /Antigravity/, "Antigravity adapter UI must be present in bundle");
   assert.match(jsCode, /Unified Line Diff/, "Line diff view must be present in bundle");
+  assert.match(jsCode, /实时记忆信息流拓扑/, "MemoryFlowCanvas live topology must be present in bundle");
 
   console.log("Frontend E2E smoke test passed:", baseUrl);
 } catch (err) {

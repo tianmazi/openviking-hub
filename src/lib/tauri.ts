@@ -235,6 +235,7 @@ export const api = {
         integration_mode: "MCP + Hooks",
         installed: true,
         connected: true,
+        detected_surfaces: ["CLI"],
         binary_path: "/usr/local/bin/claude",
         config_path: "~/.claude.json",
         version: "claude 1.0.32",
@@ -243,15 +244,16 @@ export const api = {
       {
         id: "codex",
         agent_id: "codex",
-        name: "Codex CLI",
-        integration_mode: "MCP + Hooks (TOML)",
+        name: "Codex (Desktop App + CLI)",
+        integration_mode: "Unified Global TOML (~/.codex/config.toml)",
         installed: true,
         connected: false,
-        binary_path: "/usr/local/bin/codex",
+        detected_surfaces: ["Desktop App", "CLI"],
+        binary_path: "/Applications/Codex.app",
         config_path: "~/.codex/config.toml",
         version: "codex 0.14.0",
         warning:
-          '首次启动 Codex 时会提示 "Hooks need review"，请在终端选择 Trust all and continue。',
+          "Codex Desktop 与 CLI 共享全局 ~/.codex/config.toml（桌面端不读取项目级 .codex/config.toml）。注入后请重启 Codex Desktop 并新建线程生效。",
         legacy_memory_files: [],
       },
       {
@@ -261,6 +263,7 @@ export const api = {
         integration_mode: "Native Extension Bridge",
         installed: true,
         connected: true,
+        detected_surfaces: ["CLI"],
         binary_path: "/usr/local/bin/pi",
         config_path: "~/.pi/extensions/openviking-bridge",
         version: "pi 0.9.1",
@@ -269,13 +272,15 @@ export const api = {
       {
         id: "antigravity",
         agent_id: "antigravity",
-        name: "Antigravity (反重力)",
-        integration_mode: "MCP-Only (Global JSON)",
+        name: "Antigravity (反重力 Desktop / IDE / CLI)",
+        integration_mode: "Global MCP + Hooks (mcp_config.json + hooks.json)",
         installed: true,
         connected: false,
+        detected_surfaces: ["Desktop App 2.0", "CLI"],
         binary_path: "/Applications/Antigravity.app",
-        config_path: "~/.gemini/config/mcp_config.json",
-        warning: "注入后请在 Antigravity IDE 的 MCP 面板点击 Refresh 生效。",
+        config_path: "~/.gemini/config/mcp_config.json + ~/.gemini/config/hooks.json",
+        warning:
+          "Antigravity 2.0 桌面端与 CLI 共享全局配置。注入后请在桌面端 Customizations → Installed → MCP Servers 点击 Refresh 或重启应用生效。",
         legacy_memory_files: [],
       },
     ];
@@ -284,6 +289,21 @@ export const api = {
   async detectWsl(): Promise<WslDistroInfo[]> {
     if (isTauriRuntime()) return callTauri("detect_wsl");
     return [];
+  },
+
+  async connectWslAgent(
+    distroName: string,
+    homeUnc: string,
+    linuxBridgePath?: string,
+  ): Promise<string[]> {
+    if (isTauriRuntime()) {
+      return callTauri("connect_wsl_agent", {
+        distroName,
+        homeUnc,
+        linuxBridgePath: linuxBridgePath ?? null,
+      });
+    }
+    return [`${homeUnc}/.claude.json`, `${homeUnc}/.codex/config.toml`];
   },
 
   async connectAgent(
