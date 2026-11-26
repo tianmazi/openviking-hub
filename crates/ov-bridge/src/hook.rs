@@ -14,6 +14,13 @@ use std::time::Instant;
 use uuid::Uuid;
 
 pub async fn run_hook(event: &str, agent: AgentId) -> anyhow::Result<()> {
+    if std::env::var("OPENVIKING_DISABLE_HOOKS").as_deref() == Ok("1") {
+        if agent == AgentId::Antigravity || event == "stop" {
+            println!("{{}}");
+        }
+        return Ok(());
+    }
+
     let mut input = String::new();
     let _ = io::stdin().read_to_string(&mut input);
     let payload: Value = serde_json::from_str(&input).unwrap_or_else(|_| json!({}));

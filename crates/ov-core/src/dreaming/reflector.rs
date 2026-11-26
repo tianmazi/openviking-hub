@@ -1,8 +1,9 @@
-use crate::platform::{silent_command, PlatformPaths};
+use crate::platform::PlatformPaths;
 use crate::policy::model::{DreamingPolicy, ReflectorMode};
 use reqwest::Client;
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::{process::Stdio, time::Duration};
+use tokio::{io::AsyncWriteExt, process::Command};
 
 #[derive(Debug, Clone)]
 pub struct ReflectorResult {
@@ -69,7 +70,12 @@ pub async fn reflect_inbox_route(
     }
 
     let file_name = note_uri.rsplit('/').next().unwrap_or("note.md");
-    let project_list = available_projects.join("\n- ");
+    let projects: Vec<_> = available_projects
+        .iter()
+        .map(|uri| directory_uri(uri))
+        .collect();
+    let project_list = projects.join("\n- ");
+    let fallback_dir = directory_uri(fallback_dest.rsplit_once('/')?.0);
     let prompt = format!(
         "You are a memory router. Given an Inbox note and the list of existing project directories, choose the single best project directory URI.\n\
          Respond with ONLY a valid JSON object: {{\"destination_dir\": \"viking://...\", \"rationale\": \"short reason\"}}\n\n\
@@ -78,23 +84,16 @@ pub async fn reflect_inbox_route(
         note_uri,
         truncate_chars(note_raw, 2000),
         project_list,
-        fallback_dest
+        fallback_dir
     );
 
     let (raw_out, label) = invoke_reflector(policy, &prompt).await?;
     let parsed = extract_json_object(&raw_out)?;
-    let dir = parsed
-        .get("destination_dir")
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string())?;
-    if !dir.starts_with("viking://") {
+    let dir = parsed.get("destination_dir")?.as_str()?;
+    let normalized_dir = directory_uri(dir);
+    if !dir.trim().starts_with("viking://") || !projects.contains(&normalized_dir) {
         return None;
     }
-    let normalized_dir = if dir.ends_with('/') {
-        dir
-    } else {
-        format!("{}/", dir)
-    };
     let rationale = parsed
         .get("rationale")
         .and_then(|v| v.as_str())
@@ -105,6 +104,10 @@ pub async fn reflect_inbox_route(
         rationale,
         engine_label: label,
     })
+}
+
+fn directory_uri(uri: &str) -> String {
+    format!("{}/", uri.trim().trim_end_matches('/'))
 }
 
 async fn invoke_reflector(policy: &DreamingPolicy, prompt: &str) -> Option<(String, String)> {
@@ -124,34 +127,68 @@ async fn invoke_local_cli(preferred: &str, prompt: &str) -> Option<(String, Stri
     };
 
     for bin_name in candidates {
-        let Some(bin_path) = paths.resolve_binary(bin_name) else {
-            continue;
-        };
-        let prompt_owned = prompt.to_string();
-        let bin_owned = bin_path.clone();
-        let name_owned = bin_name.to_string();
-
-        let fut = tokio::task::spawn_blocking(move || {
-            let mut cmd = silent_command(&bin_owned.to_string_lossy());
-            if name_owned == "claude" {
-                cmd.args(["-p", &prompt_owned, "--output-format", "text"]);
-            } else {
-                cmd.args(["exec", &prompt_owned]);
-            }
-            let out = cmd.output().ok()?;
-            if !out.status.success() {
+        let bin_path = paths.resolve_binary(bin_name);
+        #[cfg(windows)]
+        let bin_path = bin_path.or_else(|| {
+            if bin_name != "codex" {
                 return None;
             }
-            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if text.is_empty() {
-                None
-            } else {
-                Some((text, format!("local_cli:{}", name_owned)))
-            }
+            let path = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
+                .join("OpenAI/Codex/bin/codex.exe");
+            path.is_file().then_some(path)
         });
-
-        if let Ok(Some(res)) = tokio::time::timeout(Duration::from_secs(25), fut).await.ok()? {
-            return Some(res);
+        let Some(bin_path) = bin_path else {
+            continue;
+        };
+        let mut cmd = Command::new(bin_path);
+        cmd.env("OPENVIKING_DISABLE_HOOKS", "1")
+            .kill_on_drop(true)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        if bin_name == "claude" {
+            cmd.args([
+                "-p",
+                "--output-format",
+                "text",
+                "--tools",
+                "",
+                "--max-turns",
+                "1",
+            ]);
+        } else {
+            cmd.args([
+                "exec",
+                "-s",
+                "read-only",
+                "--ephemeral",
+                "--skip-git-repo-check",
+                "-c",
+                "features.hooks=false",
+                "-",
+            ]);
+        }
+        let Ok(mut child) = cmd.spawn() else {
+            continue;
+        };
+        let Some(mut stdin) = child.stdin.take() else {
+            continue;
+        };
+        let write_prompt = async move {
+            let result = stdin.write_all(prompt.as_bytes()).await;
+            drop(stdin);
+            result
+        };
+        let output = async { tokio::try_join!(write_prompt, child.wait_with_output()) };
+        // The timed future owns the child, so dropping it on timeout kills the process.
+        let Ok(Ok(((), out))) = tokio::time::timeout(Duration::from_secs(25), output).await else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        if out.status.success() && !text.trim().is_empty() {
+            return Some((text.trim().to_owned(), format!("local_cli:{bin_name}")));
         }
     }
     None

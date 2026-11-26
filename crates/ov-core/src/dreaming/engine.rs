@@ -5,8 +5,10 @@ use crate::ov_client::{snapshot_commit_id, FindRequest, OvClient, OvClientError}
 use crate::policy::model::{
     ChangeAction, MemoryCategory, PendingMemoryChange, PolicyConfig, ReviewStatus, RiskLevel,
 };
-use crate::policy::router::is_protected_rule_path;
-use crate::provenance::{is_write_gate_verified, render_with_provenance, MemoryProvenance};
+use crate::policy::router::{is_protected_rule_path, USER_MEMORIES_URI};
+use crate::provenance::{
+    is_write_gate_verified, render_frontmatter, split_frontmatter, MemoryProvenance,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -30,13 +32,7 @@ pub async fn run_dreaming(
     trigger_source: &str,
 ) -> Result<(DreamingRun, Vec<PendingMemoryChange>), String> {
     let profile_key = client.profile_key();
-    let mut mem_root = "viking://~/memories/";
-    let mut mem_tree = client.tree(mem_root).await;
-    if matches!(&mem_tree, Err(e) if is_not_found(e)) {
-        mem_root = "viking://user/memories/";
-        mem_tree = client.tree(mem_root).await;
-    }
-    let mem_tree = match mem_tree {
+    let mem_tree = match client.tree(USER_MEMORIES_URI).await {
         Ok(tree) => Some(tree),
         Err(e) if is_not_found(&e) => None,
         Err(e) => return Err(e.to_string()),
@@ -56,22 +52,11 @@ pub async fn run_dreaming(
         "wiki_compile": 0
     });
 
-    let project_root = "viking://resources/projects/";
-    let available_projects: Vec<String> = client
-        .ls(project_root)
-        .await
-        .map(|value| {
-            listing_entries(&value)
-                .into_iter()
-                .filter(|entry| is_directory(entry))
-                .filter_map(|entry| entry.get("uri").and_then(Value::as_str))
-                .filter(|uri| uri.starts_with(project_root) && *uri != project_root)
-                .map(str::to_owned)
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect()
-        })
-        .unwrap_or_default();
+    let project_root = format!(
+        "{}/projects/",
+        policy.global.default_visibility.resources_prefix()
+    );
+    let available_projects = list_project_dirs(client, &project_root).await;
 
     // Analyzer 1: Inbox Sorter (uses optional LLM/CLI reflector when enabled)
     if let Ok(inbox_ls) = client.ls(&policy.routing.inbox_uri).await {
@@ -84,11 +69,7 @@ pub async fn run_dreaming(
             let content = read_text(client, entry).await.ok();
             let base_hash = content.as_deref().map(sha256_hex);
             let file_name = entry.rsplit('/').next().unwrap_or("note.md");
-            let fallback_dir = format!(
-                "{}/projects/general/",
-                policy.global.default_visibility.resources_prefix()
-            );
-            let default_dest = format!("{}{}", fallback_dir, file_name);
+            let default_dest = format!("{project_root}general/{file_name}");
 
             let (suggested_dest, rationale, reflector_label) = if let Some(ref raw) = content {
                 if let Some(res) = reflect_inbox_route(
@@ -96,7 +77,7 @@ pub async fn run_dreaming(
                     entry,
                     raw,
                     &available_projects,
-                    &fallback_dir,
+                    &default_dest,
                 )
                 .await
                 {
@@ -261,7 +242,7 @@ pub async fn run_dreaming(
                 if let Ok(content) = read_text(client, uri).await {
                     let snippet: String = content.chars().take(240).collect();
                     if snippet.trim().len() >= 20 {
-                        let scope = format!("{}{}/", mem_root, category.as_str());
+                        let scope = format!("{USER_MEMORIES_URI}{}/", category.as_str());
                         if let Ok(found) = client
                             .find(&FindRequest {
                                 query: snippet,
@@ -290,18 +271,20 @@ pub async fn run_dreaming(
                                     continue;
                                 };
 
+                                let (frontmatter, primary_body) = split_frontmatter(&content);
+                                let (_, peer_body) = split_frontmatter(&other_content);
                                 let (merged_body, reflector_label) = match reflect_merge(
                                     &policy.lifecycle.dreaming,
                                     uri,
-                                    &content,
+                                    primary_body,
                                     &other_uri,
-                                    &other_content,
+                                    peer_body,
                                 )
                                 .await
                                 {
                                     Some(res) => (res.content, res.engine_label),
                                     None => (
-                                        build_merged_markdown(&content, &other_content, &other_uri),
+                                        build_merged_markdown(primary_body, peer_body, &other_uri),
                                         "deterministic".to_string(),
                                     ),
                                 };
@@ -314,7 +297,8 @@ pub async fn run_dreaming(
                                 );
                                 prov.updated_by = format!("dreaming:{}", reflector_label);
                                 prov.evidence_uris = vec![uri.to_string(), other_uri.clone()];
-                                let merged_with_prov = render_with_provenance(&merged_body, &prov);
+                                let merged_with_prov =
+                                    render_frontmatter(frontmatter, &merged_body, &prov);
 
                                 let change = PendingMemoryChange {
                                     id: format!("chg-{}", Uuid::new_v4().simple()),
@@ -356,7 +340,13 @@ pub async fn run_dreaming(
 
     // Analyzer 4: Wiki Compile Proposal
     if policy.lifecycle.dreaming.compile_wiki {
-        if !available_projects.is_empty() {
+        let wiki_project_root = "viking://resources/projects/";
+        let wiki_projects = if project_root == wiki_project_root {
+            available_projects
+        } else {
+            list_project_dirs(client, wiki_project_root).await
+        };
+        if !wiki_projects.is_empty() {
             let change = PendingMemoryChange {
                 id: format!("chg-{}", Uuid::new_v4().simple()),
                 run_id: run_id.clone(),
@@ -364,20 +354,20 @@ pub async fn run_dreaming(
                 created_at: now,
                 action: ChangeAction::WikiCompile,
                 risk_level: RiskLevel::Low,
-                target_uri: project_root.to_string(),
+                target_uri: wiki_project_root.to_string(),
                 destination_uri: Some("viking://resources/desktop-dreaming-wiki/".to_string()),
                 category: MemoryCategory::Patterns,
                 base_hash: None,
                 before_content: None,
                 after_content: Some(format!(
                     "触发 OpenViking Compile 任务，编译 {} 个项目目录为互联 Wiki。",
-                    available_projects.len()
+                    wiki_projects.len()
                 )),
                 rationale: "将近期积累的项目文档与经验编译为结构化 Wiki，降低检索 Token 消耗。"
                     .to_string(),
                 evidence_json: json!({
-                    "project_count": available_projects.len(),
-                    "projects": available_projects
+                    "project_count": wiki_projects.len(),
+                    "projects": wiki_projects
                 })
                 .to_string(),
                 status: ReviewStatus::Pending,
@@ -525,7 +515,9 @@ pub async fn apply_accepted_changes(
 
     if snapshot_id.is_some() && !applied_ids.is_empty() && !snapshot_paths.is_empty() {
         let post_label = format!("dreaming-applied-{}", Utc::now().format("%Y%m%dT%H%M%SZ"));
-        let _ = client.snapshot_commit(&post_label, Some(snapshot_paths)).await;
+        if let Err(error) = client.snapshot_commit(&post_label, Some(snapshot_paths)).await {
+            failed_items.push(("post-apply-snapshot".to_string(), error.to_string()));
+        }
     }
 
     Ok(ApplyReport {
@@ -585,7 +577,7 @@ async fn execute_change(client: &OvClient, change: &PendingMemoryChange) -> Resu
     result.map(|_| ()).map_err(|e| e.to_string())
 }
 
-/// Roll back a previously applied Dreaming run via `POST /api/v1/snapshot/restore`.
+/// Reverse the files and Wiki output changed by a previously applied Dreaming run.
 pub async fn rollback_dreaming_run(
     client: &OvClient,
     db: &DesktopDb,
@@ -604,39 +596,18 @@ pub async fn rollback_dreaming_run(
     let snap_id = run
         .snapshot_id
         .ok_or_else(|| format!("Run {} has no associated snapshot_id", run_id))?;
-    let changes = db.list_applied_changes_for_run(&profile_key, run_id)?;
-    let mut scopes = BTreeSet::new();
+    let mut changes = db.list_applied_changes_for_run(&profile_key, run_id)?;
+    if changes.is_empty() {
+        return Err(format!("Run {run_id} has no applied changes"));
+    }
+    // Reverse the order used by claim_accepted_changes_for_profile.
+    changes.sort_unstable_by(|a, b| a.created_at.cmp(&b.created_at).then(b.id.cmp(&a.id)));
+    let mut restored = Vec::with_capacity(changes.len());
     for change in &changes {
-        let target = Some(change.target_uri.as_str());
-        let destination = change.destination_uri.as_deref();
-        let (source, destination) = match change.action {
-            ChangeAction::WikiCompile => (None, destination),
-            ChangeAction::MoveFromInbox | ChangeAction::Archive => (target, destination),
-            _ => (target, None),
-        };
-        for uri in source.into_iter().chain(destination) {
-            let scope = if change.action == ChangeAction::WikiCompile {
-                Some(uri.trim_end_matches('/'))
-            } else {
-                uri.trim_end_matches('/')
-                    .rsplit_once('/')
-                    .map(|(parent, _)| parent)
-            };
-            let scope = scope
-                .filter(|dir| dir.starts_with("viking://") && *dir != "viking://")
-                .ok_or_else(|| format!("Cannot determine restore scope for {uri}"))?;
-            scopes.insert(scope);
-        }
-    }
-    if scopes.is_empty() {
-        return Err(format!("Run {run_id} has no applied restore scopes"));
-    }
-    let mut restored = Vec::with_capacity(scopes.len());
-    for scope in scopes {
-        let response = client
-            .snapshot_restore_scoped(&snap_id, Some(scope))
+        let change_snapshot = change.snapshot_id.as_deref().unwrap_or(&snap_id);
+        let response = rollback_change(client, change_snapshot, change)
             .await
-            .map_err(|e| format!("Restore failed for {scope}: {e}"))?;
+            .map_err(|e| format!("Restore failed for {}: {e}", change.target_uri))?;
         restored.push(response);
     }
     db.update_run_status_for_profile(&profile_key, run_id, "rolled_back", Some(&snap_id), None)?;
@@ -644,6 +615,62 @@ pub async fn rollback_dreaming_run(
         1 => Ok(restored.remove(0)),
         _ => Ok(Value::Array(restored)),
     }
+}
+
+async fn rollback_change(
+    client: &OvClient,
+    snap_id: &str,
+    change: &PendingMemoryChange,
+) -> Result<Value, String> {
+    let target = &change.target_uri;
+    let before = change.before_content.as_deref();
+    let result = match change.action {
+        ChangeAction::Merge | ChangeAction::PromoteToIndex | ChangeAction::DemoteFromIndex => {
+            match before {
+                Some(content) => client.write_content(target, content).await,
+                None => client.snapshot_restore_scoped(snap_id, Some(target)).await,
+            }
+        }
+        ChangeAction::MoveFromInbox | ChangeAction::Archive => {
+            let dest = change
+                .destination_uri
+                .as_deref()
+                .ok_or("missing destination_uri")?;
+            match (client.mv(dest, target).await, before) {
+                (Err(_), Some(content)) => {
+                    let response = client
+                        .write_content(target, content)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    match client.delete_fs(dest, false).await {
+                        Err(e) if !is_not_found(&e) => Err(e),
+                        _ => Ok(response),
+                    }
+                }
+                (result, _) => result,
+            }
+        }
+        ChangeAction::WikiCompile => {
+            let dest = change
+                .destination_uri
+                .as_deref()
+                .map(|uri| uri.trim_end_matches('/'))
+                .filter(|uri| uri.starts_with("viking://"))
+                .ok_or("missing or invalid Wiki destination URI")?;
+            match client.snapshot_restore_scoped(snap_id, Some(dest)).await {
+                Err(e)
+                    if is_not_found(&e) || matches!(e, OvClientError::Api { status: 400, .. }) =>
+                {
+                    match client.delete_fs(dest, true).await {
+                        Err(e) if is_not_found(&e) => Ok(json!({ "uri": dest })),
+                        result => result,
+                    }
+                }
+                result => result,
+            }
+        }
+    };
+    result.map_err(|e| e.to_string())
 }
 
 async fn read_text(client: &OvClient, uri: &str) -> Result<String, String> {
@@ -658,6 +685,21 @@ async fn read_text(client: &OvClient, uri: &str) -> Result<String, String> {
 fn is_not_found(error: &OvClientError) -> bool {
     matches!(error, OvClientError::Api { status, code, .. }
         if *status == 404 || (code == "NOT_FOUND" && matches!(*status, 200..=299 | 400)))
+}
+
+async fn list_project_dirs(client: &OvClient, root: &str) -> Vec<String> {
+    let Ok(value) = client.ls(root).await else {
+        return Vec::new();
+    };
+    listing_entries(&value)
+        .into_iter()
+        .filter(|entry| is_directory(entry))
+        .filter_map(|entry| entry.get("uri").and_then(Value::as_str))
+        .filter(|uri| uri.starts_with(root) && *uri != root)
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn listing_entries(value: &Value) -> Vec<&Value> {

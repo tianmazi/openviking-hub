@@ -33,6 +33,7 @@ export default function App() {
   const [policy, setPolicy] = useState<PolicyConfig | null>(null);
   const [changes, setChanges] = useState<PendingMemoryChange[]>([]);
   const [runs, setRuns] = useState<DreamingRun[]>([]);
+  const [switchingProfile, setSwitchingProfile] = useState(false);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
 
   const pushToast = (kind: ToastItem["kind"], message: string) => {
@@ -79,22 +80,29 @@ export default function App() {
   }, []);
 
   const handleSaveProfiles = async (next: ProfileStore) => {
-    await api.saveProfiles(next);
-    setProfiles(next);
-    const [st, chgs, rns] = await Promise.all([
-      api.getServerStatus(),
-      api.listPendingChanges(),
-      api.listDreamingRuns(),
-    ]);
-    setServerStatus(st);
-    setChanges(chgs);
-    setRuns(rns);
-    pushToast(
-      st.reachable ? "success" : "info",
-      st.reachable
-        ? `已切换至 ${next.profiles[next.active]?.label ?? next.active}（延迟 ${st.latency_ms}ms）`
-        : `已保存 Profile，但目标服务暂不可达`,
-    );
+    setSwitchingProfile(true);
+    setChanges([]);
+    setRuns([]);
+    try {
+      await api.saveProfiles(next);
+      setProfiles(next);
+      const [st, chgs, rns] = await Promise.all([
+        api.getServerStatus(),
+        api.listPendingChanges(),
+        api.listDreamingRuns(),
+      ]);
+      setServerStatus(st);
+      setChanges(chgs);
+      setRuns(rns);
+      pushToast(
+        st.reachable ? "success" : "info",
+        st.reachable
+          ? `已切换至 ${next.profiles[next.active]?.label ?? next.active}（延迟 ${st.latency_ms}ms）`
+          : `已保存 Profile，但目标服务暂不可达`,
+      );
+    } finally {
+      setSwitchingProfile(false);
+    }
   };
 
   const handleSwitchProfile = async (name: string) => {
@@ -139,6 +147,7 @@ export default function App() {
   };
 
   const handleTriggerDreaming = async () => {
+    if (switchingProfile) return;
     try {
       await api.triggerDreaming();
       setChanges(await api.listPendingChanges());
@@ -155,11 +164,15 @@ export default function App() {
     status: ReviewStatus,
     editedAfterContent?: string,
   ) => {
+    if (switchingProfile) return;
     await api.updateChangeDecision(id, status, editedAfterContent);
     setChanges(await api.listPendingChanges());
   };
 
   const handleApplyAccepted = async () => {
+    if (switchingProfile) {
+      throw new Error("Profile 正在切换，请等待队列刷新后再提交。");
+    }
     const report = await api.applyAcceptedChanges();
     setChanges(await api.listPendingChanges());
     setRuns(await api.listDreamingRuns());
@@ -173,6 +186,7 @@ export default function App() {
   };
 
   const handleRollbackRun = async (runId: string) => {
+    if (switchingProfile) return;
     try {
       await api.rollbackDreamingRun(runId);
       setRuns(await api.listDreamingRuns());

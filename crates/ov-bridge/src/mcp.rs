@@ -2,7 +2,9 @@ use chrono::Utc;
 use ov_core::dreaming::db::{DesktopDb, RecallEvent};
 use ov_core::ov_client::{ContextSearchRequest, FindRequest, OvClient};
 use ov_core::policy::model::{AgentId, ContextLayer, PolicyConfig};
-use ov_core::policy::router::{is_protected_rule_path, resolve_route_for_agent};
+use ov_core::policy::router::{
+    is_foreign_agent_private_uri, is_protected_rule_path, resolve_route_for_agent,
+};
 use ov_core::policy::store::PolicyStore;
 use ov_core::provenance::{render_with_provenance, wrap_ifc_readonly, MemoryProvenance};
 use serde_json::{json, Value};
@@ -152,6 +154,9 @@ fn tool_definitions() -> Value {
 }
 
 async fn handle_tool_call(agent: AgentId, params: &Value) -> Result<String, String> {
+    if std::env::var("OPENVIKING_DISABLE_HOOKS").as_deref() == Ok("1") {
+        return Err("OpenViking tools are disabled for this reflector process".to_string());
+    }
     let policy = PolicyStore::load_or_init().map_err(|e| e.to_string())?;
     let client = OvClient::from_local_config().map_err(|e| e.to_string())?;
     let db = DesktopDb::open_default().ok();
@@ -173,6 +178,13 @@ pub(crate) async fn call_tool(
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
 
     let budget = policy.budget.resolve_for(agent);
+    let check_access = |uri: &str| {
+        if is_foreign_agent_private_uri(policy, agent, uri) {
+            Err("Access denied: URI belongs to another agent's private namespace")
+        } else {
+            Ok(())
+        }
+    };
 
     match name {
         "recall" => {
@@ -189,9 +201,12 @@ pub(crate) async fn call_tool(
                     resolve_route_for_agent(policy, &cwd, Some(agent)).target_resource_uri
                 });
             let target_uri = (!target_uri.is_empty()).then_some(target_uri);
+            if let Some(uri) = target_uri.as_deref() {
+                check_access(uri)?;
+            }
             let limit = args.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
 
-            let res = if target_uri.is_some() {
+            let mut res = if target_uri.is_some() {
                 client
                     .find(&FindRequest {
                         query: query.to_string(),
@@ -211,6 +226,7 @@ pub(crate) async fn call_tool(
             }
             .map_err(|e| e.to_string())?;
 
+            filter_private_entries(&mut res, policy, agent);
             let top_hit = extract_top_hit(&res);
             let mut combined = serde_json::to_string_pretty(&res).unwrap_or_default();
             let mut expansion = None;
@@ -314,6 +330,7 @@ pub(crate) async fn call_tool(
                     )
                 });
 
+            check_access(&uri)?;
             if !policy.global.capture_enabled {
                 if let Some(db) = db {
                     let evt = RecallEvent {
@@ -379,6 +396,7 @@ pub(crate) async fn call_tool(
                 .get("uri")
                 .and_then(|v| v.as_str())
                 .ok_or("Missing uri")?;
+            check_access(uri)?;
             let layer = args
                 .get("layer")
                 .and_then(|v| v.as_str())
@@ -399,10 +417,36 @@ pub(crate) async fn call_tool(
                 .get("uri")
                 .and_then(|v| v.as_str())
                 .unwrap_or("viking://");
-            let res = client.ls(uri).await.map_err(|e| e.to_string())?;
+            check_access(uri)?;
+            let mut res = client.ls(uri).await.map_err(|e| e.to_string())?;
+            filter_private_entries(&mut res, policy, agent);
             Ok(serde_json::to_string_pretty(&res).unwrap_or_default())
         }
         _ => Err(format!("Unknown tool: {}", name)),
+    }
+}
+
+fn filter_private_entries(value: &mut Value, policy: &PolicyConfig, agent: AgentId) {
+    if !policy.routing.isolate_agent_namespaces {
+        return;
+    }
+    match value {
+        Value::Array(items) => {
+            items.retain(|item| {
+                !item["uri"]
+                    .as_str()
+                    .is_some_and(|uri| is_foreign_agent_private_uri(policy, agent, uri))
+            });
+            for item in items {
+                filter_private_entries(item, policy, agent);
+            }
+        }
+        Value::Object(fields) => {
+            for value in fields.values_mut() {
+                filter_private_entries(value, policy, agent);
+            }
+        }
+        _ => {}
     }
 }
 
