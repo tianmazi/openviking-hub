@@ -1,3 +1,4 @@
+use crate::fs_util::sha256_hex;
 use crate::platform::{silent_command, PlatformPaths};
 use crate::policy::model::{AgentId, PolicyConfig, ResolvedRoute, RouteMatchSource};
 use globset::{Glob, GlobSetBuilder};
@@ -150,7 +151,24 @@ fn detect_git_repo_slug(cwd: &Path) -> Option<String> {
         return None;
     }
     let remote = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    parse_repo_slug(&remote)
+    project_identity(&remote)
+}
+
+/// Normalize common Git HTTPS/SSH remotes without retaining credentials.
+pub fn project_identity(remote: &str) -> Option<String> {
+    let raw = remote.trim().trim_end_matches('/').trim_end_matches(".git");
+    let (host, path) = if let Some((_, rest)) = raw.split_once("://") {
+        rest.split_once('/')?
+    } else {
+        raw.split_once(':')?
+    };
+    let host = host.rsplit('@').next()?.to_ascii_lowercase();
+    if host.is_empty() || path.is_empty() {
+        return None;
+    }
+    let canonical = format!("{host}/{}", path.trim_matches('/'));
+    let slug = parse_repo_slug(raw)?;
+    Some(format!("{slug}__{}", &sha256_hex(&canonical)[..12]))
 }
 
 pub fn parse_repo_slug(remote: &str) -> Option<String> {
@@ -177,6 +195,15 @@ pub fn parse_repo_slug(remote: &str) -> Option<String> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn stable_project_identity() {
+        let a = project_identity("git@github.com:team/payment.git").unwrap();
+        assert_eq!(Some(a.clone()), project_identity("https://github.com/team/payment"));
+        assert_eq!(Some(a.clone()), project_identity("ssh://git@github.com/team/payment.git"));
+        assert_ne!(Some(a.clone()), project_identity("https://github.com/other/payment"));
+        assert_ne!(Some(a), project_identity("https://gitlab.example/team/payment"));
+    }
 
     #[test]
     fn test_parse_repo_slug() {

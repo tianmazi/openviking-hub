@@ -104,10 +104,12 @@ pub(super) fn json_path_exists(file: PathBuf, keys: &[&str]) -> bool {
     keys.iter().try_fold(&root, |value, &key| value.get(key)).is_some()
 }
 
-pub(super) const HOOK_EVENTS: [(&str, &str); 3] = [
+pub(super) const HOOK_EVENTS: [(&str, &str); 5] = [
     ("SessionStart", "session-start"),
     ("UserPromptSubmit", "user-prompt-submit"),
     ("Stop", "stop"),
+    ("PreCompact", "pre-compact"),
+    ("SessionEnd", "session-end"),
 ];
 
 pub(super) fn is_managed_hook(handler: &Value, cli_event: &str, agent: AgentId) -> bool {

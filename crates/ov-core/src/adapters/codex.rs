@@ -115,7 +115,7 @@ impl CodexAdapter {
         let Some(hooks) = root.get("hooks").and_then(Value::as_object) else {
             return false;
         };
-        HOOK_EVENTS.into_iter().any(|(event, cli_event)| {
+        HOOK_EVENTS.into_iter().all(|(event, cli_event)| {
             hooks.get(event).and_then(Value::as_array).into_iter().flatten().any(|group| {
                 group.get("hooks").and_then(Value::as_array).is_some_and(|handlers| {
                     handlers.iter().any(|handler| is_managed_hook(handler, cli_event, AgentId::Codex))

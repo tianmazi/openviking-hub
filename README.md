@@ -67,3 +67,9 @@ npm run tauri build
 ```
 
 推送 `v*` 标签（例如 `git tag v0.2.1 && git push origin v0.2.1`）会自动触发 GitHub Actions 构建 macOS（Apple Silicon + Intel）、Windows 与 Linux 四平台安装包并发布至 [GitHub Releases](https://github.com/tianmazi/openviking-hub/releases)。
+
+### Agent capture queue (foundation)
+
+The bridge captures textual user/assistant transcript records, filters injected references and common credential markers, and stores deduplicated messages in the active server profile's SQLite outbox. Stop, PreCompact and SessionEnd enqueue work; a short-lived sync process sends it to a reused OpenViking session and commits each delivered batch. Run `ov-bridge sync` to retry a connection failure and `ov-bridge doctor` to inspect pending/sent/uncertain counts. An uncertain remote write is not replayed automatically. Session commit acknowledgement is not proof that background memory extraction finished.
+
+Git auto-routing now uses a hash of the normalized remote. Existing projects may retain their old resource directory with an explicit workspace mapping or RESOURCE_POLICY.md. The first sync uses the active profile only. Runtime protocol compatibility and real-server behavior should be checked before enabling capture for sensitive repositories; the simple credential filter is not a comprehensive DLP system.

@@ -121,31 +121,28 @@ function runHook(event, payload) {
 }
 
 export default function (pi) {
-  const captured = new Set();
+  const sessionPayload = (ctx) => ({
+    cwd: ctx.cwd,
+    session_id: ctx.sessionManager.getSessionId(),
+    transcript_path: ctx.sessionManager.getSessionFile(),
+  });
+
+  pi.on("session_start", async (_event, ctx) => {
+    runHook("session-start", sessionPayload(ctx));
+  });
 
   pi.on("before_agent_start", async (event, ctx) => {
-    captured.clear();
-    const recall = runHook("user-prompt-submit", { prompt: event.prompt, cwd: ctx.cwd });
+    const recall = runHook("user-prompt-submit", { ...sessionPayload(ctx), prompt: event.prompt });
     if (recall && typeof event.systemPrompt === "string") {
       return { systemPrompt: event.systemPrompt + "\n\n" + recall };
     }
   });
 
   pi.on("agent_end", async (event, ctx) => {
-    for (const message of [...event.messages].reverse()) {
-      if (message.role !== "assistant") continue;
-      const text = message.content
-        .filter((block) => block.type === "text")
-        .map((block) => block.text)
-        .join("\n")
-        .trim();
-      if (!text) continue;
-      if (!captured.has(text)) {
-        captured.add(text);
-        runHook("stop", { last_assistant_message: text, cwd: ctx.cwd });
-      }
-      break;
-    }
+    runHook("stop", { ...sessionPayload(ctx), messages: event.messages });
+  });
+  pi.on("session_shutdown", async (_event, ctx) => {
+    runHook("session-end", sessionPayload(ctx));
   });
 }
 "#;

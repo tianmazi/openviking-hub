@@ -7,8 +7,9 @@ use ov_core::policy::router::resolve_route_for_agent;
 use ov_core::policy::store::PolicyStore;
 use ov_core::provenance::wrap_ifc_readonly;
 use serde_json::{json, Value};
-use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read};
+use ov_core::capture::collect;
+use ov_core::fs_util::sha256_hex;
 use std::path::PathBuf;
 use std::time::Instant;
 use uuid::Uuid;
@@ -31,7 +32,18 @@ async fn local_hook(event: &str, agent: AgentId, payload: &Value) -> anyhow::Res
     };
     let policy = PolicyStore::load_or_init()?;
     let db = DesktopDb::open_default().ok();
-    Ok(execute_hook(event, agent, payload, &policy, &client, db.as_ref()).await)
+    let result = execute_hook(event, agent, payload, &policy, &client, db.as_ref()).await;
+    if policy.global.capture_enabled && matches!(event, "stop" | "pre-compact" | "session-end" | "session-start") {
+        // Short-lived independent worker; the desktop window need not be open.
+        if let Ok(exe) = std::env::current_exe() {
+            let mut command = std::process::Command::new(exe);
+            command.args(["sync", "--profile", &client.profile_key()])
+                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            let _ = command.spawn();
+        }
+    }
+    Ok(result)
 }
 
 pub(crate) fn hook_stdout(event: &str, agent: AgentId, text: &str) -> Option<String> {
@@ -158,13 +170,24 @@ pub(crate) async fn execute_hook(
             ) else {
                 return String::new();
             };
-            let Ok(res) = client
+            if matches!(prompt.trim().to_lowercase().as_str(), "ok" | "yes" | "继续" | "可以" | "好的") {
+                return String::new();
+            }
+            let recall_key = payload_text(payload, &["session_id", "sessionId", "transcript_path", "transcriptPath"])
+                .map(|session| format!("recall:{}:{}", client.profile_key(),
+                    sha256_hex(&format!("{}:{}:{}", agent.as_str(), route.target_resource_uri, session))));
+            let digest = sha256_hex(prompt);
+            if let (Some(db), Some(key)) = (db, &recall_key) {
+                if db.get_kv(key).ok().flatten().as_deref() == Some(digest.as_str()) {
+                    return String::new();
+                }
+            }
+            let Ok(Ok(res)) = tokio::time::timeout(std::time::Duration::from_secs(3), client
                 .find(&FindRequest {
                     query: prompt.to_string(),
                     target_uri: Some(route.target_resource_uri).filter(|uri| !uri.is_empty()),
                     limit: Some(5),
-                })
-                .await
+                })).await
             else {
                 return String::new();
             };
@@ -175,41 +198,34 @@ pub(crate) async fn execute_hook(
                 &serde_json::to_string_pretty(&res).unwrap_or_default(),
                 budget.max_recall_tokens,
             );
+            if let (Some(db), Some(key)) = (db, &recall_key) {
+                let _ = db.set_kv(key, &digest);
+            }
             evt.target_uri = Some(top_uri);
             evt.query = Some(prompt.chars().take(120).collect());
             evt.layer = Some("l0".to_string());
             evt.tokens_used = (text.len() / 4) as i64;
             text
         }
-        "stop" => {
+        "stop" | "pre-compact" | "session-end" => {
             evt.event_type = "hook_stop".to_string();
             evt.target_uri = Some(route.target_memory_uri);
             evt.blocked_by_privacy = !policy.global.capture_enabled;
             if evt.blocked_by_privacy {
                 evt.layer = None;
             } else {
-                let summary = payload_text(
-                    payload,
-                    &[
-                        "transcript_summary",
-                        "transcriptSummary",
-                        "last_assistant_message",
-                        "lastAssistantMessage",
-                    ],
-                )
-                .map(str::to_owned)
-                .or_else(|| {
-                    let path = payload_text(payload, &["transcript_path", "transcriptPath"])?;
-                    transcript_last_assistant(path)
-                });
-                let Some(summary) = summary else {
-                    return String::new();
-                };
-                if !commit_summary(client, agent, &route.target_resource_uri, &summary).await {
-                    return String::new();
+                let (session, messages) = collect(payload);
+                let Some(db) = db else { return String::new(); };
+                if messages.is_empty() { return String::new(); }
+                let runtime_id = session.unwrap_or_else(|| messages[0].key.clone());
+                let session_key = sha256_hex(&format!("{}:{}:{}", agent.as_str(), route.target_resource_uri, runtime_id));
+                match db.enqueue_capture(&client.profile_key(), &session_key, agent.as_str(), &route.target_resource_uri, &messages) {
+                    Ok(0) | Err(_) => return String::new(),
+                    Ok(_) => {}
                 }
+                evt.event_type = "capture_queued".to_string();
                 evt.layer = Some("l2".to_string());
-                evt.tokens_used = (summary.len() / 4) as i64;
+                evt.tokens_used = messages.iter().map(|m| (m.content.len() / 4) as i64).sum();
             }
             String::new()
         }
@@ -227,65 +243,6 @@ fn payload_text<'a>(payload: &'a Value, keys: &[&str]) -> Option<&'a str> {
     keys.iter()
         .filter_map(|key| payload.get(*key).and_then(Value::as_str))
         .find(|text| !text.trim().is_empty())
-}
-
-async fn commit_summary(client: &OvClient, agent: AgentId, resource_uri: &str, summary: &str) -> bool {
-    let Ok(session) = client
-        .create_session(json!({ "agent": agent.as_str(), "resource_uri": resource_uri }))
-        .await
-    else {
-        return false;
-    };
-    let Some(id) = payload_text(&session, &["session_id", "id"]) else {
-        return false;
-    };
-    client
-        .add_session_message(id, "assistant", summary)
-        .await
-        .is_ok()
-        && client.commit_session(id).await.is_ok()
-}
-
-fn transcript_last_assistant(path: &str) -> Option<String> {
-    const TAIL_BYTES: u64 = 256 * 1024;
-    let mut file = File::open(path).ok()?;
-    let offset = file.metadata().ok()?.len().saturating_sub(TAIL_BYTES);
-    file.seek(SeekFrom::Start(offset.saturating_sub(1))).ok()?;
-    let mut tail = Vec::new();
-    file.take(TAIL_BYTES + 1).read_to_end(&mut tail).ok()?;
-    // Drop the first record when the window starts in the middle of a JSONL line.
-    let start = if offset == 0 {
-        0
-    } else {
-        tail.iter().position(|byte| *byte == b'\n')? + 1
-    };
-    tail[start..].rsplit(|byte| *byte == b'\n').find_map(|line| {
-        let entry: Value = serde_json::from_slice(line).ok()?;
-        let message = match entry["type"].as_str() {
-            Some("response_item") => &entry["payload"],
-            Some("event_msg") if entry["payload"]["type"] == "agent_message" => {
-                return payload_text(&entry["payload"], &["message"]).map(str::to_owned);
-            }
-            Some("assistant") => entry.get("message").unwrap_or(&entry),
-            _ => &entry,
-        };
-        let is_assistant = message["role"].as_str()
-            .map_or_else(|| entry["type"] == "assistant", |role| role == "assistant");
-        if !is_assistant {
-            return None;
-        }
-        let content = &message["content"];
-        let text = if let Some(text) = content.as_str() {
-            text.trim().to_string()
-        } else {
-            content.as_array()?.iter()
-                .filter(|block| matches!(block["type"].as_str(), Some("text" | "output_text")))
-                .filter_map(|block| block["text"].as_str())
-                .filter(|text| !text.trim().is_empty())
-                .collect::<Vec<_>>().join("\n")
-        };
-        (!text.is_empty()).then_some(text)
-    })
 }
 
 fn enforce_startup_caps(text: &str, max_lines: usize, max_bytes: usize) -> String {

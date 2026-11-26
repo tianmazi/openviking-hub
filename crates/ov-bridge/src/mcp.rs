@@ -259,7 +259,7 @@ pub(crate) async fn call_tool(
                     agent_id: agent.as_str().to_string(),
                     event_type: "recall".to_string(),
                     query: Some(query.to_string()),
-                    target_uri: top_hit.map(|(uri, _)| uri).or(target_uri),
+                    target_uri: top_hit.map(|(uri, _)| uri),
                     layer: Some(layer.to_string()),
                     tokens_used: approx_tokens,
                     latency_ms: start.elapsed().as_millis() as i64,

@@ -84,7 +84,7 @@ impl DesktopDb {
         Ok(db)
     }
 
-    fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, String> {
+    pub(crate) fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, String> {
         self.conn
             .lock()
             .map_err(|_| "DesktopDb mutex poisoned".to_string())
@@ -155,6 +155,28 @@ impl DesktopDb {
                 PRIMARY KEY (profile_key, uri)
             );
 
+            CREATE TABLE IF NOT EXISTS capture_sessions (
+                profile_key TEXT NOT NULL,
+                session_key TEXT NOT NULL,
+                agent TEXT NOT NULL,
+                resource_uri TEXT NOT NULL,
+                remote_id TEXT,
+                state TEXT NOT NULL DEFAULT 'idle',
+                claimed_at INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                task_id TEXT,
+                PRIMARY KEY (profile_key, session_key)
+            );
+            CREATE TABLE IF NOT EXISTS capture_outbox (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_key TEXT NOT NULL,
+                session_key TEXT NOT NULL,
+                event_key TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'pending',
+                UNIQUE(profile_key, session_key, event_key)
+            );
             CREATE TABLE IF NOT EXISTS kv_state (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -239,7 +261,7 @@ impl DesktopDb {
         conn.query_row(
             "SELECT COUNT(*) FROM recall_events
              WHERE profile_key = ?1 AND created_at > ?2 AND blocked_by_privacy = 0
-                   AND event_type IN ('hook_stop', 'capture')",
+                   AND event_type IN ('hook_stop', 'capture', 'capture_queued')",
             params![profile_key, since],
             |row| row.get(0),
         ).map_err(|e| e.to_string())

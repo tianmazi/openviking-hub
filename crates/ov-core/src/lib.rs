@@ -1,4 +1,5 @@
 pub mod adapters;
+pub mod capture;
 pub mod dreaming;
 pub mod fs_util;
 pub mod ov_client;

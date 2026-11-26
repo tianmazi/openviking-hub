@@ -32,6 +32,10 @@ enum Commands {
     },
     /// Print remote OpenViking server status and loaded policy summary as JSON.
     Status,
+    /// Drain the active profile's durable capture queue.
+    Sync { #[arg(long)] profile: Option<String> },
+    /// Inspect the active profile's capture queue and connectivity.
+    Doctor,
 }
 
 #[tokio::main]
@@ -46,11 +50,24 @@ async fn main() -> anyhow::Result<()> {
             let agent_id = AgentId::parse_str(&agent).unwrap_or(AgentId::ClaudeCode);
             hook::run_hook(&event, agent_id).await?;
         }
-        Commands::Status => {
+        Commands::Sync { profile } => {
+            let client = OvClient::from_local_config()?;
+            if profile.as_deref().is_some_and(|p| p != client.profile_key()) { return Ok(()); }
+            let policy = PolicyStore::load_or_init()?;
+            if policy.global.capture_enabled {
+                let db = ov_core::dreaming::db::DesktopDb::open_default().map_err(anyhow::Error::msg)?;
+                let count = ov_core::capture::sync_capture(&db, &client).await.map_err(anyhow::Error::msg)?;
+                println!("{}", serde_json::json!({"committed_sessions":count}));
+            }
+        }
+        Commands::Doctor | Commands::Status => {
             let client = OvClient::from_local_config()?;
             let status = client.status().await;
             let policy = PolicyStore::load_or_init().ok();
+            let capture = ov_core::dreaming::db::DesktopDb::open_default().ok()
+                .and_then(|db| db.capture_health(&client.profile_key()).ok());
             let out = serde_json::json!({
+                "capture_queue": capture,
                 "server": status,
                 "capture_enabled": policy.as_ref().map(|p| p.global.capture_enabled).unwrap_or(true),
             });
