@@ -1,6 +1,12 @@
 import { useState } from "react";
-import { Save } from "lucide-react";
-import type { AgentId, ContextLayer, PolicyConfig } from "../types/openviking";
+import { Plus, Save, Trash2 } from "lucide-react";
+import type {
+  AgentId,
+  ContextLayer,
+  DreamingTrigger,
+  PolicyConfig,
+  VisibilityScope,
+} from "../types/openviking";
 
 interface PolicyViewProps {
   policy: PolicyConfig;
@@ -18,6 +24,10 @@ export function PolicyView({ policy, onSave }: PolicyViewProps) {
   const [draft, setDraft] = useState<PolicyConfig>(policy);
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
+  const [newMapPath, setNewMapPath] = useState("");
+  const [newMapUri, setNewMapUri] = useState("viking://resources/projects/");
+  const [newMapVis, setNewMapVis] = useState<VisibilityScope>("shared");
+  const [newGlob, setNewGlob] = useState("");
 
   const handleSave = async () => {
     setSaving(true);
@@ -30,6 +40,37 @@ export function PolicyView({ policy, onSave }: PolicyViewProps) {
     } finally {
       setSaving(false);
     }
+  };
+
+  const addMapping = () => {
+    if (!newMapPath.trim() || !newMapUri.startsWith("viking://")) return;
+    setDraft({
+      ...draft,
+      routing: {
+        ...draft.routing,
+        workspace_mappings: [
+          ...draft.routing.workspace_mappings,
+          {
+            local_path: newMapPath.trim(),
+            resource_uri: newMapUri.trim(),
+            visibility: newMapVis,
+          },
+        ],
+      },
+    });
+    setNewMapPath("");
+  };
+
+  const addGlob = () => {
+    if (!newGlob.trim()) return;
+    setDraft({
+      ...draft,
+      routing: {
+        ...draft.routing,
+        protected_rule_globs: [...draft.routing.protected_rule_globs, newGlob.trim()],
+      },
+    });
+    setNewGlob("");
   };
 
   return (
@@ -89,6 +130,7 @@ export function PolicyView({ policy, onSave }: PolicyViewProps) {
             />
           </label>
         </div>
+
         <div className="space-y-1.5">
           <label className="text-xs text-zinc-400">Inbox 兜底目录 URI</label>
           <input
@@ -98,6 +140,118 @@ export function PolicyView({ policy, onSave }: PolicyViewProps) {
             }
             className="w-full bg-surface-2 border border-border-subtle rounded-lg px-3 py-2 font-mono text-xs text-zinc-200"
           />
+        </div>
+
+        {/* Manual Workspace Mappings */}
+        <div className="space-y-2">
+          <div className="text-xs font-medium text-zinc-300">手动目录映射（优先于 Git 自动识别）</div>
+          <div className="space-y-1.5">
+            {draft.routing.workspace_mappings.map((m, idx) => (
+              <div
+                key={`${m.local_path}-${idx}`}
+                className="flex items-center justify-between gap-2 px-3 py-1.5 rounded-lg bg-surface-2 border border-border-subtle font-mono text-[11px]"
+              >
+                <span className="text-zinc-200 truncate">{m.local_path}</span>
+                <span className="text-zinc-500">→</span>
+                <span className="text-indigo-300 truncate flex-1">{m.resource_uri}</span>
+                <span className="px-1.5 py-0.5 rounded bg-surface-1 text-[10px] text-zinc-400">
+                  {m.visibility}
+                </span>
+                <button
+                  onClick={() =>
+                    setDraft({
+                      ...draft,
+                      routing: {
+                        ...draft.routing,
+                        workspace_mappings: draft.routing.workspace_mappings.filter(
+                          (_, i) => i !== idx,
+                        ),
+                      },
+                    })
+                  }
+                  className="text-zinc-500 hover:text-rose-400"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            ))}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <input
+              value={newMapPath}
+              onChange={(e) => setNewMapPath(e.target.value)}
+              placeholder="~/work/my-repo"
+              className="flex-1 min-w-[160px] bg-surface-2 border border-border-subtle rounded-lg px-2.5 py-1.5 font-mono text-xs text-zinc-200"
+            />
+            <input
+              value={newMapUri}
+              onChange={(e) => setNewMapUri(e.target.value)}
+              placeholder="viking://resources/projects/my-repo/"
+              className="flex-1 min-w-[220px] bg-surface-2 border border-border-subtle rounded-lg px-2.5 py-1.5 font-mono text-xs text-zinc-200"
+            />
+            <select
+              value={newMapVis}
+              onChange={(e) => setNewMapVis(e.target.value as VisibilityScope)}
+              className="bg-surface-2 border border-border-subtle rounded-lg px-2 py-1.5 text-xs text-zinc-200"
+            >
+              <option value="shared">shared</option>
+              <option value="private">private</option>
+            </select>
+            <button
+              onClick={addMapping}
+              className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-surface-2 hover:bg-surface-3 border border-border-subtle text-xs text-zinc-200"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              添加
+            </button>
+          </div>
+        </div>
+
+        {/* Protected Rule Globs */}
+        <div className="space-y-2">
+          <div className="text-xs font-medium text-zinc-300">人工强约束规则只读保护（protected_rule_globs）</div>
+          <div className="flex flex-wrap gap-1.5">
+            {draft.routing.protected_rule_globs.map((g, idx) => (
+              <span
+                key={`${g}-${idx}`}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-surface-2 border border-border-subtle font-mono text-[11px] text-zinc-300"
+              >
+                {g}
+                <button
+                  onClick={() =>
+                    setDraft({
+                      ...draft,
+                      routing: {
+                        ...draft.routing,
+                        protected_rule_globs: draft.routing.protected_rule_globs.filter(
+                          (_, i) => i !== idx,
+                        ),
+                      },
+                    })
+                  }
+                  className="text-zinc-500 hover:text-rose-400"
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+          </div>
+          <div className="flex gap-2">
+            <input
+              value={newGlob}
+              onChange={(e) => setNewGlob(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && addGlob()}
+              placeholder="新增保护 Glob，如 **/SECURITY.md"
+              className="flex-1 bg-surface-2 border border-border-subtle rounded-lg px-2.5 py-1.5 font-mono text-xs text-zinc-200"
+            />
+            <button
+              onClick={addGlob}
+              className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-surface-2 hover:bg-surface-3 border border-border-subtle text-xs text-zinc-200"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              添加
+            </button>
+          </div>
         </div>
       </section>
 
@@ -115,7 +269,9 @@ export function PolicyView({ policy, onSave }: PolicyViewProps) {
                 className="p-3.5 rounded-lg bg-surface-2 border border-border-subtle space-y-3"
               >
                 <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold text-zinc-200">{AGENT_LABELS[agentId]}</span>
+                  <span className="text-xs font-semibold text-zinc-200">
+                    {AGENT_LABELS[agentId]}
+                  </span>
                   <span className="font-mono text-xs text-indigo-300">{tokens} tokens</span>
                 </div>
                 <input
@@ -173,25 +329,69 @@ export function PolicyView({ policy, onSave }: PolicyViewProps) {
       {/* 3. Dreaming & Archival */}
       <section className="rounded-xl bg-surface-1 border border-border-subtle p-5 space-y-4">
         <h2 className="text-sm font-semibold text-zinc-100">3. Dreaming 后台整理与冷记忆归档</h2>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-4 text-xs">
           <div className="space-y-1.5">
-            <label className="text-zinc-400">定时 Cron 表达式</label>
-            <input
-              value={draft.lifecycle.dreaming.cron}
+            <label className="text-zinc-400">触发模式</label>
+            <select
+              value={draft.lifecycle.dreaming.trigger}
               onChange={(e) =>
                 setDraft({
                   ...draft,
                   lifecycle: {
                     ...draft.lifecycle,
-                    dreaming: { ...draft.lifecycle.dreaming, cron: e.target.value },
+                    dreaming: {
+                      ...draft.lifecycle.dreaming,
+                      trigger: e.target.value as DreamingTrigger,
+                    },
                   },
                 })
               }
-              className="w-full bg-surface-2 border border-border-subtle rounded-lg px-3 py-2 font-mono text-zinc-200"
-            />
+              className="w-full bg-surface-2 border border-border-subtle rounded-lg px-3 py-2 text-zinc-200"
+            >
+              <option value="schedule">Cron 定时</option>
+              <option value="session_threshold">累计会话数阈值</option>
+              <option value="manual">仅手动触发</option>
+            </select>
           </div>
           <div className="space-y-1.5">
-            <label className="text-zinc-400">冷记忆归档天数（stale_days）</label>
+            <label className="text-zinc-400">定时 Cron / 会话阈值</label>
+            {draft.lifecycle.dreaming.trigger === "session_threshold" ? (
+              <input
+                type="number"
+                min={1}
+                value={draft.lifecycle.dreaming.session_threshold}
+                onChange={(e) =>
+                  setDraft({
+                    ...draft,
+                    lifecycle: {
+                      ...draft.lifecycle,
+                      dreaming: {
+                        ...draft.lifecycle.dreaming,
+                        session_threshold: Number(e.target.value),
+                      },
+                    },
+                  })
+                }
+                className="w-full bg-surface-2 border border-border-subtle rounded-lg px-3 py-2 font-mono text-zinc-200"
+              />
+            ) : (
+              <input
+                value={draft.lifecycle.dreaming.cron}
+                onChange={(e) =>
+                  setDraft({
+                    ...draft,
+                    lifecycle: {
+                      ...draft.lifecycle,
+                      dreaming: { ...draft.lifecycle.dreaming, cron: e.target.value },
+                    },
+                  })
+                }
+                className="w-full bg-surface-2 border border-border-subtle rounded-lg px-3 py-2 font-mono text-zinc-200"
+              />
+            )}
+          </div>
+          <div className="space-y-1.5">
+            <label className="text-zinc-400">冷记忆归档天数</label>
             <input
               type="number"
               min={7}

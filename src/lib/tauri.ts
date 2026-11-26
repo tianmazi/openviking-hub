@@ -21,7 +21,24 @@ async function callTauri<T>(cmd: string, args?: Record<string, unknown>): Promis
   return invoke<T>(cmd, args);
 }
 
-// Rich local preview state when running `npm run dev` in a standalone browser without Tauri
+let previewProfiles: ProfileStore = {
+  active: "default",
+  profiles: {
+    default: {
+      name: "default",
+      label: "Local / VPS OpenViking",
+      url: "http://127.0.0.1:1933",
+      api_key: "",
+    },
+    volcengine: {
+      name: "volcengine",
+      label: "Volcano Engine Managed",
+      url: "https://openviking.volcengine.example",
+      api_key: "",
+    },
+  },
+};
+
 let previewPolicy: PolicyConfig = {
   schema_version: 1,
   global: {
@@ -33,7 +50,13 @@ let previewPolicy: PolicyConfig = {
     auto_map_git_repo: true,
     respect_project_policy_file: true,
     inbox_uri: "viking://~/resources/inbox/",
-    protected_rule_globs: ["CLAUDE.md", "**/CLAUDE.md", "AGENTS.md", ".cursorrules", ".agents/rules/**"],
+    protected_rule_globs: [
+      "CLAUDE.md",
+      "**/CLAUDE.md",
+      "AGENTS.md",
+      ".cursorrules",
+      ".agents/rules/**",
+    ],
     workspace_mappings: [
       {
         local_path: "~/work/openviking-desktop",
@@ -57,7 +80,11 @@ let previewPolicy: PolicyConfig = {
       patterns: 200,
     },
     agent_overrides: {
-      "claude-code": { startup_max_bytes: 9500, default_recall_layer: "l0", max_recall_tokens: 2500 },
+      "claude-code": {
+        startup_max_bytes: 9500,
+        default_recall_layer: "l0",
+        max_recall_tokens: 2500,
+      },
       codex: { default_recall_layer: "l0", max_recall_tokens: 2000 },
       pi: { default_recall_layer: "l1", max_recall_tokens: 3000 },
       antigravity: { default_recall_layer: "l1", max_recall_tokens: 4000 },
@@ -103,9 +130,14 @@ let previewChanges: PendingMemoryChange[] = [
     category: "preferences",
     base_hash: "e3b0c44298fc1c149afbf4c8996fb924",
     before_content: "# Git Commit 规范\n\n使用中文自由格式编写 commit message。",
-    after_content: "# Git Commit 规范\n\n统一使用英文 Conventional Commits（feat/fix/chore/docs），保持标题 72 字符以内。",
+    after_content:
+      "# Git Commit 规范\n\n统一使用英文 Conventional Commits（feat/fix/chore/docs），保持标题 72 字符以内。",
     rationale: "检测到 Codex 与 Claude Code 近期会话要求使用 Conventional Commits，覆盖 10 月旧偏好。",
-    evidence_json: JSON.stringify({ hit_count: 14, agents: ["claude-code", "codex"], similarity: 0.91 }),
+    evidence_json: JSON.stringify({
+      hit_count: 14,
+      agents: ["claude-code", "codex"],
+      similarity: 0.91,
+    }),
     status: "pending",
   },
   {
@@ -156,32 +188,40 @@ let previewChanges: PendingMemoryChange[] = [
 export const api = {
   async getServerStatus(): Promise<ServerStatus> {
     if (isTauriRuntime()) return callTauri("get_server_status");
-    return { reachable: true, latency_ms: 18, url: "http://127.0.0.1:1933", error: null };
+    const active = previewProfiles.profiles[previewProfiles.active];
+    return {
+      reachable: true,
+      latency_ms: 18,
+      url: active?.url ?? "http://127.0.0.1:1933",
+      error: null,
+    };
+  },
+
+  async testConnection(
+    url: string,
+    apiKey: string,
+    account?: string,
+    user?: string,
+  ): Promise<ServerStatus> {
+    if (isTauriRuntime()) {
+      return callTauri("test_connection", {
+        url,
+        apiKey,
+        account: account ?? null,
+        user: user ?? null,
+      });
+    }
+    return { reachable: true, latency_ms: 21, url, error: null };
   },
 
   async getProfiles(): Promise<ProfileStore> {
     if (isTauriRuntime()) return callTauri("get_profiles");
-    return {
-      active: "default",
-      profiles: {
-        default: {
-          name: "default",
-          label: "Local / VPS OpenViking",
-          url: "http://127.0.0.1:1933",
-          api_key: "",
-        },
-        volcengine: {
-          name: "volcengine",
-          label: "Volcano Engine Managed",
-          url: "https://openviking.volcengine.example",
-          api_key: "",
-        },
-      },
-    };
+    return previewProfiles;
   },
 
   async saveProfiles(store: ProfileStore): Promise<ProfileStore> {
     if (isTauriRuntime()) return callTauri("save_profiles", { store });
+    previewProfiles = store;
     return store;
   },
 
@@ -210,7 +250,8 @@ export const api = {
         binary_path: "/usr/local/bin/codex",
         config_path: "~/.codex/config.toml",
         version: "codex 0.14.0",
-        warning: '首次启动 Codex 时会提示 "Hooks need review"，请在终端选择 Trust all and continue。',
+        warning:
+          '首次启动 Codex 时会提示 "Hooks need review"，请在终端选择 Trust all and continue。',
         legacy_memory_files: [],
       },
       {
@@ -269,6 +310,13 @@ export const api = {
     return { ...target, connected: false };
   },
 
+  async importLegacyMemory(localPath: string, targetUri: string): Promise<unknown> {
+    if (isTauriRuntime()) {
+      return callTauri("import_legacy_memory", { localPath, targetUri });
+    }
+    return { status: "ok", localPath, targetUri };
+  },
+
   async getPolicy(): Promise<PolicyConfig> {
     if (isTauriRuntime()) return callTauri("get_policy");
     return previewPolicy;
@@ -291,26 +339,88 @@ export const api = {
     return previewPolicy;
   },
 
-  async fsLs(uri: string): Promise<Array<{ name: string; uri: string; isDir?: boolean; size?: number }>> {
+  async fsLs(
+    uri: string,
+  ): Promise<Array<{ name: string; uri: string; isDir?: boolean; size?: number }>> {
     if (isTauriRuntime()) {
       const res = await callTauri<unknown>("fs_ls", { uri });
       return Array.isArray(res) ? res : [];
     }
     if (uri === "viking://user/memories/") {
       return [
-        { name: "preferences/git-commit.md", uri: "viking://user/memories/preferences/git-commit.md", isDir: false, size: 412 },
-        { name: "profile/coding-style.md", uri: "viking://user/memories/profile/coding-style.md", isDir: false, size: 680 },
-        { name: "entities/openviking-cluster.md", uri: "viking://user/memories/entities/openviking-cluster.md", isDir: false, size: 520 },
+        {
+          name: "preferences/git-commit.md",
+          uri: "viking://user/memories/preferences/git-commit.md",
+          isDir: false,
+          size: 412,
+        },
+        {
+          name: "profile/coding-style.md",
+          uri: "viking://user/memories/profile/coding-style.md",
+          isDir: false,
+          size: 680,
+        },
+        {
+          name: "entities/openviking-cluster.md",
+          uri: "viking://user/memories/entities/openviking-cluster.md",
+          isDir: false,
+          size: 520,
+        },
       ];
     }
     if (uri === "viking://~/resources/inbox/") {
       return [
-        { name: "auth-v2-notes.md", uri: "viking://~/resources/inbox/auth-v2-notes.md", isDir: false, size: 245 },
+        {
+          name: "auth-v2-notes.md",
+          uri: "viking://~/resources/inbox/auth-v2-notes.md",
+          isDir: false,
+          size: 245,
+        },
       ];
     }
     return [
-      { name: "openviking-desktop/", uri: "viking://resources/projects/openviking-desktop/", isDir: true },
-      { name: "ARCHITECTURE.md", uri: "viking://resources/projects/openviking-desktop/ARCHITECTURE.md", isDir: false, size: 2410 },
+      {
+        name: "openviking-desktop/",
+        uri: "viking://resources/projects/openviking-desktop/",
+        isDir: true,
+      },
+      {
+        name: "ARCHITECTURE.md",
+        uri: "viking://resources/projects/openviking-desktop/ARCHITECTURE.md",
+        isDir: false,
+        size: 2410,
+      },
+    ];
+  },
+
+  async fsDelete(uri: string, recursive = false): Promise<unknown> {
+    if (isTauriRuntime()) return callTauri("fs_delete", { uri, recursive });
+    return { status: "ok", uri };
+  },
+
+  async searchFind(
+    query: string,
+    targetUri?: string,
+  ): Promise<Array<{ name: string; uri: string; isDir?: boolean }>> {
+    if (isTauriRuntime()) {
+      const res = await callTauri<unknown>("search_find", {
+        query,
+        targetUri: targetUri ?? null,
+        limit: 20,
+      });
+      const arr = Array.isArray(res) ? res : [];
+      return arr.map((item: { uri?: string; name?: string }) => ({
+        name: item.name ?? item.uri?.split("/").pop() ?? "result",
+        uri: item.uri ?? "",
+        isDir: false,
+      }));
+    }
+    return [
+      {
+        name: `命中结果: ${query} (git-commit.md)`,
+        uri: "viking://user/memories/preferences/git-commit.md",
+        isDir: false,
+      },
     ];
   },
 

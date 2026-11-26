@@ -4,7 +4,7 @@ use ov_core::dreaming::engine::{
     apply_accepted_changes as engine_apply, rollback_dreaming_run as engine_rollback,
     run_dreaming as engine_run, ApplyReport,
 };
-use ov_core::ov_client::{OvClient, ProfileStore, ServerStatus};
+use ov_core::ov_client::{FindRequest, OvCliConfig, OvClient, ProfileStore, ServerStatus};
 use ov_core::platform::{PlatformPaths, WslDistroInfo};
 use ov_core::policy::model::{AgentId, PendingMemoryChange, PolicyConfig, ReviewStatus};
 use ov_core::policy::store::PolicyStore;
@@ -23,6 +23,25 @@ pub struct LayeredContent {
 #[tauri::command]
 pub async fn get_server_status() -> Result<ServerStatus, String> {
     let client = OvClient::from_local_config().map_err(|e| e.to_string())?;
+    Ok(client.status().await)
+}
+
+#[tauri::command]
+pub async fn test_connection(
+    url: String,
+    api_key: String,
+    account: Option<String>,
+    user: Option<String>,
+) -> Result<ServerStatus, String> {
+    let cfg = OvCliConfig {
+        url,
+        api_key,
+        account,
+        user,
+        timeout: 15.0,
+        output: "json".to_string(),
+    };
+    let client = OvClient::new(&cfg).map_err(|e| e.to_string())?;
     Ok(client.status().await)
 }
 
@@ -69,8 +88,10 @@ pub fn disconnect_agent(agent_id: AgentId) -> Result<AgentStatus, String> {
 
 #[tauri::command]
 pub async fn import_legacy_memory(local_path: String, target_uri: String) -> Result<Value, String> {
-    let content = std::fs::read_to_string(&local_path)
-        .map_err(|e| format!("Failed to read {}: {}", local_path, e))?;
+    let paths = PlatformPaths::detect().ok_or("Cannot resolve home directory")?;
+    let resolved = paths.expand_tilde(std::path::Path::new(&local_path));
+    let content = std::fs::read_to_string(&resolved)
+        .map_err(|e| format!("Failed to read {}: {}", resolved.display(), e))?;
     let client = OvClient::from_local_config().map_err(|e| e.to_string())?;
     client
         .write_content(&target_uri, &content)
@@ -101,6 +122,38 @@ pub fn toggle_privacy_mode(capture_enabled: bool) -> Result<PolicyConfig, String
 pub async fn fs_ls(uri: String) -> Result<Value, String> {
     let client = OvClient::from_local_config().map_err(|e| e.to_string())?;
     client.ls(&uri).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn fs_mkdir(uri: String) -> Result<Value, String> {
+    let client = OvClient::from_local_config().map_err(|e| e.to_string())?;
+    client.mkdir(&uri).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn fs_delete(uri: String, recursive: bool) -> Result<Value, String> {
+    let client = OvClient::from_local_config().map_err(|e| e.to_string())?;
+    client
+        .delete_fs(&uri, recursive)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn search_find(
+    query: String,
+    target_uri: Option<String>,
+    limit: Option<usize>,
+) -> Result<Value, String> {
+    let client = OvClient::from_local_config().map_err(|e| e.to_string())?;
+    client
+        .find(&FindRequest {
+            query,
+            target_uri,
+            limit,
+        })
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

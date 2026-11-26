@@ -13,6 +13,7 @@ import type {
 } from "./types/openviking";
 import { Sidebar, type NavTab } from "./components/Sidebar";
 import { CommandPalette } from "./components/CommandPalette";
+import { ProfileModal } from "./components/ProfileModal";
 import { AgentsView } from "./components/AgentsView";
 import { ExplorerView } from "./components/ExplorerView";
 import { EventsView } from "./components/EventsView";
@@ -22,6 +23,7 @@ import { DreamingWorkbench } from "./components/DreamingWorkbench";
 export default function App() {
   const [activeTab, setActiveTab] = useState<NavTab>("agents");
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [profileModalOpen, setProfileModalOpen] = useState(false);
   const [serverStatus, setServerStatus] = useState<ServerStatus | null>(null);
   const [profiles, setProfiles] = useState<ProfileStore | null>(null);
   const [agents, setAgents] = useState<AgentStatus[]>([]);
@@ -61,12 +63,15 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
-  const handleSwitchProfile = async (name: string) => {
-    if (!profiles) return;
-    const next = { ...profiles, active: name };
+  const handleSaveProfiles = async (next: ProfileStore) => {
     await api.saveProfiles(next);
     setProfiles(next);
     setServerStatus(await api.getServerStatus());
+  };
+
+  const handleSwitchProfile = async (name: string) => {
+    if (!profiles) return;
+    await handleSaveProfiles({ ...profiles, active: name });
   };
 
   const handleTogglePrivacy = async () => {
@@ -83,6 +88,12 @@ export default function App() {
   const handleDisconnectAgent = async (id: AgentId) => {
     const updated = await api.disconnectAgent(id);
     setAgents((prev) => prev.map((a) => (a.agent_id === id ? updated : a)));
+  };
+
+  const handleImportLegacy = async (localPath: string, agentId: AgentId) => {
+    const fileName = localPath.split(/[\\/]/).pop() || "legacy.md";
+    const targetUri = `viking://~/resources/inbox/imported-${agentId}-${fileName}`;
+    await api.importLegacyMemory(localPath, targetUri);
   };
 
   const handleTriggerDreaming = async () => {
@@ -123,6 +134,7 @@ export default function App() {
         serverStatus={serverStatus}
         profiles={profiles}
         onSwitchProfile={handleSwitchProfile}
+        onManageProfiles={() => setProfileModalOpen(true)}
         captureEnabled={policy?.global.capture_enabled ?? true}
         onTogglePrivacy={handleTogglePrivacy}
         pendingDreamCount={pendingDreamCount}
@@ -137,6 +149,7 @@ export default function App() {
             onRefresh={async () => setAgents(await api.detectAgents())}
             onConnect={handleConnectAgent}
             onDisconnect={handleDisconnectAgent}
+            onImportLegacy={handleImportLegacy}
           />
         )}
         {activeTab === "explorer" && <ExplorerView />}
@@ -169,6 +182,13 @@ export default function App() {
         onSelectTab={setActiveTab}
         onTriggerDreaming={handleTriggerDreaming}
         onTogglePrivacy={handleTogglePrivacy}
+      />
+
+      <ProfileModal
+        open={profileModalOpen}
+        store={profiles}
+        onClose={() => setProfileModalOpen(false)}
+        onSaveStore={handleSaveProfiles}
       />
     </div>
   );

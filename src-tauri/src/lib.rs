@@ -19,14 +19,25 @@ pub fn run() {
             Some(vec!["--minimized"]),
         ))
         .setup(|app| {
-            // Initialize policy & local SQLite database on startup
             let _ = PolicyStore::load_or_init();
             let _ = DesktopDb::open_default();
 
-            // Tray-First menu bar setup
-            let open_item = MenuItem::with_id(app, "open", "打开 OpenViking 控制台", true, None::<&str>)?;
-            let privacy_item = MenuItem::with_id(app, "toggle_privacy", "切换隐私模式（暂停捕获）", true, None::<&str>)?;
-            let dream_item = MenuItem::with_id(app, "run_dreaming", "立即执行 Dreaming 整理", true, None::<&str>)?;
+            let open_item =
+                MenuItem::with_id(app, "open", "打开 OpenViking 控制台", true, None::<&str>)?;
+            let privacy_item = MenuItem::with_id(
+                app,
+                "toggle_privacy",
+                "切换隐私模式（暂停捕获）",
+                true,
+                None::<&str>,
+            )?;
+            let dream_item = MenuItem::with_id(
+                app,
+                "run_dreaming",
+                "立即执行 Dreaming 整理",
+                true,
+                None::<&str>,
+            )?;
             let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open_item, &privacy_item, &dream_item, &quit_item])?;
 
@@ -44,7 +55,8 @@ pub fn run() {
                         if let Ok(mut policy) = PolicyStore::load_or_init() {
                             policy.global.capture_enabled = !policy.global.capture_enabled;
                             let _ = PolicyStore::save(&policy);
-                            let _ = app.emit("policy://privacy-changed", policy.global.capture_enabled);
+                            let _ =
+                                app.emit("policy://privacy-changed", policy.global.capture_enabled);
                         }
                     }
                     "run_dreaming" => {
@@ -58,7 +70,8 @@ pub fn run() {
                                 if let Ok((run, staged)) =
                                     run_dreaming(&client, &db, &policy, "tray_manual").await
                                 {
-                                    let _ = handle.emit("dreaming://completed", (run, staged.len()));
+                                    let _ =
+                                        handle.emit("dreaming://completed", (run, staged.len()));
                                 }
                             }
                         });
@@ -92,7 +105,7 @@ pub fn run() {
             }
             let _tray = tray_builder.build(app)?;
 
-            // Background Cron scheduler for Dreaming
+            // Background Dreaming scheduler (supports both Cron Schedule and SessionThreshold)
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 loop {
@@ -100,28 +113,62 @@ pub fn run() {
                     let Ok(policy) = PolicyStore::load_or_init() else {
                         continue;
                     };
-                    if !policy.lifecycle.dreaming.enabled
-                        || policy.lifecycle.dreaming.trigger != DreamingTrigger::Schedule
-                    {
+                    if !policy.lifecycle.dreaming.enabled {
                         continue;
                     }
-                    let expr = normalize_cron(&policy.lifecycle.dreaming.cron);
-                    let Ok(schedule) = cron::Schedule::from_str(&expr) else {
-                        continue;
+                    let should_run = match policy.lifecycle.dreaming.trigger {
+                        DreamingTrigger::Schedule => {
+                            let expr = normalize_cron(&policy.lifecycle.dreaming.cron);
+                            cron::Schedule::from_str(&expr)
+                                .ok()
+                                .and_then(|s| s.upcoming(chrono::Utc).next())
+                                .map(|next| {
+                                    let diff = (next - chrono::Utc::now()).num_seconds();
+                                    (0..=60).contains(&diff)
+                                })
+                                .unwrap_or(false)
+                        }
+                        DreamingTrigger::SessionThreshold => {
+                            if let Ok(db) = DesktopDb::open_default() {
+                                let last_ts = db
+                                    .list_runs(1)
+                                    .ok()
+                                    .and_then(|r| r.first().map(|x| x.started_at))
+                                    .unwrap_or(0);
+                                let new_sessions = db
+                                    .list_events(None, 200)
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .filter(|e| {
+                                        e.created_at > last_ts
+                                            && (e.event_type == "hook_stop"
+                                                || e.event_type == "capture")
+                                    })
+                                    .count();
+                                new_sessions >= policy.lifecycle.dreaming.session_threshold as usize
+                            } else {
+                                false
+                            }
+                        }
+                        DreamingTrigger::Manual => false,
                     };
-                    let now = chrono::Utc::now();
-                    if let Some(next) = schedule.upcoming(chrono::Utc).next() {
-                        let diff = (next - now).num_seconds();
-                        if (0..=60).contains(&diff) {
-                            if let (Ok(client), Ok(db)) =
-                                (OvClient::from_local_config(), DesktopDb::open_default())
+
+                    if should_run {
+                        if let (Ok(client), Ok(db)) =
+                            (OvClient::from_local_config(), DesktopDb::open_default())
+                        {
+                            let source = if policy.lifecycle.dreaming.trigger
+                                == DreamingTrigger::SessionThreshold
                             {
-                                if let Ok((run, staged)) =
-                                    run_dreaming(&client, &db, &policy, "schedule").await
-                                {
-                                    let _ = app_handle
-                                        .emit("dreaming://completed", (run, staged.len()));
-                                }
+                                "session_threshold"
+                            } else {
+                                "schedule"
+                            };
+                            if let Ok((run, staged)) =
+                                run_dreaming(&client, &db, &policy, source).await
+                            {
+                                let _ =
+                                    app_handle.emit("dreaming://completed", (run, staged.len()));
                             }
                         }
                     }
@@ -132,6 +179,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_server_status,
+            commands::test_connection,
             commands::get_profiles,
             commands::save_profiles,
             commands::detect_agents,
@@ -143,6 +191,9 @@ pub fn run() {
             commands::save_policy,
             commands::toggle_privacy_mode,
             commands::fs_ls,
+            commands::fs_mkdir,
+            commands::fs_delete,
+            commands::search_find,
             commands::read_uri_layers,
             commands::write_uri_content,
             commands::list_recall_events,

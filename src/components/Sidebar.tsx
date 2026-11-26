@@ -5,6 +5,7 @@ import {
   GitPullRequestDraft,
   Search,
   Server,
+  Settings2,
   ShieldAlert,
   ShieldCheck,
   Sliders,
@@ -19,6 +20,7 @@ interface SidebarProps {
   serverStatus: ServerStatus | null;
   profiles: ProfileStore | null;
   onSwitchProfile: (name: string) => void;
+  onManageProfiles: () => void;
   captureEnabled: boolean;
   onTogglePrivacy: () => void;
   pendingDreamCount: number;
@@ -31,6 +33,7 @@ export function Sidebar({
   serverStatus,
   profiles,
   onSwitchProfile,
+  onManageProfiles,
   captureEnabled,
   onTogglePrivacy,
   pendingDreamCount,
@@ -57,7 +60,6 @@ export function Sidebar({
   return (
     <aside className="w-60 shrink-0 bg-surface-1 border-r border-border-subtle flex flex-col justify-between select-none">
       <div className="p-3 space-y-4">
-        {/* Brand + Status */}
         <div className="flex items-center justify-between px-1.5">
           <div className="flex items-center gap-2">
             <div className="w-6 h-6 rounded-md bg-indigo-500/20 border border-indigo-400/30 flex items-center justify-center text-indigo-400 font-bold text-xs">
@@ -83,7 +85,6 @@ export function Sidebar({
           </span>
         </div>
 
-        {/* Cmd+K Search trigger */}
         <button
           onClick={onOpenPalette}
           className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-surface-2 hover:bg-surface-3 border border-border-subtle text-xs text-zinc-400 transition-colors"
@@ -97,11 +98,19 @@ export function Sidebar({
           </kbd>
         </button>
 
-        {/* Remote Profile Switcher */}
         <div className="space-y-1.5">
-          <div className="px-1.5 flex items-center gap-1.5 text-[11px] font-medium text-zinc-500 uppercase tracking-wider">
-            <Server className="w-3 h-3" />
-            远端实例 Profile
+          <div className="px-1.5 flex items-center justify-between text-[11px] font-medium text-zinc-500 uppercase tracking-wider">
+            <span className="flex items-center gap-1.5">
+              <Server className="w-3 h-3" />
+              远端实例 Profile
+            </span>
+            <button
+              onClick={onManageProfiles}
+              className="text-zinc-400 hover:text-indigo-300"
+              title="管理远端实例"
+            >
+              <Settings2 className="w-3.5 h-3.5" />
+            </button>
           </div>
           <select
             value={profiles?.active ?? "default"}
@@ -117,7 +126,6 @@ export function Sidebar({
           </select>
         </div>
 
-        {/* Main Navigation */}
         <nav className="space-y-0.5">
           {navItems.map((item) => {
             const Icon = item.icon;
@@ -147,7 +155,6 @@ export function Sidebar({
         </nav>
       </div>
 
-      {/* Privacy Mode Footer Toggle */}
       <div className="p-3 border-t border-border-subtle">
         <button
           onClick={onTogglePrivacy}

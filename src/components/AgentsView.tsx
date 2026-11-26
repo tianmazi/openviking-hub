@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { AlertTriangle, CheckCircle2, Plug, RefreshCw, Terminal, Unplug } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Plug, RefreshCw, Terminal, Unplug, Upload } from "lucide-react";
 import type { AgentId, AgentStatus, WslDistroInfo } from "../types/openviking";
 
 interface AgentsViewProps {
@@ -8,6 +8,7 @@ interface AgentsViewProps {
   onRefresh: () => void;
   onConnect: (id: AgentId, writeRules: boolean) => Promise<void>;
   onDisconnect: (id: AgentId) => Promise<void>;
+  onImportLegacy: (localPath: string, agentId: AgentId) => Promise<void>;
 }
 
 export function AgentsView({
@@ -16,23 +17,42 @@ export function AgentsView({
   onRefresh,
   onConnect,
   onDisconnect,
+  onImportLegacy,
 }: AgentsViewProps) {
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [importingFile, setImportingFile] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [writeAntigravityRules, setWriteAntigravityRules] = useState(true);
 
   const handleToggle = async (agent: AgentStatus) => {
     setBusyId(agent.id);
+    setNotice(null);
     try {
       if (agent.connected) {
         await onDisconnect(agent.agent_id);
+        setNotice(`已安全卸载 ${agent.name} 接入配置（原配置已备份）。`);
       } else {
         await onConnect(
           agent.agent_id,
           agent.agent_id === "antigravity" ? writeAntigravityRules : false,
         );
+        setNotice(`已成功为 ${agent.name} 注入 ov-bridge 配置。`);
       }
     } finally {
       setBusyId(null);
+    }
+  };
+
+  const handleImport = async (file: string, agentId: AgentId) => {
+    setImportingFile(file);
+    setNotice(null);
+    try {
+      await onImportLegacy(file, agentId);
+      setNotice(`已将原生记忆文件 ${file} 冷启动导入至 OpenViking 远端空间。`);
+    } catch (e) {
+      setNotice(`导入失败：${String(e)}`);
+    } finally {
+      setImportingFile(null);
     }
   };
 
@@ -55,6 +75,12 @@ export function AgentsView({
           重新探测
         </button>
       </div>
+
+      {notice && (
+        <div className="px-3.5 py-2.5 rounded-lg bg-indigo-500/10 border border-indigo-500/25 text-xs text-indigo-200">
+          {notice}
+        </div>
+      )}
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {agents.map((agent) => (
@@ -115,11 +141,24 @@ export function AgentsView({
               )}
 
               {agent.legacy_memory_files.length > 0 && (
-                <div className="text-[11px] text-zinc-400">
-                  发现原生记忆文件：
-                  <span className="font-mono text-indigo-300 ml-1">
-                    {agent.legacy_memory_files.join(", ")}
-                  </span>
+                <div className="space-y-1.5 pt-1">
+                  <div className="text-[11px] text-zinc-400">原生历史记忆（冷启动导入）：</div>
+                  {agent.legacy_memory_files.map((file) => (
+                    <div
+                      key={file}
+                      className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-surface-2 border border-border-subtle text-[11px]"
+                    >
+                      <span className="font-mono text-indigo-300 truncate">{file}</span>
+                      <button
+                        disabled={importingFile === file}
+                        onClick={() => void handleImport(file, agent.agent_id)}
+                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-indigo-500/15 hover:bg-indigo-500/25 text-indigo-200 shrink-0"
+                      >
+                        <Upload className="w-3 h-3" />
+                        {importingFile === file ? "导入中..." : "导入远端"}
+                      </button>
+                    </div>
+                  ))}
                 </div>
               )}
             </div>

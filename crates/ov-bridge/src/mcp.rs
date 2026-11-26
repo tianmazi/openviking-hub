@@ -1,7 +1,7 @@
 use chrono::Utc;
 use ov_core::dreaming::db::{DesktopDb, RecallEvent};
 use ov_core::ov_client::{ContextSearchRequest, OvClient};
-use ov_core::policy::model::AgentId;
+use ov_core::policy::model::{AgentId, ContextLayer};
 use ov_core::policy::router::{is_protected_rule_path, resolve_route};
 use ov_core::policy::store::PolicyStore;
 use serde_json::{json, Value};
@@ -28,7 +28,6 @@ pub async fn run_stdio_server(agent: AgentId) -> anyhow::Result<()> {
         let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
 
-        // Notifications have no id and require no response
         if id.is_none() {
             continue;
         }
@@ -91,7 +90,7 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "recall",
-            "description": "Search shared OpenViking memories and project resources with policy-governed L0/L1/L2 token budgeting.",
+            "description": "Search shared OpenViking memories and project resources with policy-governed L0/L1/L2 token budgeting and automatic L0->L1 expansion.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -148,7 +147,6 @@ async fn handle_tool_call(agent: AgentId, params: &Value) -> Result<String, Stri
         .ok_or("Missing tool name")?;
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
 
-    // Hot-reload policy & client config on every call (zero restart needed)
     let policy = PolicyStore::load_or_init().map_err(|e| e.to_string())?;
     let budget = policy.budget.resolve_for(agent);
     let client = OvClient::from_local_config().map_err(|e| e.to_string())?;
@@ -179,10 +177,29 @@ async fn handle_tool_call(agent: AgentId, params: &Value) -> Result<String, Stri
                 .await
                 .map_err(|e| e.to_string())?;
 
-            let text = truncate_to_token_budget(
-                &serde_json::to_string_pretty(&res).unwrap_or_default(),
-                budget.max_recall_tokens,
-            );
+            let mut effective_layer = budget.default_recall_layer;
+            let mut combined = serde_json::to_string_pretty(&res).unwrap_or_default();
+
+            // Progressive L0 -> L1 auto-expansion when top hit exceeds threshold
+            if effective_layer == ContextLayer::L0 {
+                if let Some((top_uri, top_score)) = extract_top_hit(&res) {
+                    if top_score >= budget.auto_expand_l1_threshold as f64 {
+                        if let Ok(l1_val) = client.read_content(&top_uri, "l1").await {
+                            let l1_text = l1_val
+                                .as_str()
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| serde_json::to_string_pretty(&l1_val).unwrap_or_default());
+                            combined.push_str(&format!(
+                                "\n\n--- Auto-Expanded L1 Overview ({} | score {:.2}) ---\n{}",
+                                top_uri, top_score, l1_text
+                            ));
+                            effective_layer = ContextLayer::L1;
+                        }
+                    }
+                }
+            }
+
+            let text = truncate_to_token_budget(&combined, budget.max_recall_tokens);
             let approx_tokens = (text.len() / 4) as i64;
 
             if let Some(db) = db {
@@ -192,7 +209,7 @@ async fn handle_tool_call(agent: AgentId, params: &Value) -> Result<String, Stri
                     event_type: "recall".to_string(),
                     query: Some(query.to_string()),
                     target_uri,
-                    layer: Some(budget.default_recall_layer.as_str().to_string()),
+                    layer: Some(effective_layer.as_str().to_string()),
                     tokens_used: approx_tokens,
                     latency_ms: start.elapsed().as_millis() as i64,
                     blocked_by_privacy: false,
@@ -235,7 +252,10 @@ async fn handle_tool_call(agent: AgentId, params: &Value) -> Result<String, Stri
                         created_at: Utc::now().timestamp(),
                     });
                 }
-                return Ok("Privacy Mode is enabled in OpenViking Desktop; memory write skipped.".to_string());
+                return Ok(
+                    "Privacy Mode is enabled in OpenViking Desktop; memory write skipped."
+                        .to_string(),
+                );
             }
 
             if is_protected_rule_path(&policy, &uri) {
@@ -290,6 +310,28 @@ async fn handle_tool_call(agent: AgentId, params: &Value) -> Result<String, Stri
         }
         _ => Err(format!("Unknown tool: {}", name)),
     }
+}
+
+fn extract_top_hit(val: &Value) -> Option<(String, f64)> {
+    let arr = val
+        .as_array()
+        .or_else(|| val.get("items").and_then(|i| i.as_array()))
+        .or_else(|| val.get("results").and_then(|i| i.as_array()))?;
+    let mut best: Option<(String, f64)> = None;
+    for item in arr {
+        let Some(uri) = item.get("uri").and_then(|u| u.as_str()) else {
+            continue;
+        };
+        let score = item
+            .get("score")
+            .or_else(|| item.get("similarity"))
+            .and_then(|s| s.as_f64())
+            .unwrap_or(0.0);
+        if best.as_ref().map(|(_, s)| score > *s).unwrap_or(true) {
+            best = Some((uri.to_string(), score));
+        }
+    }
+    best
 }
 
 pub fn truncate_to_token_budget(text: &str, max_tokens: usize) -> String {
