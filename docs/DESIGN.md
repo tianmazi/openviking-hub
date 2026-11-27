@@ -55,3 +55,12 @@ openviking-desktop/
 2. **Analyze（只读分析）**：并行运行 Inbox 分拣、冲突合并（仅限可变类 `profile`/`preferences`/`entities`，跳过不可变类与 `protected_rule_globs`）、冷热升降级/归档、Wiki 编译 4 个分析器。
 3. **Stage（暂存）**：连同目标 URI 的 SHA-256 `base_hash` 存入 `~/.openviking/desktop.db` 的 `pending_memory_changes` 表，推送托盘红点与审核台。
 4. **Commit（原子提交）**：用户审批（可在线编辑终稿）后，调用 `POST /api/v1/snapshot/commit` 创建快照 → 校验 `remote_hash == base_hash`（防并发覆盖）→ 批量写入/移动/触发 `ov compile` → 记录 `snapshot_id` 支持随时 `POST /api/v1/snapshot/restore` 一键回滚。
+
+
+## 6. Agent Capture Queue & Sync Guarantees
+
+- The bridge captures textual user/assistant transcript records, strips injected `<openviking_memory_reference>` blocks (it does **not** redact credentials or secrets — enable Privacy Mode when working with sensitive data), and stores deduplicated messages in the active server profile's SQLite outbox (`capture_outbox`).
+- `Stop`, `PreCompact`, and `SessionEnd` hooks enqueue work; a short-lived sync process sends it to a reused OpenViking session and commits each delivered batch. Run `ov-bridge sync` to retry a connection failure and `ov-bridge doctor` to inspect pending/sent/uncertain counts.
+- An uncertain append is not replayed automatically; after the previous request has settled, manual `ov-bridge sync` checks the dedicated remote session's total message count before resuming. A failed commit can be retried without resending acknowledged messages.
+- Git auto-routing hashes the normalized remote; existing projects may retain their old resource directory via explicit `workspace_mappings` or `RESOURCE_POLICY.md`.
+- Project-scoped capture tags messages with a stable native OpenViking Peer derived from the resolved resource root. Set `global.capture_commit_tokens` in `~/.openviking/policy.toml` to batch queued messages by approximate token count (`0` = every completed turn, default). `PreCompact` and `SessionEnd` force a flush; manual `ov-bridge sync` drains the active profile regardless of the threshold.
