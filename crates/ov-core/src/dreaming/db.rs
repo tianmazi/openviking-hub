@@ -36,6 +36,14 @@ pub struct RecallEvent {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RecallHitRecord {
+    pub memory_uri: String,
+    pub score: f64,
+    pub injected: bool,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommittedTranscriptRow {
     pub seq: i64,
@@ -173,6 +181,7 @@ impl DesktopDb {
                 memory_uri TEXT NOT NULL,
                 score REAL NOT NULL,
                 injected INTEGER NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (event_id, memory_uri)
             );
             CREATE TABLE IF NOT EXISTS capture_tasks (
@@ -248,6 +257,7 @@ impl DesktopDb {
                     [],
                 ).map_err(|e| e.to_string())?;
             }
+            let _ = tx.execute("ALTER TABLE recall_hits ADD COLUMN reason TEXT NOT NULL DEFAULT ''", []);
         }
         tx.execute_batch(
             "INSERT OR IGNORE INTO scoped_pinned_uris (profile_key, uri, created_at)
@@ -294,13 +304,66 @@ impl DesktopDb {
     }
 
     pub fn record_recall_hits(&self, event_id: &str, hits: &[(String, f64, bool)]) -> Result<(), String> {
+        let detailed: Vec<RecallHitRecord> = hits
+            .iter()
+            .map(|(uri, score, injected)| RecallHitRecord {
+                memory_uri: uri.clone(),
+                score: *score,
+                injected: *injected,
+                reason: if *injected { "injected".to_string() } else { "skipped".to_string() },
+            })
+            .collect();
+        self.record_recall_hit_details(event_id, &detailed)
+    }
+
+    pub fn record_recall_hit_details(
+        &self,
+        event_id: &str,
+        hits: &[RecallHitRecord],
+    ) -> Result<(), String> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
-        for (uri, score, injected) in hits {
-            tx.execute("INSERT OR IGNORE INTO recall_hits(event_id,memory_uri,score,injected) VALUES (?1,?2,?3,?4)",
-                params![event_id,uri,score,*injected]).map_err(|e| e.to_string())?;
+        for hit in hits {
+            tx.execute(
+                "INSERT OR REPLACE INTO recall_hits(event_id, memory_uri, score, injected, reason) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![event_id, hit.memory_uri, hit.score, i64::from(hit.injected), hit.reason],
+            )
+            .map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub fn list_recall_hits_for_event(&self, event_id: &str) -> Result<Vec<RecallHitRecord>, String> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT memory_uri, score, injected, reason
+                 FROM recall_hits
+                 WHERE event_id = ?1
+                 ORDER BY injected DESC, score DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![event_id], |r| {
+                let injected: i64 = r.get(2)?;
+                let reason: String = r.get(3)?;
+                Ok(RecallHitRecord {
+                    memory_uri: r.get(0)?,
+                    score: r.get(1)?,
+                    injected: injected != 0,
+                    reason: if reason.is_empty() {
+                        if injected != 0 { "injected".to_string() } else { "skipped".to_string() }
+                    } else {
+                        reason
+                    },
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| e.to_string())?);
+        }
+        Ok(out)
     }
 
     pub fn list_events_for_profile(
@@ -1139,5 +1202,38 @@ mod tests {
         assert_eq!(max_seq, rows.last().unwrap().seq);
         let next = db.recent_committed_transcripts_for_profile("p1", max_seq, 10).unwrap();
         assert!(next.is_empty());
+    }
+
+    #[test]
+    fn recall_hit_details_roundtrip_and_ordering() {
+        let db = DesktopDb::open_in_memory().unwrap();
+        let details = vec![
+            RecallHitRecord {
+                memory_uri: "viking://~/memories/cases/low.md".into(),
+                score: 0.42,
+                injected: false,
+                reason: "below_min_score".into(),
+            },
+            RecallHitRecord {
+                memory_uri: "viking://~/memories/preferences/top.md".into(),
+                score: 0.91,
+                injected: true,
+                reason: "injected_l1".into(),
+            },
+            RecallHitRecord {
+                memory_uri: "viking://~/memories/events/old.md".into(),
+                score: 0.80,
+                injected: false,
+                reason: "expired".into(),
+            },
+        ];
+        db.record_recall_hit_details("ev-inspect-1", &details).unwrap();
+        let loaded = db.list_recall_hits_for_event("ev-inspect-1").unwrap();
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded[0].memory_uri, "viking://~/memories/preferences/top.md");
+        assert!(loaded[0].injected);
+        assert_eq!(loaded[0].reason, "injected_l1");
+        assert_eq!(loaded[1].reason, "expired");
+        assert_eq!(loaded[2].reason, "below_min_score");
     }
 }

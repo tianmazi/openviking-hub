@@ -1,6 +1,6 @@
 use ov_core::adapters::wsl::inject_wsl_home;
 use ov_core::adapters::{AdapterRegistry, AgentStatus, ConnectOptions};
-use ov_core::dreaming::db::{DesktopDb, DreamingRun, RecallEvent};
+use ov_core::dreaming::db::{DesktopDb, DreamingRun, RecallEvent, RecallHitRecord};
 use ov_core::dreaming::engine::{
     apply_accepted_changes as engine_apply, rollback_dreaming_run as engine_rollback,
     run_dreaming as engine_run, ApplyReport,
@@ -217,6 +217,12 @@ pub fn list_recall_events(
     let client = OvClient::from_local_config().map_err(|e| e.to_string())?;
     let db = DesktopDb::open_default()?;
     db.list_events_for_profile(&client.profile_key(), agent_filter.as_deref(), limit.unwrap_or(100))
+}
+
+#[tauri::command]
+pub fn list_recall_hits(event_id: String) -> Result<Vec<RecallHitRecord>, String> {
+    let db = DesktopDb::open_default()?;
+    db.list_recall_hits_for_event(&event_id)
 }
 
 #[tauri::command]

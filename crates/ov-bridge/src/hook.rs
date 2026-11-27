@@ -1,6 +1,6 @@
 use crate::mcp::{find_scopes, is_recall_excluded, render_recall};
 use chrono::Utc;
-use ov_core::dreaming::db::{DesktopDb, RecallEvent};
+use ov_core::dreaming::db::{DesktopDb, RecallEvent, RecallHitRecord};
 use ov_core::ov_client::OvClient;
 use ov_core::policy::model::{AgentId, PolicyConfig};
 use ov_core::policy::router::{is_foreign_agent_private_uri, project_peer, resolve_route_for_agent};
@@ -122,7 +122,7 @@ pub(crate) async fn execute_hook(
         created_at: Utc::now().timestamp(),
     };
 
-    let mut recall_hits: Vec<(String, f64, bool)> = Vec::new();
+    let mut recall_hits: Vec<RecallHitRecord> = Vec::new();
     let text = match event {
         "session-start" => {
             // Context Assembly I: Concurrent 4-category Startup Profile within a strict 2s timeout
@@ -256,7 +256,7 @@ pub(crate) async fn execute_hook(
                 client, candidates, &budget, &policy.budget.category_quotas,
                 respect_ttl_expiry, Some(5),
             ).await;
-            evt.target_uri = hits.iter().find(|(_,_,injected)| *injected).map(|(uri,_,_)| uri.clone());
+            evt.target_uri = hits.iter().find(|h| h.injected).map(|h| h.memory_uri.clone());
             recall_hits = hits;
             evt.query = Some(prompt.chars().take(120).collect());
             evt.layer = Some(layer);
@@ -325,7 +325,7 @@ pub(crate) async fn execute_hook(
         if let Err(error) = db.record_event_for_profile(&client.profile_key(), &evt) {
             eprintln!("OpenViking telemetry: {error}");
         } else if !recall_hits.is_empty() {
-            if let Err(error) = db.record_recall_hits(&evt.id, &recall_hits) {
+            if let Err(error) = db.record_recall_hit_details(&evt.id, &recall_hits) {
                 eprintln!("OpenViking recall hits: {error}");
             }
         }

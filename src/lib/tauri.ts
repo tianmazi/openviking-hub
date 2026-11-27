@@ -9,6 +9,7 @@ import type {
   PolicyConfig,
   ProfileStore,
   RecallEvent,
+  RecallHitRecord,
   ReviewStatus,
   ServerStatus,
   WslDistroInfo,
@@ -549,6 +550,60 @@ export const api = {
       },
     ];
     return agentFilter ? items.filter((i) => i.agent_id === agentFilter) : items;
+  },
+
+  async listRecallHits(eventId: string): Promise<RecallHitRecord[]> {
+    if (isTauriRuntime()) {
+      return callTauri("list_recall_hits", { eventId });
+    }
+    const mockMap: Record<string, RecallHitRecord[]> = {
+      "ev-1": [
+        {
+          memory_uri: "viking://resources/projects/openviking-desktop/snapshot-api.md",
+          score: 0.93,
+          injected: true,
+          reason: "injected_l1",
+        },
+        {
+          memory_uri: "viking://~/memories/preferences/rust-error-style.md",
+          score: 0.78,
+          injected: true,
+          reason: "injected",
+        },
+        {
+          memory_uri: "viking://~/memories/events/old-standup.md",
+          score: 0.81,
+          injected: false,
+          reason: "expired",
+        },
+        {
+          memory_uri: "viking://~/memories/entities/legacy-endpoint.md",
+          score: 0.74,
+          injected: false,
+          reason: "superseded",
+        },
+        {
+          memory_uri: "viking://~/memories/cases/random-note.md",
+          score: 0.48,
+          injected: false,
+          reason: "below_min_score",
+        },
+      ],
+    };
+    return mockMap[eventId] ?? [
+      {
+        memory_uri: "viking://~/memories/preferences/coding-style.md",
+        score: 0.87,
+        injected: true,
+        reason: "injected_l1",
+      },
+      {
+        memory_uri: "viking://~/memories/cases/extra-snippet.md",
+        score: 0.64,
+        injected: false,
+        reason: "max_items_reached",
+      },
+    ];
   },
 
   async triggerDreaming(): Promise<[DreamingRun, PendingMemoryChange[]]> {

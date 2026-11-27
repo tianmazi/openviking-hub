@@ -197,6 +197,7 @@ pub fn run() {
             commands::read_uri_layers,
             commands::write_uri_content,
             commands::list_recall_events,
+            commands::list_recall_hits,
             commands::trigger_dreaming,
             commands::list_dreaming_runs,
             commands::list_pending_changes,

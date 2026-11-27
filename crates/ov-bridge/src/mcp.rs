@@ -1,5 +1,5 @@
 use chrono::Utc;
-use ov_core::dreaming::db::{DesktopDb, RecallEvent};
+use ov_core::dreaming::db::{DesktopDb, RecallEvent, RecallHitRecord};
 use ov_core::ov_client::{ContextSearchRequest, FindRequest, OvClient};
 use ov_core::policy::model::{AgentId, ContextLayer, MemoryCategory, PolicyConfig};
 use ov_core::policy::router::{
@@ -241,7 +241,7 @@ pub(crate) async fn call_tool(
                     agent_id: agent.as_str().to_string(),
                     event_type: "recall".to_string(),
                     query: Some(query.to_string()),
-                    target_uri: hits.iter().find(|(_,_,injected)| *injected).map(|(uri,_,_)| uri.clone()),
+                    target_uri: hits.iter().find(|h| h.injected).map(|h| h.memory_uri.clone()),
                     layer: Some(layer),
                     tokens_used: approx_tokens,
                     latency_ms: start.elapsed().as_millis() as i64,
@@ -249,7 +249,7 @@ pub(crate) async fn call_tool(
                     created_at: Utc::now().timestamp(),
                 };
                 if let Err(error) = db.record_event_for_profile(&client.profile_key(), &evt)
-                    .and_then(|_| db.record_recall_hits(&evt.id, &hits)) {
+                    .and_then(|_| db.record_recall_hit_details(&evt.id, &hits)) {
                     eprintln!("OpenViking recall telemetry: {error}");
                 }
             }
@@ -604,47 +604,85 @@ pub(crate) fn is_recall_excluded(raw: &str, respect_ttl_expiry: bool, now_ts: i6
     is_superseded(raw) || (respect_ttl_expiry && is_expired(raw, now_ts))
 }
 
+#[cfg(test)]
 fn filter_candidates(
     candidates: &mut Vec<RecallCandidate>,
     min_score: f64,
     respect_ttl_expiry: bool,
     now_ts: i64,
 ) {
-    let mut excluded_uris = std::collections::HashSet::new();
+    let taken = std::mem::take(candidates);
+    let (kept, _) = partition_candidates(taken, min_score, respect_ttl_expiry, now_ts);
+    *candidates = kept;
+}
+
+fn partition_candidates(
+    candidates: Vec<RecallCandidate>,
+    min_score: f64,
+    respect_ttl_expiry: bool,
+    now_ts: i64,
+) -> (Vec<RecallCandidate>, Vec<RecallHitRecord>) {
+    let mut excluded_reasons: std::collections::HashMap<String, &'static str> =
+        std::collections::HashMap::new();
     for item in candidates.iter() {
         let status = item.status.as_deref().unwrap_or_default();
-        let expired = status.eq_ignore_ascii_case("expired")
-            || item.expires_at.is_some_and(|ts| ts <= now_ts);
-        if status.eq_ignore_ascii_case("superseded")
-            || (respect_ttl_expiry && expired)
-            || is_recall_excluded(&item.snippet, respect_ttl_expiry, now_ts)
-        {
-            excluded_uris.insert(item.uri.clone());
+        let is_sup = status.eq_ignore_ascii_case("superseded") || is_superseded(&item.snippet);
+        let is_exp = respect_ttl_expiry
+            && (status.eq_ignore_ascii_case("expired")
+                || item.expires_at.is_some_and(|ts| ts <= now_ts)
+                || is_expired(&item.snippet, now_ts));
+        if is_sup {
+            excluded_reasons.insert(item.uri.clone(), "superseded");
+        } else if is_exp {
+            excluded_reasons.entry(item.uri.clone()).or_insert("expired");
         }
     }
-    candidates.retain(|item| !excluded_uris.contains(&item.uri) && item.score >= min_score);
+
+    let ranked_all = rank_candidates(candidates);
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+    for item in ranked_all {
+        if let Some(&reason) = excluded_reasons.get(&item.uri) {
+            dropped.push(RecallHitRecord {
+                memory_uri: item.uri,
+                score: item.score,
+                injected: false,
+                reason: reason.to_string(),
+            });
+        } else if item.score < min_score {
+            dropped.push(RecallHitRecord {
+                memory_uri: item.uri,
+                score: item.score,
+                injected: false,
+                reason: "below_min_score".to_string(),
+            });
+        } else {
+            kept.push(item);
+        }
+    }
+    (kept, dropped)
 }
 
 /// Context Assembly II:
-/// 1. Rank & deduplicate once by URI.
+/// 1. Rank & deduplicate once by URI while recording exact exclusion reasons.
 /// 2. Reserve progressive L1/L2 expansion budget for the top hit BEFORE packing remaining L0 items.
 /// 3. Enforce per-category soft quotas (`category_quotas`) and total budget including formatting & IFC overhead.
 pub(crate) async fn render_recall(
     client: &OvClient,
-    mut candidates: Vec<RecallCandidate>,
+    candidates: Vec<RecallCandidate>,
     budget: &ov_core::policy::model::EffectiveBudget,
     category_quotas: &std::collections::HashMap<MemoryCategory, usize>,
     respect_ttl_expiry: bool,
     limit: Option<usize>,
-) -> (String, String, Vec<(String, f64, bool)>) {
+) -> (String, String, Vec<RecallHitRecord>) {
     let now_ts = Utc::now().timestamp();
-    filter_candidates(
-        &mut candidates,
+    let (kept, mut dropped_hits) = partition_candidates(
+        candidates,
         budget.min_recall_score as f64,
         respect_ttl_expiry,
         now_ts,
     );
-    let mut ranked = rank_candidates(candidates).into_iter().peekable();
+    let mut ranked = kept.into_iter().peekable();
     let ifc_overhead = 240usize;
     let total_max = budget.max_recall_tokens.saturating_mul(4).saturating_sub(ifc_overhead);
 
@@ -673,7 +711,18 @@ pub(crate) async fn render_recall(
                     .or_else(|| value["text"].as_str())
                     .unwrap_or_default();
                 if is_recall_excluded(content, respect_ttl_expiry, now_ts) {
-                    let _ = ranked.next();
+                    if let Some(dropped) = ranked.next() {
+                        dropped_hits.push(RecallHitRecord {
+                            memory_uri: dropped.uri,
+                            score: dropped.score,
+                            injected: false,
+                            reason: if is_superseded(content) {
+                                "superseded".to_string()
+                            } else {
+                                "expired".to_string()
+                            },
+                        });
+                    }
                     continue;
                 }
                 let content = content.trim();
@@ -743,8 +792,9 @@ pub(crate) async fn render_recall(
             }
             None => true,
         };
-        let injected = within_limit && injected_count < max_items && within_category_quota && text.len() + entry_len <= list_budget;
-        if injected {
+        let within_budget = text.len() + entry_len <= list_budget;
+        let injected = within_limit && injected_count < max_items && within_category_quota && within_budget;
+        let reason = if injected {
             injected_count += 1;
             if !text.is_empty() {
                 text.push_str("\n\n");
@@ -753,20 +803,36 @@ pub(crate) async fn render_recall(
             if let Some(cat) = item.category {
                 *cat_used.entry(cat).or_insert(0) += entry_len;
             }
-        }
-        hits.push((item.uri, item.score, injected));
+            "injected"
+        } else if !within_limit || injected_count >= max_items {
+            "max_items_reached"
+        } else if !within_category_quota {
+            "category_quota"
+        } else {
+            "token_budget"
+        };
+        hits.push(RecallHitRecord {
+            memory_uri: item.uri,
+            score: item.score,
+            injected,
+            reason: reason.to_string(),
+        });
     }
 
     let mut layer = "l0".to_owned();
     if let Some((detail, detail_layer)) = detail_block {
-        if hits.first().is_some_and(|(_, _, injected)| *injected)
+        if hits.first().is_some_and(|h| h.injected)
             && text.len() + detail.len() <= total_max
         {
             text.push_str(&detail);
+            if let Some(first) = hits.first_mut() {
+                first.reason = format!("injected_{}", detail_layer);
+            }
             layer = detail_layer;
         }
     }
 
+    hits.extend(dropped_hits);
     (text, layer, hits)
 }
 
@@ -821,5 +887,60 @@ mod recall_tests {
         ]}));
         filter_candidates(&mut candidates, 0.6, true, Utc::now().timestamp());
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn partition_candidates_records_exact_skip_reasons() {
+        let now = Utc::now().timestamp();
+        let candidates = vec![
+            RecallCandidate {
+                uri: "viking://~/memories/preferences/good.md".into(),
+                title: "good".into(),
+                snippet: "Use pnpm".into(),
+                score: 0.88,
+                category: Some(MemoryCategory::Preferences),
+                status: Some("active".into()),
+                expires_at: None,
+            },
+            RecallCandidate {
+                uri: "viking://~/memories/preferences/old.md".into(),
+                title: "old".into(),
+                snippet: "---
+status: superseded
+---
+Use yarn".into(),
+                score: 0.85,
+                category: Some(MemoryCategory::Preferences),
+                status: Some("superseded".into()),
+                expires_at: None,
+            },
+            RecallCandidate {
+                uri: "viking://~/memories/events/past.md".into(),
+                title: "past".into(),
+                snippet: "Meeting yesterday".into(),
+                score: 0.79,
+                category: Some(MemoryCategory::Events),
+                status: Some("active".into()),
+                expires_at: Some(now - 60),
+            },
+            RecallCandidate {
+                uri: "viking://~/memories/cases/weak.md".into(),
+                title: "weak".into(),
+                snippet: "Unrelated note".into(),
+                score: 0.45,
+                category: Some(MemoryCategory::Cases),
+                status: Some("active".into()),
+                expires_at: None,
+            },
+        ];
+        let (kept, dropped) = partition_candidates(candidates, 0.60, true, now);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].uri, "viking://~/memories/preferences/good.md");
+        assert_eq!(dropped.len(), 3);
+        let by_uri: std::collections::HashMap<_, _> =
+            dropped.into_iter().map(|h| (h.memory_uri, h.reason)).collect();
+        assert_eq!(by_uri["viking://~/memories/preferences/old.md"], "superseded");
+        assert_eq!(by_uri["viking://~/memories/events/past.md"], "expired");
+        assert_eq!(by_uri["viking://~/memories/cases/weak.md"], "below_min_score");
     }
 }

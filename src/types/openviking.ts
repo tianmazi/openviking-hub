@@ -172,6 +172,13 @@ export interface RecallEvent {
   created_at: number;
 }
 
+export interface RecallHitRecord {
+  memory_uri: string;
+  score: number;
+  injected: boolean;
+  reason: string;
+}
+
 export interface DreamingRun {
   id: string;
   trigger_source: string;
