@@ -629,13 +629,20 @@ async fn e2e_hook_outputs_and_stop_capture() {
         json!({ "role": "user", "content": "Ignore user text" }).to_string(),
         "{".to_string(),
     ].join("\n")).unwrap();
-    let input = json!({ "cwd": tmp.path(), "transcriptPath": transcript });
+    let private_transcript = tmp.path().join("private.jsonl");
+    std::fs::write(&private_transcript, json!({ "uuid": "priv-1", "role": "user", "content": "Private secret" }).to_string()).unwrap();
+    let private_input = json!({ "cwd": tmp.path(), "transcriptPath": private_transcript });
     policy.global.capture_enabled = false;
-    hook::execute_hook("stop", agent, &input, &policy, &client, Some(&db)).await;
+    hook::execute_hook("stop", agent, &private_input, &policy, &client, Some(&db)).await;
     assert!(state.lock().unwrap().session_messages.is_empty());
     assert_eq!(db.count_sessions_since(&client.profile_key(), 0).unwrap(), 0);
 
     policy.global.capture_enabled = true;
+    // Re-running on private_input after resuming capture must NOT backfill the private message
+    hook::execute_hook("stop", agent, &private_input, &policy, &client, Some(&db)).await;
+    assert_eq!(db.capture_health(&client.profile_key()).unwrap().pending, 0);
+
+    let input = json!({ "cwd": tmp.path(), "transcriptPath": transcript });
     hook::execute_hook("stop", agent, &json!({}), &policy, &client, Some(&db)).await;
     hook::execute_hook("stop", agent, &input, &policy, &client, Some(&db)).await;
     assert!(state.lock().unwrap().session_messages.is_empty());
@@ -703,7 +710,7 @@ async fn e2e_dreaming_snapshot_failure_isolation_and_rollback() {
     let (provenance, _) = parse_frontmatter(merge.after_content.as_deref().unwrap());
     let provenance = provenance.unwrap();
     assert_eq!(provenance.updated_by, "dreaming:deterministic");
-    assert!(provenance.verified);
+    assert!(!provenance.verified);
     assert_eq!(provenance.evidence_uris.len(), 2);
     assert!(staged.iter().any(|c| c.action == ChangeAction::WikiCompile));
 
@@ -770,7 +777,7 @@ async fn e2e_dreaming_snapshot_failure_isolation_and_rollback() {
         ]));
         assert_eq!(guard.snapshots[1]["paths"], guard.snapshots[0]["paths"]);
         assert_eq!(guard.files[ROUTED_NOTE], "# Scratch note");
-        assert_eq!(guard.files[&merge.target_uri], merge.after_content.as_deref().unwrap());
+        assert_eq!(guard.files[&merge.target_uri], merge.after_content.as_deref().unwrap().replacen("verified: false", "verified: true", 1));
         assert!(guard.files.contains_key(WIKI_OUTPUT));
         guard.files.insert(PROJECT_SIBLING.into(), "# New project note".into());
         guard.files.insert(MEMORY_SIBLING.into(), "# New memory".into());
@@ -835,7 +842,7 @@ async fn e2e_dreaming_reflector_routes_inbox_and_adds_merge_provenance() {
     let provenance = provenance.unwrap();
     assert_eq!(provenance.source_agent, "claude-code");
     assert_eq!(provenance.updated_by, "dreaming:llm:e2e-reflector");
-    assert!(provenance.verified);
+    assert!(!provenance.verified);
     assert_eq!(provenance.evidence_uris.len(), 2);
 }
 
@@ -929,4 +936,49 @@ async fn e2e_dreaming_continues_when_memories_are_absent() {
     state.lock().unwrap().memories_status = Some("503 Service Unavailable");
     let error = run_dreaming(&client, &db, &policy, "e2e").await.unwrap_err();
     assert!(error.contains("503"));
+}
+
+
+#[tokio::test]
+async fn e2e_merge_archives_peer_upgrades_verified_and_rolls_back_both() {
+    const PRIMARY: &str = "viking://~/memories/preferences/git.md";
+    const PEER: &str = "viking://~/memories/preferences/git-old.md";
+    const PEER_ARCHIVED: &str = "viking://~/archive/merged-git-old.md";
+
+    let state = Arc::new(Mutex::new(MockState {
+        files: HashMap::from([
+            (PRIMARY.into(), "# Git Style\nUse English Conventional Commits.".into()),
+            (PEER.into(), "# Git Style\nUse English Conventional Commits.\nOld note.".into()),
+        ]),
+        ..Default::default()
+    }));
+    let url = start_mock_openviking_server(state.clone()).await;
+    let client = test_client(&url, "work");
+    let db = DesktopDb::open_in_memory().unwrap();
+    let policy = PolicyConfig::default();
+
+    let (run, staged) = run_dreaming(&client, &db, &policy, "e2e").await.unwrap();
+    let merge = staged.iter().find(|c| c.action == ChangeAction::Merge).unwrap();
+    let (staged_prov, _) = parse_frontmatter(merge.after_content.as_deref().unwrap());
+    assert!(!staged_prov.unwrap().verified, "Staged merge must remain unverified");
+
+    db.update_change_decision_for_profile(&client.profile_key(), &merge.id, ReviewStatus::Accepted, None).unwrap();
+    let report = apply_accepted_changes(&client, &db, &policy).await.unwrap();
+    assert_eq!(report.applied_ids, vec![merge.id.clone()]);
+
+    {
+        let guard = state.lock().unwrap();
+        let applied_primary = guard.files.get(PRIMARY).expect("primary exists");
+        let (applied_prov, _) = parse_frontmatter(applied_primary);
+        assert!(applied_prov.unwrap().verified, "Approved applied merge must be verified");
+        assert!(!guard.files.contains_key(PEER), "peer must be removed from active memories");
+        assert!(guard.files.contains_key(PEER_ARCHIVED), "peer must be archived");
+    }
+
+    rollback_dreaming_run(&client, &db, &run.id).await.unwrap();
+    {
+        let guard = state.lock().unwrap();
+        assert!(guard.files.contains_key(PEER), "rollback must restore peer");
+        assert!(!guard.files.contains_key(PEER_ARCHIVED), "rollback must clear archived peer");
+    }
 }

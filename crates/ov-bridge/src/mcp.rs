@@ -1,7 +1,7 @@
 use chrono::Utc;
 use ov_core::dreaming::db::{DesktopDb, RecallEvent};
 use ov_core::ov_client::{ContextSearchRequest, FindRequest, OvClient};
-use ov_core::policy::model::{AgentId, ContextLayer, PolicyConfig};
+use ov_core::policy::model::{AgentId, ContextLayer, MemoryCategory, PolicyConfig};
 use ov_core::policy::router::{
     is_foreign_agent_private_uri, is_protected_rule_path, project_peer, resolve_route_for_agent,
 };
@@ -218,7 +218,7 @@ pub(crate) async fn call_tool(
             .map_err(|e| e.to_string())?;
 
             candidates.retain(|item| !is_foreign_agent_private_uri(policy, agent, &item.uri));
-            let (text, layer, hits) = render_recall(client, candidates, &budget).await;
+            let (text, layer, hits) = render_recall(client, candidates, &budget, &policy.budget.category_quotas).await;
             let wrapped = wrap_ifc_readonly(
                 &text,
                 &format!("recall:{}", agent.as_str()),
@@ -390,7 +390,9 @@ pub(crate) async fn call_tool(
 pub(crate) struct RecallCandidate {
     pub(crate) uri: String,
     score: f64,
-    record: String,
+    title: String,
+    category: Option<MemoryCategory>,
+    snippet: String,
 }
 
 fn filter_private_entries(value: &mut Value, policy: &PolicyConfig, agent: AgentId) {
@@ -417,80 +419,264 @@ fn filter_private_entries(value: &mut Value, policy: &PolicyConfig, agent: Agent
     }
 }
 
-/// Parse each response once; combine scopes before ranking and deduplicating.
+fn detect_known_category(uri: &str, item: &Value) -> Option<MemoryCategory> {
+    if let Some(cat) = item.get("category").and_then(Value::as_str) {
+        return match cat.to_ascii_lowercase().as_str() {
+            "profile" => Some(MemoryCategory::Profile),
+            "preferences" | "preference" => Some(MemoryCategory::Preferences),
+            "entities" | "entity" => Some(MemoryCategory::Entities),
+            "events" | "event" => Some(MemoryCategory::Events),
+            "cases" | "case" => Some(MemoryCategory::Cases),
+            "patterns" | "pattern" => Some(MemoryCategory::Patterns),
+            _ => None,
+        };
+    }
+    let lower = uri.to_ascii_lowercase();
+    if lower.contains("/profile/") {
+        Some(MemoryCategory::Profile)
+    } else if lower.contains("/preferences/") {
+        Some(MemoryCategory::Preferences)
+    } else if lower.contains("/entities/") {
+        Some(MemoryCategory::Entities)
+    } else if lower.contains("/events/") {
+        Some(MemoryCategory::Events)
+    } else if lower.contains("/cases/") {
+        Some(MemoryCategory::Cases)
+    } else if lower.contains("/patterns/") {
+        Some(MemoryCategory::Patterns)
+    } else {
+        None
+    }
+}
+
+fn format_candidate(item: &RecallCandidate) -> String {
+    let cat = item.category.map(|c| c.as_str()).unwrap_or("general");
+    if item.snippet.is_empty() {
+        format!("- [{}] {} (`{}`, score {:.2})", cat, item.title, item.uri, item.score)
+    } else {
+        format!(
+            "### [{}] {} (`{}`, score {:.2})\n{}",
+            cat, item.title, item.uri, item.score, item.snippet
+        )
+    }
+}
+
+/// Parse each response once into clean structured candidates (no raw JSON noise).
 fn parse_candidates(value: Value) -> Vec<RecallCandidate> {
     let items: Vec<&Value> = if let Some(array) = value.as_array() {
         array.iter().collect()
     } else {
-        ["items","results","entries","memories","resources","skills"].iter()
+        ["items", "results", "entries", "memories", "resources", "skills"]
+            .iter()
             .filter_map(|key| value.get(*key).and_then(Value::as_array))
-            .flatten().collect()
+            .flatten()
+            .collect()
     };
-    items.into_iter().filter_map(|item| {
-        let uri = item["uri"].as_str().filter(|uri| !uri.is_empty())?.to_owned();
-        let score = item.get("score").or_else(||item.get("similarity")).and_then(Value::as_f64).unwrap_or(0.0);
-        Some(RecallCandidate {uri, score, record:item.to_string()})
-    }).collect()
+    items
+        .into_iter()
+        .filter_map(|item| {
+            let uri = item["uri"]
+                .as_str()
+                .filter(|uri| !uri.is_empty())?
+                .to_owned();
+            let score = item
+                .get("score")
+                .or_else(|| item.get("similarity"))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            let title = item
+                .get("title")
+                .or_else(|| item.get("name"))
+                .and_then(Value::as_str)
+                .map(|t| t.trim().to_owned())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| {
+                    uri.trim_end_matches('/')
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&uri)
+                        .to_owned()
+                });
+            let snippet = ["abstract", "overview", "snippet", "summary", "content", "text", "description"]
+                .iter()
+                .filter_map(|k| item.get(*k).and_then(Value::as_str))
+                .map(str::trim)
+                .find(|text| !text.is_empty())
+                .map(|text| text.chars().take(600).collect::<String>())
+                .unwrap_or_default();
+            let category = detect_known_category(&uri, item);
+            Some(RecallCandidate {
+                uri,
+                score,
+                title,
+                category,
+                snippet,
+            })
+        })
+        .collect()
 }
 
-pub(crate) async fn find_scopes(client: &OvClient, query: &str, resource: &str,
-    peer: Option<&str>, limit: Option<usize>) -> Result<Vec<RecallCandidate>, ov_core::ov_client::OvClientError> {
-    let primary = FindRequest {query:query.to_owned(), target_uri:(!resource.is_empty()).then(||resource.to_owned()),limit};
-    let Some(peer) = peer else {return client.find(&primary).await.map(parse_candidates);};
-    let memory = FindRequest {query:query.to_owned(),target_uri:Some(format!("viking://~/peers/{peer}/memories/")),limit};
-    let (a,b) = tokio::join!(client.find(&primary),client.find(&memory));
-    match (a,b) {
-        (Ok(a),Ok(b)) => {
+pub(crate) async fn find_scopes(
+    client: &OvClient,
+    query: &str,
+    resource: &str,
+    peer: Option<&str>,
+    limit: Option<usize>,
+) -> Result<Vec<RecallCandidate>, ov_core::ov_client::OvClientError> {
+    let primary = FindRequest {
+        query: query.to_owned(),
+        target_uri: (!resource.is_empty()).then(|| resource.to_owned()),
+        limit,
+    };
+    let Some(peer) = peer else {
+        return client.find(&primary).await.map(parse_candidates);
+    };
+    let memory = FindRequest {
+        query: query.to_owned(),
+        target_uri: Some(format!("viking://~/peers/{peer}/memories/")),
+        limit,
+    };
+    let (a, b) = tokio::join!(client.find(&primary), client.find(&memory));
+    match (a, b) {
+        (Ok(a), Ok(b)) => {
             let mut candidates = parse_candidates(a);
             candidates.extend(parse_candidates(b));
             Ok(candidates)
         }
-        (Ok(a),Err(_)) => {eprintln!("OpenViking peer recall failed"); Ok(parse_candidates(a))}
-        (Err(_),Ok(b)) => {eprintln!("OpenViking resource recall failed"); Ok(parse_candidates(b))}
-        (Err(a),Err(_)) => Err(a),
+        (Ok(a), Err(_)) => {
+            eprintln!("OpenViking peer recall failed");
+            Ok(parse_candidates(a))
+        }
+        (Err(_), Ok(b)) => {
+            eprintln!("OpenViking resource recall failed");
+            Ok(parse_candidates(b))
+        }
+        (Err(a), Err(_)) => Err(a),
     }
 }
 
 fn rank_candidates(mut candidates: Vec<RecallCandidate>) -> Vec<RecallCandidate> {
-    candidates.sort_by(|a,b| b.score.total_cmp(&a.score));
+    candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
     let mut seen = std::collections::HashSet::new();
     candidates.retain(|item| seen.insert(item.uri.clone()));
     candidates
 }
 
-/// Fit whole candidates. Cross-turn suppression is deliberately avoided:
-/// runtimes may discard injected context after each invocation.
-pub(crate) async fn render_recall(client: &OvClient, candidates: Vec<RecallCandidate>,
-    budget: &ov_core::policy::model::EffectiveBudget) -> (String, String, Vec<(String,f64,bool)>) {
-    let mut text = String::new();
-    let mut layer = "l0".to_owned();
-    let mut hits = Vec::new();
-    let max = budget.max_recall_tokens.saturating_mul(4);
-    for item in rank_candidates(candidates) {
-        let injected = text.len() + item.record.len() + 1 <= max;
-        if injected {
-            text.push_str(&item.record);
-            text.push('\n');
-        }
-        hits.push((item.uri,item.score,injected));
-    }
-    if let Some((uri, score, _)) = hits.iter().find(|(_,_,injected)| *injected) {
-        let selected = if budget.default_recall_layer == ContextLayer::L0 && *score >= budget.auto_expand_l1_threshold as f64 {
+/// Context Assembly II:
+/// 1. Rank & deduplicate once by URI.
+/// 2. Reserve progressive L1/L2 expansion budget for the top hit BEFORE packing remaining L0 items.
+/// 3. Enforce per-category soft quotas (`category_quotas`) and total budget including formatting & IFC overhead.
+pub(crate) async fn render_recall(
+    client: &OvClient,
+    candidates: Vec<RecallCandidate>,
+    budget: &ov_core::policy::model::EffectiveBudget,
+    category_quotas: &std::collections::HashMap<MemoryCategory, usize>,
+) -> (String, String, Vec<(String, f64, bool)>) {
+    let ranked = rank_candidates(candidates);
+    let ifc_overhead = 240usize;
+    let total_max = budget.max_recall_tokens.saturating_mul(4).saturating_sub(ifc_overhead);
+
+    // Pre-fetch and reserve budget for top-hit progressive expansion (L0->L1 or default L1/L2)
+    let mut detail_block: Option<(String, String)> = None;
+    if let Some(top) = ranked.first() {
+        let selected = if budget.default_recall_layer == ContextLayer::L0
+            && top.score >= budget.auto_expand_l1_threshold as f64
+        {
             ContextLayer::L1
-        } else { budget.default_recall_layer };
+        } else {
+            budget.default_recall_layer
+        };
         if selected != ContextLayer::L0 {
-            if let Ok(Ok(value)) = tokio::time::timeout(std::time::Duration::from_secs(2),client.read_content(uri,selected.as_str())).await {
-                let content = value.as_str().or_else(|| value["content"].as_str()).or_else(||value["text"].as_str()).unwrap_or_default();
-                let heading = if selected == ContextLayer::L1 {"Auto-Expanded L1 Overview"} else {"L2 Detail"};
-                let detail = format!("\n--- {heading} ({uri} | score {score:.2}) ---\n{content}");
-                if !content.is_empty() && text.len() + detail.len() <= max {
-                    text.push_str(&detail);
-                    layer = selected.as_str().to_owned();
+            if let Ok(Ok(value)) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client.read_content(&top.uri, selected.as_str()),
+            )
+            .await
+            {
+                let content = value
+                    .as_str()
+                    .or_else(|| value["content"].as_str())
+                    .or_else(|| value["text"].as_str())
+                    .unwrap_or_default()
+                    .trim();
+                if !content.is_empty() {
+                    let heading = if selected == ContextLayer::L1 {
+                        "Auto-Expanded L1 Overview"
+                    } else {
+                        "L2 Detail"
+                    };
+                    let header = format!(
+                        "\n\n--- {heading} ({} | score {:.2}) ---\n",
+                        top.uri, top.score
+                    );
+                    let max_detail = if ranked.len() > 1 {
+                        (total_max * 60) / 100
+                    } else {
+                        total_max
+                    };
+                    if max_detail > header.len() + 32 {
+                        let body_cap = max_detail - header.len();
+                        let mut end = content.len().min(body_cap);
+                        while end > 0 && !content.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        detail_block = Some((
+                            format!("{header}{}", &content[..end]),
+                            selected.as_str().to_owned(),
+                        ));
+                    }
                 }
             }
         }
     }
-    (text,layer,hits)
+
+    let reserved_for_detail = detail_block.as_ref().map(|(d, _)| d.len()).unwrap_or(0);
+    let list_budget = total_max.saturating_sub(reserved_for_detail);
+
+    let mut text = String::new();
+    let mut hits = Vec::new();
+    let mut cat_used: std::collections::HashMap<MemoryCategory, usize> =
+        std::collections::HashMap::new();
+
+    for item in ranked {
+        let formatted = format_candidate(&item);
+        let entry_len = formatted.len() + 2;
+        let within_category_quota = match item.category {
+            Some(cat) => {
+                if let Some(&quota_tokens) = category_quotas.get(&cat) {
+                    let quota_bytes = quota_tokens.saturating_mul(4);
+                    let used = *cat_used.get(&cat).unwrap_or(&0);
+                    used == 0 || used + entry_len <= quota_bytes
+                } else {
+                    true
+                }
+            }
+            None => true,
+        };
+        let injected = within_category_quota && text.len() + entry_len <= list_budget;
+        if injected {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&formatted);
+            if let Some(cat) = item.category {
+                *cat_used.entry(cat).or_insert(0) += entry_len;
+            }
+        }
+        hits.push((item.uri, item.score, injected));
+    }
+
+    let mut layer = "l0".to_owned();
+    if let Some((detail, detail_layer)) = detail_block {
+        if hits.first().is_some_and(|(_, _, injected)| *injected)
+            && text.len() + detail.len() <= total_max
+        {
+            text.push_str(&detail);
+            layer = detail_layer;
+        }
+    }
+
+    (text, layer, hits)
 }
 
 #[cfg(test)]
@@ -500,13 +686,26 @@ mod recall_tests {
     #[test]
     fn candidates_rank_once_and_keep_best_duplicate() {
         let candidates = parse_candidates(json!({"memories":[
-            {"uri":"viking://resources/a", "score":0.5},
-            {"uri":"viking://resources/b", "score":0.8},
-            {"uri":"viking://resources/a", "score":0.9}
+            {"uri":"viking://resources/a", "score":0.5, "snippet":"old"},
+            {"uri":"viking://resources/b", "score":0.8, "snippet":"mid"},
+            {"uri":"viking://resources/a", "score":0.9, "snippet":"best"}
         ]}));
         let ranked = rank_candidates(candidates);
-        assert_eq!(ranked.len(),2);
-        assert_eq!(ranked[0].uri,"viking://resources/a");
-        assert_eq!(ranked[0].score,0.9);
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].uri, "viking://resources/a");
+        assert_eq!(ranked[0].score, 0.9);
+        assert_eq!(ranked[0].snippet, "best");
+    }
+
+    #[test]
+    fn formatted_candidate_strips_raw_json_noise() {
+        let candidates = parse_candidates(json!({"memories":[
+            {"uri":"viking://~/memories/preferences/git.md", "score":0.92, "title":"Git Rules", "snippet":"Use Conventional Commits", "distance":0.08, "internal_id":"xyz"}
+        ]}));
+        let rendered = format_candidate(&candidates[0]);
+        assert!(rendered.contains("[preferences] Git Rules"));
+        assert!(rendered.contains("Use Conventional Commits"));
+        assert!(!rendered.contains("internal_id"));
+        assert!(!rendered.contains("distance"));
     }
 }

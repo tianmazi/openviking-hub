@@ -124,7 +124,7 @@ pub(crate) async fn execute_hook(
     let mut recall_hits: Vec<(String, f64, bool)> = Vec::new();
     let text = match event {
         "session-start" => {
-            // Position-Biased Structured Index Header (Displacement: Primacy -> Middle TOC -> Recency)
+            // Context Assembly I: Concurrent 4-category Startup Profile within a strict 2s timeout
             let context_text = |res: Value| {
                 res.as_str()
                     .or_else(|| res["content"].as_str())
@@ -132,40 +132,74 @@ pub(crate) async fn execute_hook(
                     .map(str::to_owned)
                     .unwrap_or_else(|| serde_json::to_string(&res).unwrap_or_default())
             };
-            let project_text = client
-                .read_content(&route.target_resource_uri, budget.default_recall_layer.as_str())
-                .await
-                .map(context_text)
-                .unwrap_or_default();
-            let user_mem_l0 = client
-                .read_content(&route.target_memory_uri, "l0")
-                .await
-                .map(context_text)
-                .unwrap_or_default();
+            let peer_mem_uri = peer.as_deref().map(|p| format!("viking://~/peers/{p}/memories/"));
+            let (project_text, user_mem_l0, recent_peer_l0) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                async {
+                    let project_fut = client.read_content(
+                        &route.target_resource_uri,
+                        budget.default_recall_layer.as_str(),
+                    );
+                    let user_fut = client.read_content(&route.target_memory_uri, "l0");
+                    let peer_fut = async {
+                        if let Some(uri) = peer_mem_uri.as_deref() {
+                            client.read_content(uri, "l0").await.ok().map(context_text).unwrap_or_default()
+                        } else {
+                            String::new()
+                        }
+                    };
+                    let (p_res, u_res, peer_res) = tokio::join!(project_fut, user_fut, peer_fut);
+                    (
+                        p_res.ok().map(context_text).unwrap_or_default(),
+                        u_res.ok().map(context_text).unwrap_or_default(),
+                        peer_res,
+                    )
+                },
+            )
+            .await
+            .unwrap_or_default();
 
             let mut sections = Vec::new();
-            // 1. Head (Primacy Advantage): Core Scope & Read-Only Rule Constraints
-            sections.push(format!(
-                "## [Head / Policy & Scope]\n- Active Project Scope: `{}`\n- Shared Memory Root: `{}`\n- Protected Rules (Read-Only): `{}`",
+            // 1. Project Profile & Policy (Primacy)
+            let mut project_sec = format!(
+                "## [Project Profile & Policy]\n- Active Project Scope: `{}`\n- Protected Rules (Read-Only): `{}`",
                 route.target_resource_uri,
-                route.target_memory_uri,
                 policy.routing.protected_rule_globs.join(", ")
-            ));
-
-            // 2. Middle (Reference TOC): Lazy-load index & optional Agent private namespace
-            let mut toc = String::from("## [Middle / Structured Index TOC (Use `read_uri` for L1/L2)]\n");
-            if let Some(priv_uri) = &route.agent_private_memory_uri {
-                toc.push_str(&format!("- Agent Private Space: `{}`\n", priv_uri));
-            }
+            );
             if !project_text.trim().is_empty() {
-                toc.push_str(&format!("- Project Context ({}):\n{}\n", budget.default_recall_layer.as_str().to_uppercase(), project_text.trim()));
+                project_sec.push_str(&format!(
+                    "\n- Project Overview ({}):\n{}",
+                    budget.default_recall_layer.as_str().to_uppercase(),
+                    project_text.trim()
+                ));
+            }
+            sections.push(project_sec);
+
+            // 2. Knowledge Index (Lazy-load TOC)
+            let mut toc = format!(
+                "## [Knowledge Index (Use `read_uri` for L1/L2)]\n- Shared User Memories: `{}`\n- Project Resources: `{}`",
+                route.target_memory_uri, route.target_resource_uri
+            );
+            if let Some(uri) = peer_mem_uri.as_deref() {
+                toc.push_str(&format!("\n- Project Peer Memories: `{uri}`"));
+            }
+            if let Some(priv_uri) = &route.agent_private_memory_uri {
+                toc.push_str(&format!("\n- Agent Private Space: `{priv_uri}`"));
             }
             sections.push(toc);
 
-            // 3. Tail (Recency Advantage): Shared User Preferences / Active Memory Abstract
+            // 3. Recent Context (only included when actual peer memory exists)
+            if !recent_peer_l0.trim().is_empty() {
+                sections.push(format!(
+                    "## [Recent Project Context]\n{}",
+                    recent_peer_l0.trim()
+                ));
+            }
+
+            // 4. User Profile (Recency Advantage)
             if !user_mem_l0.trim().is_empty() {
                 sections.push(format!(
-                    "## [Tail / Active User Preferences & Recent Context]\n{}",
+                    "## [User Profile & Preferences]\n{}",
                     user_mem_l0.trim()
                 ));
             }
@@ -188,14 +222,15 @@ pub(crate) async fn execute_hook(
             ) else {
                 return String::new();
             };
+            let search_query = build_session_aware_query(prompt, payload);
             let mut candidates = match tokio::time::timeout(std::time::Duration::from_secs(3),
-                find_scopes(client, prompt, &route.target_resource_uri, peer.as_deref(), Some(5))).await {
+                find_scopes(client, &search_query, &route.target_resource_uri, peer.as_deref(), Some(5))).await {
                 Ok(Ok(candidates)) => candidates,
                 Ok(Err(_)) => { eprintln!("OpenViking recall request failed"); return String::new(); }
                 Err(_) => { eprintln!("OpenViking recall timed out"); return String::new(); }
             };
             candidates.retain(|item| !is_foreign_agent_private_uri(policy, agent, &item.uri));
-            let (text, layer, hits) = render_recall(client, candidates, &budget).await;
+            let (text, layer, hits) = render_recall(client, candidates, &budget, &policy.budget.category_quotas).await;
             evt.target_uri = hits.iter().find(|(_,_,injected)| *injected).map(|(uri,_,_)| uri.clone());
             recall_hits = hits;
             evt.query = Some(prompt.chars().take(120).collect());
@@ -209,6 +244,26 @@ pub(crate) async fn execute_hook(
             evt.blocked_by_privacy = !policy.global.capture_enabled;
             if evt.blocked_by_privacy {
                 evt.layer = None;
+                let (session, messages) = collect(payload);
+                if let (Some(db), Some(runtime_id)) = (
+                    db,
+                    session.or_else(|| messages.first().map(|m| m.key.clone())),
+                ) {
+                    let session_key = sha256_hex(&format!(
+                        "{}:{}:{}",
+                        agent.as_str(),
+                        route.target_resource_uri,
+                        runtime_id
+                    ));
+                    let _ = db.skip_capture(
+                        &client.profile_key(),
+                        &session_key,
+                        agent.as_str(),
+                        &route.target_resource_uri,
+                        peer.as_deref(),
+                        &messages,
+                    );
+                }
             } else {
                 let (session, messages) = collect(payload);
                 let Some(db) = db else { return String::new(); };
@@ -269,4 +324,36 @@ fn enforce_startup_caps(text: &str, max_lines: usize, max_bytes: usize) -> Strin
         end -= 1;
     }
     format!("{}{notice}", &limited_lines[..end])
+}
+
+
+/// When the current prompt is short/context-dependent (e.g. "继续", "fix that test"),
+/// enrich the search query with up to 2 recent user turns from the transcript/messages
+/// without calling any LLM.
+fn build_session_aware_query(prompt: &str, payload: &Value) -> String {
+    let trimmed = prompt.trim();
+    if trimmed.chars().count() >= 40 {
+        return trimmed.to_owned();
+    }
+    let (_, messages) = collect(payload);
+    let recent_user: Vec<&str> = messages
+        .iter()
+        .rev()
+        .filter(|m| m.role == "user")
+        .map(|m| m.content.trim())
+        .filter(|c| !c.is_empty() && *c != trimmed)
+        .take(2)
+        .collect();
+    if recent_user.is_empty() {
+        return trimmed.to_owned();
+    }
+    let mut ctx = String::new();
+    for msg in recent_user.into_iter().rev() {
+        if !ctx.is_empty() {
+            ctx.push_str(" | ");
+        }
+        ctx.push_str(msg);
+    }
+    let capped_ctx: String = ctx.chars().take(300).collect();
+    format!("{capped_ctx}\n{trimmed}")
 }

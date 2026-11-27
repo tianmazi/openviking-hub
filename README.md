@@ -18,6 +18,8 @@
   - **一键隐私模式**：系统托盘与侧边栏均支持秒切只读隐私模式，实时拦截自动捕获与写入。
 - **Dreaming 后台整理与 PR-Style 审核台**：支持 Cron 定时与 `SessionThreshold` 累计会话数触发，支持接入**本机 CLI Agent（`claude -p` / `codex exec`）或 OpenAI 兼容 LLM 反思器**进行语义冲突消解与 Inbox 智能项目归类（带纯程序确定性降级与 **Write-Gate 晋升门禁**），采用 **Stage-then-Commit** 流水线，提供逐行 `+`/`-` 双列行号 Diff、审阅进度条、键盘流审批（`J/K/A/X/E/⌘↵`）、在线编辑终稿、SHA-256 `base_hash` 乐观锁防并发漂移、Commit 前自动创建 Snapshot（`POST /api/v1/snapshot/commit`）及一键回滚（`POST /api/v1/snapshot/restore`）。
 
+- **Context Assembly 上下文组装与隐私水位（v0.4.0）**：`session-start` 在 2 秒超时预算内并发组装 4 类启动上下文（Project / Knowledge Index / Recent Peer / User Profile），`user-prompt-submit` 针对短句自动拼接近期会话上下文构建会话感知 Query；召回渲染剔除原始 JSON 噪音并按「先预留高分 L1 预算、再按六类记忆配额软上限填充」组装；隐私模式下记录空正文 `skipped` 水位，防止恢复捕获后补采历史隐私对话；Dreaming 拆分热度与 `verified` 语义，并在 `Merge` 批准后自动归档旧 `peer` 且支持双向回滚。
+
 ## 工程结构
 
 ```text

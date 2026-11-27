@@ -154,6 +154,7 @@ pub async fn run_dreaming(
                     .unwrap_or(false);
                 if gate_ok {
                     let base_hash = content.as_deref().map(sha256_hex);
+                    let promoted_content = content.as_deref().map(stamp_index_priority_high);
                     let change = PendingMemoryChange {
                         id: format!("chg-{}", Uuid::new_v4().simple()),
                         run_id: run_id.clone(),
@@ -166,7 +167,7 @@ pub async fn run_dreaming(
                         category,
                         base_hash,
                         before_content: content.clone(),
-                        after_content: content,
+                        after_content: promoted_content,
                         rationale: format!(
                             "高频跨 Agent 记忆（共命中 {} 次，涉及 {}，已通过 Write-Gate 校验），建议晋升至顶层 L0/L1 启动索引。",
                             hit_count,
@@ -289,16 +290,23 @@ pub async fn run_dreaming(
                                     ),
                                 };
 
+                                // Staged proposals remain verified=false until human approval or independent evidence.
                                 let mut prov = MemoryProvenance::new(
                                     "dreaming",
                                     "shared",
-                                    true,
+                                    false,
                                     score as f32,
                                 );
                                 prov.updated_by = format!("dreaming:{}", reflector_label);
                                 prov.evidence_uris = vec![uri.to_string(), other_uri.clone()];
                                 let merged_with_prov =
                                     render_frontmatter(frontmatter, &merged_body, &prov);
+                                let peer_file_name = other_uri.rsplit('/').next().unwrap_or("peer.md");
+                                let peer_archive_uri = format!(
+                                    "{}/merged-{}",
+                                    policy.lifecycle.archival.archive_uri.trim_end_matches('/'),
+                                    peer_file_name
+                                );
 
                                 let change = PendingMemoryChange {
                                     id: format!("chg-{}", Uuid::new_v4().simple()),
@@ -314,12 +322,14 @@ pub async fn run_dreaming(
                                     before_content: Some(content.clone()),
                                     after_content: Some(merged_with_prov),
                                     rationale: format!(
-                                        "检测到与 {} 语义高度重合（相似度 {:.2}），已通过 {} 生成去重合并提案。",
-                                        other_uri, score, reflector_label
+                                        "检测到与 {} 语义高度重合（相似度 {:.2}），已通过 {} 生成去重合并提案；批准后将把旧条目归档至 {}。",
+                                        other_uri, score, reflector_label, peer_archive_uri
                                     ),
                                     evidence_json: json!({
                                         "source": "semantic_dedupe",
                                         "peer_uri": other_uri,
+                                        "peer_archive_uri": peer_archive_uri,
+                                        "peer_before_content": other_content,
                                         "similarity": score,
                                         "category": category.as_str(),
                                         "reflector": reflector_label
@@ -545,7 +555,28 @@ fn check_write_protection<'a>(
 
 async fn execute_change(client: &OvClient, change: &PendingMemoryChange) -> Result<(), String> {
     let result = match change.action {
-        ChangeAction::Merge | ChangeAction::PromoteToIndex | ChangeAction::DemoteFromIndex => {
+        ChangeAction::Merge => {
+            let raw_body = change
+                .after_content
+                .as_deref()
+                .ok_or("missing after_content")?;
+            let verified_body = mark_frontmatter_verified(raw_body);
+            let write_res = client.write_content(&change.target_uri, &verified_body).await;
+            if write_res.is_ok() {
+                if let Some(peer_uri) = change.destination_uri.as_deref() {
+                    if let Ok(ev) = serde_json::from_str::<Value>(&change.evidence_json) {
+                        if let Some(archive_dest) = ev.get("peer_archive_uri").and_then(Value::as_str) {
+                            match client.mv(peer_uri, archive_dest).await {
+                                Err(e) if !is_not_found(&e) => return Err(e.to_string()),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            write_res
+        }
+        ChangeAction::PromoteToIndex | ChangeAction::DemoteFromIndex => {
             let body = change
                 .after_content
                 .as_deref()
@@ -625,7 +656,31 @@ async fn rollback_change(
     let target = &change.target_uri;
     let before = change.before_content.as_deref();
     let result = match change.action {
-        ChangeAction::Merge | ChangeAction::PromoteToIndex | ChangeAction::DemoteFromIndex => {
+        ChangeAction::Merge => {
+            let primary_res = match before {
+                Some(content) => client.write_content(target, content).await,
+                None => client.snapshot_restore_scoped(snap_id, Some(target)).await,
+            };
+            if primary_res.is_ok() {
+                if let Some(peer_uri) = change.destination_uri.as_deref() {
+                    if let Ok(ev) = serde_json::from_str::<Value>(&change.evidence_json) {
+                        let archive_dest = ev.get("peer_archive_uri").and_then(Value::as_str);
+                        let peer_before = ev.get("peer_before_content").and_then(Value::as_str);
+                        if let Some(archive_uri) = archive_dest {
+                            match (client.mv(archive_uri, peer_uri).await, peer_before) {
+                                (Err(_), Some(peer_content)) => {
+                                    let _ = client.write_content(peer_uri, peer_content).await;
+                                    let _ = client.delete_fs(archive_uri, false).await;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            primary_res
+        }
+        ChangeAction::PromoteToIndex | ChangeAction::DemoteFromIndex => {
             match before {
                 Some(content) => client.write_content(target, content).await,
                 None => client.snapshot_restore_scoped(snap_id, Some(target)).await,
@@ -794,4 +849,29 @@ fn build_merged_markdown(primary: &str, peer: &str, peer_uri: &str) -> String {
         lines.extend(extra);
     }
     lines.join("\n")
+}
+
+
+fn mark_frontmatter_verified(raw: &str) -> String {
+    if let Some(rest) = raw.strip_prefix("---\n") {
+        if let Some(end) = rest.find("\n---\n") {
+            let yaml = &rest[..end];
+            let updated_yaml = yaml.replacen("verified: false", "verified: true", 1);
+            return format!("---\n{}\n---\n{}", updated_yaml, &rest[end + 5..]);
+        }
+    }
+    raw.to_string()
+}
+
+fn stamp_index_priority_high(raw: &str) -> String {
+    if let Some(rest) = raw.strip_prefix("---\n") {
+        if let Some(end) = rest.find("\n---\n") {
+            let yaml = &rest[..end];
+            if yaml.contains("index_priority:") {
+                return raw.to_string();
+            }
+            return format!("---\n{}\nindex_priority: high\n---\n{}", yaml, &rest[end + 5..]);
+        }
+    }
+    format!("---\nindex_priority: high\n---\n{}", raw)
 }

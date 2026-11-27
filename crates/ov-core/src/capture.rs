@@ -133,6 +133,42 @@ impl DesktopDb {
         Ok(added)
     }
 
+    /// Record event_key watermarks with empty content and state='skipped' during Privacy Mode
+    /// so re-enabling capture later never backfills private messages from full transcript scans.
+    pub fn skip_capture(
+        &self,
+        profile: &str,
+        session: &str,
+        agent: &str,
+        uri: &str,
+        peer: Option<&str>,
+        messages: &[CapturedMessage],
+    ) -> Result<usize, String> {
+        if messages.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.lock_conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR IGNORE INTO capture_sessions(profile_key,session_key,agent,resource_uri,peer_id) VALUES (?1,?2,?3,?4,?5)",
+            params![profile, session, agent, uri, peer],
+        )
+        .map_err(|e| e.to_string())?;
+        let mut skipped = 0;
+        for msg in messages {
+            skipped += tx
+                .execute(
+                    "INSERT OR IGNORE INTO capture_outbox(profile_key,session_key,event_key,role,content,state) VALUES (?1,?2,?3,?4,'','skipped')",
+                    params![profile, session, msg.key, msg.role],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(skipped)
+    }
+
     fn claim_capture(&self, profile: &str, threshold: u64, reconcile: bool) -> Result<Option<Session>, String> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
@@ -355,5 +391,30 @@ mod tests {
         assert_eq!(db.enqueue_capture("b","session","codex","viking://resources/p/",None,&messages,false).unwrap(),2);
         assert_eq!(db.capture_health("a").unwrap().pending,2);
         assert_eq!(db.capture_health("b").unwrap().pending,2);
+    }
+
+    #[test]
+    fn privacy_mode_skip_capture_prevents_backfill_on_resume() {
+        let db = DesktopDb::open_in_memory().unwrap();
+        let (_, private_msgs) = collect(&json!({"messages":[
+            {"uuid":"m1","role":"user","content":"secret private note"}
+        ]}));
+        assert_eq!(
+            db.skip_capture("p", "sess", "codex", "viking://resources/p/", None, &private_msgs).unwrap(),
+            1
+        );
+        assert_eq!(db.capture_health("p").unwrap().pending, 0);
+        assert!(!db.has_capture_work("p").unwrap());
+
+        // Later resume capture with the same transcript plus a new message
+        let (_, resumed_msgs) = collect(&json!({"messages":[
+            {"uuid":"m1","role":"user","content":"secret private note"},
+            {"uuid":"m2","role":"assistant","content":"public decision after resume"}
+        ]}));
+        assert_eq!(
+            db.enqueue_capture("p", "sess", "codex", "viking://resources/p/", None, &resumed_msgs, false).unwrap(),
+            1
+        );
+        assert_eq!(db.capture_health("p").unwrap().pending, 1);
     }
 }
