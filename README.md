@@ -20,6 +20,8 @@
 
 - **Context Assembly 上下文组装与隐私水位（v0.4.0）**：`session-start` 在 2 秒超时预算内并发组装 4 类启动上下文（Project / Knowledge Index / Recent Peer / User Profile），`user-prompt-submit` 针对短句自动拼接近期会话上下文构建会话感知 Query；召回渲染剔除原始 JSON 噪音并按「先预留高分 L1 预算、再按六类记忆配额软上限填充」组装；隐私模式下记录空正文 `skipped` 水位，防止恢复捕获后补采历史隐私对话；Dreaming 拆分热度与 `verified` 语义，并在 `Merge` 批准后自动归档旧 `peer` 且支持双向回滚。
 
+- **5 类知识关系演化与风险分级治理（v0.5.0）**：Dreaming Reflector 升级为结构化 5 类关系契约（`DUPLICATES` / `UPDATES` / `EXTENDS` / `CONFLICTS` / `DERIVES`），`CONFLICTS` 自动标记高风险并保留双方证据留待人工裁定；策略中心新增可选「低风险变更自动执行并创建快照」，审核台同步支持风险徽章、关系标签与高风险筛选。
+
 ## 工程结构
 
 ```text

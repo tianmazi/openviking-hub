@@ -585,6 +585,25 @@ export function PolicyView({ policy, onSave }: PolicyViewProps) {
           <label className="inline-flex items-center gap-2">
             <input
               type="checkbox"
+              checked={draft.lifecycle.dreaming.auto_apply_low_risk ?? false}
+              onChange={(e) =>
+                setDraft({
+                  ...draft,
+                  lifecycle: {
+                    ...draft.lifecycle,
+                    dreaming: {
+                      ...draft.lifecycle.dreaming,
+                      auto_apply_low_risk: e.target.checked,
+                    },
+                  },
+                })
+              }
+            />
+            低风险变更自动执行并创建快照（中高风险与冲突仍留待人工审核）
+          </label>
+          <label className="inline-flex items-center gap-2">
+            <input
+              type="checkbox"
               checked={draft.lifecycle.dreaming.compile_wiki}
               onChange={(e) =>
                 setDraft({

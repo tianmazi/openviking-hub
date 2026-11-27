@@ -385,6 +385,7 @@ pub struct DreamingPolicy {
     pub compile_wiki: bool,
     pub auto_snapshot_before_run: bool,
     pub require_human_review: bool,
+    pub auto_apply_low_risk: bool,
     pub reflector_mode: ReflectorMode,
     pub reflector_cli_agent: String,
     pub reflector_endpoint: String,
@@ -404,6 +405,7 @@ impl Default for DreamingPolicy {
             compile_wiki: true,
             auto_snapshot_before_run: true,
             require_human_review: true,
+            auto_apply_low_risk: false,
             reflector_mode: ReflectorMode::Deterministic,
             reflector_cli_agent: "auto".to_string(),
             reflector_endpoint: "http://127.0.0.1:11434/v1".to_string(),
@@ -498,6 +500,54 @@ impl ReviewStatus {
             ReviewStatus::Rejected => "rejected",
             ReviewStatus::Applied => "applied",
             ReviewStatus::Conflict => "conflict",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum KnowledgeRelation {
+    Duplicates,
+    Updates,
+    Extends,
+    Conflicts,
+    Derives,
+}
+
+impl KnowledgeRelation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KnowledgeRelation::Duplicates => "DUPLICATES",
+            KnowledgeRelation::Updates => "UPDATES",
+            KnowledgeRelation::Extends => "EXTENDS",
+            KnowledgeRelation::Conflicts => "CONFLICTS",
+            KnowledgeRelation::Derives => "DERIVES",
+        }
+    }
+
+    pub fn parse_str(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_uppercase().as_str() {
+            "DUPLICATES" | "DUPLICATE" => Some(KnowledgeRelation::Duplicates),
+            "UPDATES" | "UPDATE" | "INVALIDATES" | "SUPERSEDES" => Some(KnowledgeRelation::Updates),
+            "EXTENDS" | "EXTEND" => Some(KnowledgeRelation::Extends),
+            "CONFLICTS" | "CONFLICT" => Some(KnowledgeRelation::Conflicts),
+            "DERIVES" | "DERIVE" => Some(KnowledgeRelation::Derives),
+            _ => None,
+        }
+    }
+
+    pub fn default_risk(self, similarity: f64) -> RiskLevel {
+        match self {
+            KnowledgeRelation::Conflicts => RiskLevel::High,
+            KnowledgeRelation::Updates | KnowledgeRelation::Derives => RiskLevel::Medium,
+            KnowledgeRelation::Extends => RiskLevel::Low,
+            KnowledgeRelation::Duplicates => {
+                if similarity >= 0.92 {
+                    RiskLevel::Low
+                } else {
+                    RiskLevel::Medium
+                }
+            }
         }
     }
 }

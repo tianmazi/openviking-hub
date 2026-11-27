@@ -118,6 +118,7 @@ let previewPolicy: PolicyConfig = {
       compile_wiki: true,
       auto_snapshot_before_run: true,
       require_human_review: true,
+      auto_apply_low_risk: false,
       reflector_mode: "deterministic",
       reflector_cli_agent: "auto",
       reflector_endpoint: "http://127.0.0.1:11434/v1",

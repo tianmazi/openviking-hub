@@ -3,7 +3,7 @@ use crate::dreaming::reflector::{reflect_inbox_route, reflect_merge};
 use crate::fs_util::sha256_hex;
 use crate::ov_client::{snapshot_commit_id, FindRequest, OvClient, OvClientError};
 use crate::policy::model::{
-    ChangeAction, MemoryCategory, PendingMemoryChange, PolicyConfig, ReviewStatus, RiskLevel,
+    ChangeAction, KnowledgeRelation, MemoryCategory, PendingMemoryChange, PolicyConfig, ReviewStatus, RiskLevel,
 };
 use crate::policy::router::{is_protected_rule_path, USER_MEMORIES_URI};
 use crate::provenance::{
@@ -274,39 +274,82 @@ pub async fn run_dreaming(
 
                                 let (frontmatter, primary_body) = split_frontmatter(&content);
                                 let (_, peer_body) = split_frontmatter(&other_content);
-                                let (merged_body, reflector_label) = match reflect_merge(
-                                    &policy.lifecycle.dreaming,
-                                    uri,
-                                    primary_body,
-                                    &other_uri,
-                                    peer_body,
-                                )
-                                .await
-                                {
-                                    Some(res) => (res.content, res.engine_label),
-                                    None => (
-                                        build_merged_markdown(primary_body, peer_body, &other_uri),
-                                        "deterministic".to_string(),
-                                    ),
-                                };
+                                let (relation, merged_body, reflector_label, custom_rationale, rel_conf) =
+                                    match reflect_merge(
+                                        &policy.lifecycle.dreaming,
+                                        uri,
+                                        primary_body,
+                                        &other_uri,
+                                        peer_body,
+                                    )
+                                    .await
+                                    {
+                                        Some(res) => (
+                                            res.relation,
+                                            res.content,
+                                            res.engine_label,
+                                            res.rationale,
+                                            res.confidence.unwrap_or(score as f32),
+                                        ),
+                                        None => (
+                                            KnowledgeRelation::Duplicates,
+                                            build_merged_markdown(primary_body, peer_body, &other_uri),
+                                            "deterministic".to_string(),
+                                            None,
+                                            score as f32,
+                                        ),
+                                    };
 
                                 // Staged proposals remain verified=false until human approval or independent evidence.
                                 let mut prov = MemoryProvenance::new(
                                     "dreaming",
                                     "shared",
                                     false,
-                                    score as f32,
+                                    rel_conf,
                                 );
                                 prov.updated_by = format!("dreaming:{}", reflector_label);
                                 prov.evidence_uris = vec![uri.to_string(), other_uri.clone()];
                                 let merged_with_prov =
                                     render_frontmatter(frontmatter, &merged_body, &prov);
-                                let peer_file_name = other_uri.rsplit('/').next().unwrap_or("peer.md");
-                                let peer_archive_uri = format!(
-                                    "{}/merged-{}",
-                                    policy.lifecycle.archival.archive_uri.trim_end_matches('/'),
-                                    peer_file_name
+                                let risk_level = relation.default_risk(score);
+                                let archives_peer = matches!(
+                                    relation,
+                                    KnowledgeRelation::Duplicates
+                                        | KnowledgeRelation::Updates
+                                        | KnowledgeRelation::Extends
                                 );
+                                let peer_file_name = other_uri.rsplit('/').next().unwrap_or("peer.md");
+                                let peer_archive_uri = archives_peer.then(|| {
+                                    format!(
+                                        "{}/merged-{}",
+                                        policy.lifecycle.archival.archive_uri.trim_end_matches('/'),
+                                        peer_file_name
+                                    )
+                                });
+                                let rationale = match custom_rationale {
+                                    Some(reason) => format!("[{}] {}（{}）", relation.as_str(), reason, reflector_label),
+                                    None if relation == KnowledgeRelation::Conflicts => format!(
+                                        "[CONFLICTS] 检测到与 {} 存在事实冲突（相似度 {:.2}），已保留双方内容，需人工裁定。",
+                                        other_uri, score
+                                    ),
+                                    None => format!(
+                                        "[{}] 检测到与 {} 语义高度重合（相似度 {:.2}），已通过 {} 生成整理提案。",
+                                        relation.as_str(), other_uri, score, reflector_label
+                                    ),
+                                };
+
+                                let mut evidence = json!({
+                                    "source": "semantic_dedupe",
+                                    "relation": relation.as_str(),
+                                    "peer_uri": other_uri,
+                                    "peer_before_content": other_content,
+                                    "similarity": score,
+                                    "category": category.as_str(),
+                                    "reflector": reflector_label
+                                });
+                                if let Some(ref archive_uri) = peer_archive_uri {
+                                    evidence["peer_archive_uri"] = json!(archive_uri);
+                                }
 
                                 let change = PendingMemoryChange {
                                     id: format!("chg-{}", Uuid::new_v4().simple()),
@@ -314,27 +357,15 @@ pub async fn run_dreaming(
                                     snapshot_id: None,
                                     created_at: now,
                                     action: ChangeAction::Merge,
-                                    risk_level: RiskLevel::Medium,
+                                    risk_level,
                                     target_uri: uri.to_string(),
                                     destination_uri: Some(other_uri.clone()),
                                     category,
                                     base_hash: Some(sha256_hex(&content)),
                                     before_content: Some(content.clone()),
                                     after_content: Some(merged_with_prov),
-                                    rationale: format!(
-                                        "检测到与 {} 语义高度重合（相似度 {:.2}），已通过 {} 生成去重合并提案；批准后将把旧条目归档至 {}。",
-                                        other_uri, score, reflector_label, peer_archive_uri
-                                    ),
-                                    evidence_json: json!({
-                                        "source": "semantic_dedupe",
-                                        "peer_uri": other_uri,
-                                        "peer_archive_uri": peer_archive_uri,
-                                        "peer_before_content": other_content,
-                                        "similarity": score,
-                                        "category": category.as_str(),
-                                        "reflector": reflector_label
-                                    })
-                                    .to_string(),
+                                    rationale,
+                                    evidence_json: evidence.to_string(),
                                     status: ReviewStatus::Pending,
                                 };
                                 db.insert_pending_change_for_profile(&profile_key, &change)?;
@@ -388,10 +419,54 @@ pub async fn run_dreaming(
         }
     }
 
+    let mut auto_applied_count = 0usize;
+    let mut auto_snapshot_id: Option<String> = None;
+    if policy.lifecycle.dreaming.auto_apply_low_risk {
+        let mut low_ids = Vec::new();
+        for chg in &staged {
+            if chg.risk_level == RiskLevel::Low {
+                db.update_change_decision_for_profile(
+                    &profile_key,
+                    &chg.id,
+                    ReviewStatus::Accepted,
+                    None,
+                )?;
+                low_ids.push(chg.id.clone());
+            }
+        }
+        if !low_ids.is_empty() {
+            if let Ok(report) = apply_accepted_changes(client, db, policy).await {
+                auto_applied_count = report.applied_ids.len();
+                auto_snapshot_id = report.snapshot_id;
+                for chg in &mut staged {
+                    if report.applied_ids.contains(&chg.id) {
+                        chg.status = ReviewStatus::Applied;
+                        chg.snapshot_id = auto_snapshot_id.clone();
+                    }
+                }
+            }
+        }
+    }
+    counts["auto_applied"] = json!(auto_applied_count);
+
+    let has_pending = staged.iter().any(|c| c.status == ReviewStatus::Pending);
     let summary_str = counts.to_string();
-    let final_status = "ready_for_review";
-    db.update_run_status_for_profile(&profile_key, &run_id, final_status, None, Some(&summary_str))?;
+    let final_status = if has_pending {
+        "ready_for_review"
+    } else if auto_applied_count > 0 {
+        "applied"
+    } else {
+        "ready_for_review"
+    };
+    db.update_run_status_for_profile(
+        &profile_key,
+        &run_id,
+        final_status,
+        auto_snapshot_id.as_deref(),
+        Some(&summary_str),
+    )?;
     run.status = final_status.to_string();
+    run.snapshot_id = auto_snapshot_id;
     run.summary_json = summary_str;
     run.finished_at = Some(Utc::now().timestamp());
 

@@ -133,6 +133,7 @@ export interface PolicyConfig {
       compile_wiki: boolean;
       auto_snapshot_before_run: boolean;
       require_human_review: boolean;
+      auto_apply_low_risk: boolean;
       reflector_mode: ReflectorMode;
       reflector_cli_agent: string;
       reflector_endpoint: string;

@@ -1,5 +1,5 @@
 use crate::platform::PlatformPaths;
-use crate::policy::model::{DreamingPolicy, ReflectorMode};
+use crate::policy::model::{DreamingPolicy, KnowledgeRelation, ReflectorMode};
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::{process::Stdio, time::Duration};
@@ -7,7 +7,10 @@ use tokio::{io::AsyncWriteExt, process::Command};
 
 #[derive(Debug, Clone)]
 pub struct ReflectorResult {
+    pub relation: KnowledgeRelation,
     pub content: String,
+    pub rationale: Option<String>,
+    pub confidence: Option<f32>,
     pub engine_label: String,
 }
 
@@ -33,11 +36,14 @@ pub async fn reflect_merge(
     }
 
     let prompt = format!(
-        "You are a memory consolidation engine. Merge the following two overlapping Markdown memories into ONE clean, concise, contradiction-free Markdown note.\n\
-         Rules:\n\
-         - Keep the same language as the inputs.\n\
-         - Remove duplicate points; if newer or more specific rules conflict with older vague ones, keep the clearer rule.\n\
-         - Output ONLY the merged Markdown body (no YAML frontmatter, no outer ```markdown fences).\n\n\
+        "You are a memory evolution engine. Compare the two Markdown memories below and classify their relationship into ONE of 5 types:\n\
+         - DUPLICATES: same fact repeated; merge cleanly and remove redundancy.\n\
+         - UPDATES: newer/more specific fact supersedes an older one; keep the updated fact and note what was superseded.\n\
+         - EXTENDS: complementary facts; combine both without discarding existing valid rules.\n\
+         - CONFLICTS: direct contradiction that requires human review; keep BOTH positions clearly labeled under a conflict note.\n\
+         - DERIVES: higher-level inferred pattern from both notes.\n\
+         Respond with ONLY a valid JSON object:\n\
+         {{\"relation\": \"DUPLICATES|UPDATES|EXTENDS|CONFLICTS|DERIVES\", \"merged_content\": \"Markdown body without YAML frontmatter\", \"rationale\": \"short explanation in input language\", \"confidence\": 0.90}}\n\n\
          [Primary URI: {}]\n{}\n\n\
          [Peer URI: {}]\n{}\n",
         primary_uri,
@@ -47,14 +53,7 @@ pub async fn reflect_merge(
     );
 
     let (raw_out, label) = invoke_reflector(policy, &prompt).await?;
-    let cleaned = strip_markdown_fence(&raw_out).trim().to_string();
-    if cleaned.len() < 10 {
-        return None;
-    }
-    Some(ReflectorResult {
-        content: cleaned,
-        engine_label: label,
-    })
+    parse_reflect_merge_output(&raw_out, label)
 }
 
 /// Ask the optional reflector to classify an Inbox note into the best matching project URI.
@@ -268,6 +267,55 @@ fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
+
+pub(crate) fn parse_reflect_merge_output(raw_out: &str, engine_label: String) -> Option<ReflectorResult> {
+    if let Some(obj) = extract_json_object(raw_out) {
+        let relation = obj
+            .get("relation")
+            .and_then(Value::as_str)
+            .and_then(KnowledgeRelation::parse_str)
+            .unwrap_or(KnowledgeRelation::Duplicates);
+        if let Some(body) = obj
+            .get("merged_content")
+            .or_else(|| obj.get("content"))
+            .and_then(Value::as_str)
+        {
+            let cleaned = strip_markdown_fence(body).trim().to_string();
+            if cleaned.len() >= 10 {
+                let rationale = obj
+                    .get("rationale")
+                    .and_then(Value::as_str)
+                    .map(|r| r.trim().to_string())
+                    .filter(|r| !r.is_empty());
+                let confidence = obj
+                    .get("confidence")
+                    .and_then(Value::as_f64)
+                    .map(|c| (c as f32).clamp(0.0, 1.0));
+                return Some(ReflectorResult {
+                    relation,
+                    content: cleaned,
+                    rationale,
+                    confidence,
+                    engine_label,
+                });
+            }
+        }
+    }
+
+    // Graceful fallback when an LLM or mock returns plain Markdown instead of JSON
+    let cleaned = strip_markdown_fence(raw_out).trim().to_string();
+    if cleaned.len() < 10 {
+        return None;
+    }
+    Some(ReflectorResult {
+        relation: KnowledgeRelation::Duplicates,
+        content: cleaned,
+        rationale: None,
+        confidence: None,
+        engine_label,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,5 +331,23 @@ mod tests {
             v.get("destination_dir").and_then(|x| x.as_str()),
             Some("viking://resources/projects/demo/")
         );
+    }
+
+    #[test]
+    fn test_parse_five_knowledge_relations_and_fallback() {
+        let conflict_json = r#"{"relation":"CONFLICTS","merged_content":"- Side A: use Bearer\n- Side B: use Basic","rationale":"Auth headers contradict","confidence":0.88}"#;
+        let parsed = parse_reflect_merge_output(conflict_json, "llm:test".into()).unwrap();
+        assert_eq!(parsed.relation, KnowledgeRelation::Conflicts);
+        assert_eq!(parsed.rationale.as_deref(), Some("Auth headers contradict"));
+        assert_eq!(parsed.relation.default_risk(0.95), crate::policy::model::RiskLevel::High);
+
+        let updates_json = r#"{"relation":"UPDATES","merged_content":"Java 21 is required","rationale":"Upgraded from 17"}"#;
+        let upd = parse_reflect_merge_output(updates_json, "llm:test".into()).unwrap();
+        assert_eq!(upd.relation, KnowledgeRelation::Updates);
+        assert_eq!(upd.relation.default_risk(0.95), crate::policy::model::RiskLevel::Medium);
+
+        let fallback = parse_reflect_merge_output("```markdown\n# Plain merged body\n```", "llm:test".into()).unwrap();
+        assert_eq!(fallback.relation, KnowledgeRelation::Duplicates);
+        assert_eq!(fallback.content, "# Plain merged body");
     }
 }

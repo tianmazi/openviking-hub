@@ -33,6 +33,30 @@ interface DreamingWorkbenchProps {
   onPinUri: (uri: string) => Promise<void>;
 }
 
+
+const RISK_BADGES: Record<string, { label: string; cls: string }> = {
+  high: { label: "高风险", cls: "bg-rose-500/20 text-rose-300 border border-rose-500/30" },
+  medium: { label: "中风险", cls: "bg-amber-500/15 text-amber-300 border border-amber-500/25" },
+  low: { label: "低风险", cls: "bg-emerald-500/15 text-emerald-300 border border-emerald-500/25" },
+};
+
+const RELATION_LABELS: Record<string, string> = {
+  DUPLICATES: "重复去重",
+  UPDATES: "演进更新",
+  EXTENDS: "扩展补充",
+  CONFLICTS: "事实冲突",
+  DERIVES: "推导结论",
+};
+
+function parseRelation(evidenceJson: string): string | null {
+  try {
+    const parsed = JSON.parse(evidenceJson) as { relation?: string };
+    return parsed.relation ?? null;
+  } catch {
+    return null;
+  }
+}
+
 const ACTION_LABELS: Record<ChangeAction, string> = {
   merge: "冲突合并",
   move_from_inbox: "Inbox 分拣",
@@ -69,6 +93,7 @@ export function DreamingWorkbench({
     () =>
       activeQueue.filter((c) => {
         if (filterAction === "all") return true;
+        if (filterAction === "high_risk") return c.risk_level === "high";
         return c.action === filterAction;
       }),
     [activeQueue, filterAction],
@@ -254,6 +279,7 @@ export function DreamingWorkbench({
         <div className="flex items-center gap-1.5 overflow-x-auto">
           {[
             { id: "all", label: `全部 (${activeQueue.length})` },
+            { id: "high_risk", label: `高风险/冲突 (${activeQueue.filter((c) => c.risk_level === "high").length})` },
             { id: "merge", label: "冲突合并" },
             { id: "move_from_inbox", label: "Inbox 分拣" },
             { id: "promote_to_index", label: "热记忆晋升" },
@@ -340,10 +366,23 @@ export function DreamingWorkbench({
                     : "bg-surface-1 border-border-subtle hover:border-border-strong"
                 }`}
               >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-surface-2 text-indigo-300">
-                    {ACTION_LABELS[item.action]}
-                  </span>
+                <div className="flex items-center justify-between gap-1.5 flex-wrap">
+                  <div className="flex items-center gap-1 flex-wrap">
+                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-surface-2 text-indigo-300">
+                      {ACTION_LABELS[item.action]}
+                    </span>
+                    <span className={`text-[10px] px-1.5 py-0.5 rounded ${RISK_BADGES[item.risk_level]?.cls ?? ""}`}>
+                      {RISK_BADGES[item.risk_level]?.label ?? item.risk_level}
+                    </span>
+                    {(() => {
+                      const rel = parseRelation(item.evidence_json);
+                      return rel ? (
+                        <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-violet-500/15 text-violet-300">
+                          {RELATION_LABELS[rel] ?? rel}
+                        </span>
+                      ) : null;
+                    })()}
+                  </div>
                   <span
                     className={`text-[10px] px-1.5 py-0.5 rounded-full ${
                       item.status === "accepted"

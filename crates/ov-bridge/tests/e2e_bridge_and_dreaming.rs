@@ -982,3 +982,42 @@ async fn e2e_merge_archives_peer_upgrades_verified_and_rolls_back_both() {
         assert!(!guard.files.contains_key(PEER_ARCHIVED), "rollback must clear archived peer");
     }
 }
+
+
+#[tokio::test]
+async fn e2e_auto_apply_low_risk_applies_low_and_keeps_medium_high_pending() {
+    const INBOX_NOTE: &str = "viking://~/resources/inbox/scratch.md";
+    const PROJECT_README: &str = "viking://resources/projects/demo/README.md";
+    const PRIMARY: &str = "viking://~/memories/preferences/git.md";
+    const PEER: &str = "viking://~/memories/preferences/git-old.md";
+
+    let state = Arc::new(Mutex::new(MockState {
+        files: HashMap::from([
+            (INBOX_NOTE.into(), "# Inbox note".into()),
+            (PROJECT_README.into(), "# Demo".into()),
+            (PRIMARY.into(), "# Git Style\nUse English Conventional Commits.".into()),
+            (PEER.into(), "# Git Style\nUse English Conventional Commits.\nOld note.".into()),
+        ]),
+        ..Default::default()
+    }));
+    let url = start_mock_openviking_server(state.clone()).await;
+    let client = test_client(&url, "work");
+    let db = DesktopDb::open_in_memory().unwrap();
+    let mut policy = PolicyConfig::default();
+    policy.lifecycle.dreaming.auto_apply_low_risk = true;
+
+    let (run, staged) = run_dreaming(&client, &db, &policy, "e2e").await.unwrap();
+    assert_eq!(run.status, "ready_for_review");
+    assert!(run.snapshot_id.is_some(), "Auto-apply must create a rollbackable snapshot");
+
+    let wiki = staged.iter().find(|c| c.action == ChangeAction::WikiCompile).unwrap();
+    assert_eq!(wiki.status, ReviewStatus::Applied, "Low-risk WikiCompile should auto-apply");
+
+    let inbox = staged.iter().find(|c| c.action == ChangeAction::MoveFromInbox).unwrap();
+    assert_eq!(inbox.status, ReviewStatus::Pending, "Medium-risk MoveFromInbox must stay pending");
+
+    let merge = staged.iter().find(|c| c.action == ChangeAction::Merge).unwrap();
+    let ev: Value = serde_json::from_str(&merge.evidence_json).unwrap();
+    assert_eq!(ev["relation"], "DUPLICATES");
+    assert_eq!(merge.status, ReviewStatus::Pending, "Medium-risk Merge (score 0.89 < 0.92) must stay pending");
+}
