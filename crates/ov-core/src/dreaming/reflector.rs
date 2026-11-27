@@ -354,8 +354,8 @@ mod tests {
         assert_eq!(fallback.relation, KnowledgeRelation::Duplicates);
         assert_eq!(fallback.content, "# Plain merged body");
         for input in [
-            r#"{"merged_content":"# Missing relation"}"#,
-            r#"{"relation":"OTHER","merged_content":"# Invalid relation"}"#,
+            r##"{"merged_content":"# Missing relation"}"##,
+            r##"{"relation":"OTHER","merged_content":"# Invalid relation"}"##,
         ] {
             assert!(!parse_reflect_merge_output(input, "llm:test".into()).unwrap().classified);
         }
