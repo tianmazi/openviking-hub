@@ -8,6 +8,7 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/tianmazi/openviking-hub/release.yml?branch=main&style=flat-square&label=CI)](https://github.com/tianmazi/openviking-hub/actions)
 [![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%28WSL%29%20%7C%20Linux-blue?style=flat-square)](https://github.com/tianmazi/openviking-hub/releases)
 [![Stack](https://img.shields.io/badge/built%20with-Tauri%20v2%20%2B%20Rust-orange?style=flat-square)](https://github.com/tianmazi/openviking-hub)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
 
 [English](README.md) | **简体中文**
 
