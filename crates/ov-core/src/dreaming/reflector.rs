@@ -8,6 +8,7 @@ use tokio::{io::AsyncWriteExt, process::Command};
 #[derive(Debug, Clone)]
 pub struct ReflectorResult {
     pub relation: KnowledgeRelation,
+    pub classified: bool,
     pub content: String,
     pub rationale: Option<String>,
     pub confidence: Option<f32>,
@@ -273,8 +274,7 @@ pub(crate) fn parse_reflect_merge_output(raw_out: &str, engine_label: String) ->
         let relation = obj
             .get("relation")
             .and_then(Value::as_str)
-            .and_then(KnowledgeRelation::parse_str)
-            .unwrap_or(KnowledgeRelation::Duplicates);
+            .and_then(KnowledgeRelation::parse_str);
         if let Some(body) = obj
             .get("merged_content")
             .or_else(|| obj.get("content"))
@@ -292,7 +292,8 @@ pub(crate) fn parse_reflect_merge_output(raw_out: &str, engine_label: String) ->
                     .and_then(Value::as_f64)
                     .map(|c| (c as f32).clamp(0.0, 1.0));
                 return Some(ReflectorResult {
-                    relation,
+                    relation: relation.unwrap_or(KnowledgeRelation::Duplicates),
+                    classified: relation.is_some(),
                     content: cleaned,
                     rationale,
                     confidence,
@@ -309,6 +310,7 @@ pub(crate) fn parse_reflect_merge_output(raw_out: &str, engine_label: String) ->
     }
     Some(ReflectorResult {
         relation: KnowledgeRelation::Duplicates,
+        classified: false,
         content: cleaned,
         rationale: None,
         confidence: None,
@@ -337,6 +339,7 @@ mod tests {
     fn test_parse_five_knowledge_relations_and_fallback() {
         let conflict_json = r#"{"relation":"CONFLICTS","merged_content":"- Side A: use Bearer\n- Side B: use Basic","rationale":"Auth headers contradict","confidence":0.88}"#;
         let parsed = parse_reflect_merge_output(conflict_json, "llm:test".into()).unwrap();
+        assert!(parsed.classified);
         assert_eq!(parsed.relation, KnowledgeRelation::Conflicts);
         assert_eq!(parsed.rationale.as_deref(), Some("Auth headers contradict"));
         assert_eq!(parsed.relation.default_risk(0.95), crate::policy::model::RiskLevel::High);
@@ -347,7 +350,14 @@ mod tests {
         assert_eq!(upd.relation.default_risk(0.95), crate::policy::model::RiskLevel::Medium);
 
         let fallback = parse_reflect_merge_output("```markdown\n# Plain merged body\n```", "llm:test".into()).unwrap();
+        assert!(!fallback.classified);
         assert_eq!(fallback.relation, KnowledgeRelation::Duplicates);
         assert_eq!(fallback.content, "# Plain merged body");
+        for input in [
+            r#"{"merged_content":"# Missing relation"}"#,
+            r#"{"relation":"OTHER","merged_content":"# Invalid relation"}"#,
+        ] {
+            assert!(!parse_reflect_merge_output(input, "llm:test".into()).unwrap().classified);
+        }
     }
 }

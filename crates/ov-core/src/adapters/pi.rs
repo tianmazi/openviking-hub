@@ -121,11 +121,26 @@ function runHook(event, payload) {
 }
 
 export default function (pi) {
-  const sessionPayload = (ctx) => ({
-    cwd: ctx.cwd,
-    session_id: ctx.sessionManager.getSessionId(),
-    transcript_path: ctx.sessionManager.getSessionFile(),
-  });
+  const sessionPayload = (ctx, event) => {
+    const manager = ctx.sessionManager;
+    const payload = { cwd: ctx.cwd, session_id: manager.getSessionId() };
+    const branch = manager.getBranch?.();
+    if (Array.isArray(branch)) {
+      // Preserve entry IDs so repeated scans and existing JSONL watermarks still match.
+      return { ...payload, messages: branch.filter((entry) => entry.type === "message") };
+    }
+    if (Array.isArray(event?.messages)) {
+      const messages = event.messages.map((message) => {
+        if (message.id || message.uuid || message.timestamp == null) return message;
+        return {
+          ...message,
+          id: `pi:${message.role}:${message.timestamp}:${JSON.stringify(message.content)}`,
+        };
+      });
+      return { ...payload, messages };
+    }
+    return { ...payload, transcript_path: manager.getSessionFile() };
+  };
 
   let startup = "";
   pi.on("session_start", async (_event, ctx) => {
@@ -141,7 +156,7 @@ export default function (pi) {
   });
 
   pi.on("agent_end", async (event, ctx) => {
-    runHook("stop", { ...sessionPayload(ctx), messages: event.messages });
+    runHook("stop", sessionPayload(ctx, event));
   });
   pi.on("session_before_compact", async (_event, ctx) => {
     runHook("pre-compact", sessionPayload(ctx));

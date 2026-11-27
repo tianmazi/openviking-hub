@@ -96,6 +96,11 @@ impl DesktopDb {
             .map_err(|e| e.to_string())?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
+        let had_privacy_exclusions: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'privacy_exclusions')",
+            [],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
         tx.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS dreaming_runs (
@@ -191,6 +196,12 @@ impl DesktopDb {
                 state TEXT NOT NULL DEFAULT 'pending',
                 UNIQUE(profile_key, session_key, event_key)
             );
+            CREATE TABLE IF NOT EXISTS privacy_exclusions (
+                session_key TEXT NOT NULL,
+                event_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (session_key, event_key)
+            );
             CREATE TABLE IF NOT EXISTS kv_state (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -198,6 +209,15 @@ impl DesktopDb {
             "#,
         )
         .map_err(|e| e.to_string())?;
+        if !had_privacy_exclusions {
+            // Legacy session hashes include the route and cannot be reversed. Honor their
+            // skipped event keys across routes, even when the original route is unknown.
+            tx.execute(
+                "INSERT OR IGNORE INTO privacy_exclusions (session_key, event_key, created_at)
+                 SELECT '', event_key, ?1 FROM capture_outbox WHERE state = 'skipped'",
+                [Utc::now().timestamp()],
+            ).map_err(|e| e.to_string())?;
+        }
         for table in ["dreaming_runs", "pending_memory_changes", "recall_events", "pinned_uris"] {
             let has_profile: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = 'profile_key')",
@@ -221,7 +241,9 @@ impl DesktopDb {
              CREATE INDEX IF NOT EXISTS pending_changes_profile_status
                  ON pending_memory_changes (profile_key, status);
              CREATE INDEX IF NOT EXISTS pending_changes_profile_run
-                 ON pending_memory_changes (profile_key, run_id);",
+                 ON pending_memory_changes (profile_key, run_id);
+             CREATE INDEX IF NOT EXISTS capture_outbox_skipped_event
+                 ON capture_outbox (session_key, event_key) WHERE state = 'skipped';",
         ).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
     }
@@ -475,16 +497,45 @@ impl DesktopDb {
         &self,
         profile_key: &str,
     ) -> Result<Vec<PendingMemoryChange>, String> {
+        self.claim_changes_for_profile(profile_key, None, ReviewStatus::Accepted)
+    }
+
+    pub fn claim_accepted_changes_by_ids_for_profile(
+        &self,
+        profile_key: &str,
+        ids: &[String],
+    ) -> Result<Vec<PendingMemoryChange>, String> {
+        self.claim_changes_for_profile(profile_key, Some(ids), ReviewStatus::Accepted)
+    }
+
+    pub(crate) fn claim_auto_apply_changes_for_profile(
+        &self,
+        profile_key: &str,
+        ids: &[String],
+    ) -> Result<Vec<PendingMemoryChange>, String> {
+        // Claim pending proposals atomically so a simultaneous manual apply cannot take them.
+        self.claim_changes_for_profile(profile_key, Some(ids), ReviewStatus::Pending)
+    }
+
+    fn claim_changes_for_profile(
+        &self,
+        profile_key: &str,
+        ids: Option<&[String]>,
+        status: ReviewStatus,
+    ) -> Result<Vec<PendingMemoryChange>, String> {
+        let ids = ids.map(serde_json::to_string).transpose().map_err(|e| e.to_string())?;
+        let applying = if status == ReviewStatus::Pending { "auto_applying" } else { "applying" };
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         let mut changes = {
             let mut stmt = tx.prepare(&format!(
-                "UPDATE pending_memory_changes SET status = 'applying'
-                 WHERE status = 'accepted' AND profile_key = ?1 AND profile_key != ''
+                "UPDATE pending_memory_changes SET status = ?4
+                 WHERE status = ?3 AND profile_key = ?1 AND profile_key != ''
+                   AND (?2 IS NULL OR id IN (SELECT value FROM json_each(?2)))
                  RETURNING {CHANGE_COLUMNS}",
             )).map_err(|e| e.to_string())?;
-            let rows = stmt.query_map([profile_key], map_change_row)
+            let rows = stmt.query_map(params![profile_key, ids, status.as_str(), applying], map_change_row)
                 .map_err(|e| e.to_string())?;
             rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
         };
@@ -493,7 +544,7 @@ impl DesktopDb {
                 "UPDATE dreaming_runs SET status = 'applying'
                  WHERE profile_key = ?1 AND id IN (
                      SELECT run_id FROM pending_memory_changes
-                     WHERE profile_key = ?1 AND status = 'applying'
+                     WHERE profile_key = ?1 AND status IN ('applying', 'auto_applying')
                  )",
                 [profile_key],
             ).map_err(|e| e.to_string())?;
@@ -507,15 +558,16 @@ impl DesktopDb {
         &self,
         profile_key: &str,
         changes: &[PendingMemoryChange],
+        retry_status: ReviewStatus,
     ) -> Result<(), String> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let mut runs = HashSet::new();
         for change in changes {
             tx.execute(
-                "UPDATE pending_memory_changes SET status = 'accepted'
-                 WHERE profile_key = ?1 AND id = ?2 AND status = 'applying'",
-                params![profile_key, change.id],
+                "UPDATE pending_memory_changes SET status = ?3
+                 WHERE profile_key = ?1 AND id = ?2 AND status IN ('applying', 'auto_applying')",
+                params![profile_key, change.id, retry_status.as_str()],
             ).map_err(|e| e.to_string())?;
             runs.insert(change.run_id.as_str());
         }
@@ -523,6 +575,38 @@ impl DesktopDb {
             refresh_run_outcomes(&tx, profile_key, run_id).map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn finalize_dreaming_run(
+        &self,
+        profile_key: &str,
+        run_id: &str,
+        summary: &str,
+    ) -> Result<(DreamingRun, Vec<PendingMemoryChange>), String> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        refresh_run_outcomes(&tx, profile_key, run_id).map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE dreaming_runs SET summary_json = ?3 WHERE id = ?1 AND profile_key = ?2",
+            params![run_id, profile_key, summary],
+        ).map_err(|e| e.to_string())?;
+        let run = tx.query_row(
+            &format!("SELECT {RUN_COLUMNS} FROM dreaming_runs WHERE id = ?1 AND profile_key = ?2"),
+            params![run_id, profile_key],
+            map_run_row,
+        ).map_err(|e| e.to_string())?;
+        let changes = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {CHANGE_COLUMNS} FROM pending_memory_changes
+                 WHERE run_id = ?1 AND profile_key = ?2 ORDER BY rowid",
+            )).map_err(|e| e.to_string())?;
+            let rows = stmt.query_map(params![run_id, profile_key], map_change_row)
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?
+        };
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok((run, changes))
     }
 
     /// Legacy entry point for trusted local callers that already hold a change ID.
@@ -581,7 +665,7 @@ impl DesktopDb {
             .map_err(|e| e.to_string())?;
         let updated = tx.execute(
             "UPDATE pending_memory_changes SET status = ?1, snapshot_id = ?2
-             WHERE id = ?3 AND profile_key = ?4 AND status = 'applying'",
+             WHERE id = ?3 AND profile_key = ?4 AND status IN ('applying', 'auto_applying')",
             params![status, snapshot_id, change.id, profile_key],
         ).map_err(|e| e.to_string())?;
         if updated != 1 {
@@ -637,7 +721,7 @@ impl DesktopDb {
             let mut stmt = tx
                 .prepare(
                     "SELECT DISTINCT profile_key, run_id FROM pending_memory_changes
-                     WHERE status = 'applying'",
+                     WHERE status IN ('applying', 'auto_applying')",
                 )
                 .map_err(|e| e.to_string())?;
             let rows = stmt
@@ -647,7 +731,9 @@ impl DesktopDb {
         };
         let recovered = tx
             .execute(
-                "UPDATE pending_memory_changes SET status = 'accepted' WHERE status = 'applying'",
+                "UPDATE pending_memory_changes
+                 SET status = CASE status WHEN 'auto_applying' THEN 'pending' ELSE 'accepted' END
+                 WHERE status IN ('applying', 'auto_applying')",
                 [],
             )
             .map_err(|e| e.to_string())?;
@@ -672,7 +758,7 @@ impl DesktopDb {
 fn refresh_run_outcomes(conn: &Connection, profile_key: &str, run_id: &str) -> rusqlite::Result<()> {
     conn.execute(
         "WITH outcomes AS (
-            SELECT COUNT(*) FILTER (WHERE status = 'applying') AS applying,
+            SELECT COUNT(*) FILTER (WHERE status IN ('applying', 'auto_applying')) AS applying,
                    COUNT(*) FILTER (WHERE status IN ('pending', 'accepted')) AS review,
                    COUNT(*) FILTER (WHERE status = 'failed') AS failed,
                    COUNT(*) FILTER (WHERE status = 'conflict') AS conflicts,
@@ -740,7 +826,7 @@ fn map_change_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingMemoryChan
     let category: MemoryCategory = serde_json::from_str(&format!("\"{}\"", cat_str))
         .unwrap_or(MemoryCategory::Patterns);
     let status = match status_str.as_str() {
-        "applying" => ReviewStatus::Accepted,
+        "applying" | "auto_applying" => ReviewStatus::Accepted,
         "failed" => ReviewStatus::Conflict,
         _ => serde_json::from_str(&format!("\"{}\"", status_str))
             .unwrap_or(ReviewStatus::Pending),
@@ -811,7 +897,7 @@ mod tests {
         let claimed = db.claim_accepted_changes_for_profile("a").unwrap();
         assert_eq!(claimed.len(), 1);
         assert!(db.update_change_decision("chg-1", ReviewStatus::Accepted, None).is_err());
-        db.release_claim_for_profile("a", &claimed).unwrap();
+        db.release_claim_for_profile("a", &claimed, ReviewStatus::Accepted).unwrap();
         let claimed = db.claim_accepted_changes_for_profile("a").unwrap();
         db.finish_claimed_change_for_profile("a", &claimed[0], None, "conflict")
             .unwrap();
@@ -898,6 +984,33 @@ mod tests {
     }
 
     #[test]
+    fn claims_by_id_are_profile_scoped_and_auto_claims_recover_as_pending() {
+        let db = DesktopDb::open_in_memory().unwrap();
+        db.create_run_for_profile("a", "current", "manual").unwrap();
+        let mut low = archive_change("low", "current");
+        low.status = ReviewStatus::Accepted;
+        let mut high = archive_change("older-high", "previous");
+        high.risk_level = RiskLevel::High;
+        high.status = ReviewStatus::Accepted;
+        let other = PendingMemoryChange { id: "other".into(), ..low.clone() };
+        db.insert_pending_change_for_profile("a", &low).unwrap();
+        db.insert_pending_change_for_profile("a", &high).unwrap();
+        db.insert_pending_change_for_profile("b", &other).unwrap();
+
+        assert!(db.claim_accepted_changes_by_ids_for_profile("a", &[]).unwrap().is_empty());
+        let claimed = db.claim_accepted_changes_by_ids_for_profile("a", &[low.id.clone(), other.id]).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, low.id);
+        db.release_claim_for_profile("a", &claimed, ReviewStatus::Pending).unwrap();
+        let claimed = db.claim_auto_apply_changes_for_profile("a", &[low.id.clone()]).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(db.get_run("current").unwrap().unwrap().status, "applying");
+        assert_eq!(db.recover_stale_claims().unwrap(), 1);
+        assert_eq!(db.list_pending_changes_for_profile("a", Some("pending")).unwrap()[0].id, low.id);
+        assert_eq!(db.list_pending_changes_for_profile("a", Some("accepted")).unwrap()[0].id, high.id);
+    }
+
+    #[test]
     fn legacy_schema_migrates_and_schedule_claim_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("desktop.db");
@@ -915,9 +1028,17 @@ mod tests {
         assert!(db.is_pinned_for_profile("", "viking://legacy").unwrap());
         assert!(db.is_pinned_for_profile("a", "viking://legacy").unwrap());
         assert!(db.claim_schedule_slot("a", 100).unwrap());
+        let conn = db.lock_conn().unwrap();
+        conn.execute_batch(
+            "DROP TABLE privacy_exclusions;
+             INSERT INTO capture_outbox (profile_key, session_key, event_key, role, content, state)
+             VALUES ('old-profile', 'old-route-hash', 'private-event', 'user', '', 'skipped');",
+        ).unwrap();
+        drop(conn);
         drop(db);
 
         let db = DesktopDb::open(&path).unwrap();
+        assert!(db.is_privacy_excluded("new-route-hash", "private-event").unwrap());
         assert!(!db.claim_schedule_slot("a", 100).unwrap());
         assert!(!db.claim_schedule_slot("a", 99).unwrap());
         assert!(db.claim_schedule_slot("b", 100).unwrap());

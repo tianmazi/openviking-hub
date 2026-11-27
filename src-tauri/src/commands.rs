@@ -65,6 +65,10 @@ pub fn get_capture_health() -> Result<ov_core::capture::CaptureHealth, String> {
 
 #[tauri::command]
 pub async fn sync_capture_now() -> Result<ov_core::capture::CaptureHealth, String> {
+    let policy = PolicyStore::load_or_init().map_err(|e| e.to_string())?;
+    if !policy.global.capture_enabled {
+        return Err("Privacy Mode is enabled; capture sync is paused.".to_string());
+    }
     let client = ov_core::ov_client::OvClient::from_local_config().map_err(|e| e.to_string())?;
     let db = DesktopDb::open_default()?;
     let _ = ov_core::capture::sync_capture(&db, &client, 0, true).await?;

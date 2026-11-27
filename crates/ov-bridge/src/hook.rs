@@ -222,15 +222,18 @@ pub(crate) async fn execute_hook(
             ) else {
                 return String::new();
             };
-            let search_query = build_session_aware_query(prompt, payload);
-            let mut candidates = match tokio::time::timeout(std::time::Duration::from_secs(3),
-                find_scopes(client, &search_query, &route.target_resource_uri, peer.as_deref(), Some(5))).await {
-                Ok(Ok(candidates)) => candidates,
-                Ok(Err(_)) => { eprintln!("OpenViking recall request failed"); return String::new(); }
-                Err(_) => { eprintln!("OpenViking recall timed out"); return String::new(); }
+            let search_query = build_session_aware_query(
+                prompt, payload, agent, db.filter(|_| policy.global.capture_enabled),
+            );
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+            let mut candidates = match find_scopes(
+                client, &search_query, &route.target_resource_uri, peer.as_deref(), Some(5), Some(deadline),
+            ).await {
+                Ok(candidates) => candidates,
+                Err(error) => { eprintln!("OpenViking recall: {error}"); return String::new(); }
             };
             candidates.retain(|item| !is_foreign_agent_private_uri(policy, agent, &item.uri));
-            let (text, layer, hits) = render_recall(client, candidates, &budget, &policy.budget.category_quotas).await;
+            let (text, layer, hits) = render_recall(client, candidates, &budget, &policy.budget.category_quotas, Some(5)).await;
             evt.target_uri = hits.iter().find(|(_,_,injected)| *injected).map(|(uri,_,_)| uri.clone());
             recall_hits = hits;
             evt.query = Some(prompt.chars().take(120).collect());
@@ -255,14 +258,17 @@ pub(crate) async fn execute_hook(
                         route.target_resource_uri,
                         runtime_id
                     ));
-                    let _ = db.skip_capture(
+                    if let Err(error) = db.skip_capture_for_route(
                         &client.profile_key(),
                         &session_key,
+                        &privacy_session_key(agent, &runtime_id),
                         agent.as_str(),
                         &route.target_resource_uri,
                         peer.as_deref(),
                         &messages,
-                    );
+                    ) {
+                        eprintln!("OpenViking privacy watermark: {error}");
+                    }
                 }
             } else {
                 let (session, messages) = collect(payload);
@@ -272,7 +278,10 @@ pub(crate) async fn execute_hook(
                 };
                 let flush = matches!(event,"pre-compact" | "session-end");
                 let session_key = sha256_hex(&format!("{}:{}:{}", agent.as_str(), route.target_resource_uri, runtime_id));
-                match db.enqueue_capture(&client.profile_key(), &session_key, agent.as_str(), &route.target_resource_uri, peer.as_deref(), &messages, flush) {
+                match db.enqueue_capture_for_route(
+                    &client.profile_key(), &session_key, &privacy_session_key(agent, &runtime_id),
+                    agent.as_str(), &route.target_resource_uri, peer.as_deref(), &messages, flush,
+                ) {
                     Ok(0) => return String::new(),
                     Ok(_) => {},
                     Err(error) => {
@@ -330,16 +339,31 @@ fn enforce_startup_caps(text: &str, max_lines: usize, max_bytes: usize) -> Strin
 /// When the current prompt is short/context-dependent (e.g. "继续", "fix that test"),
 /// enrich the search query with up to 2 recent user turns from the transcript/messages
 /// without calling any LLM.
-fn build_session_aware_query(prompt: &str, payload: &Value) -> String {
+fn privacy_session_key(agent: AgentId, runtime_id: &str) -> String {
+    sha256_hex(&format!("{}:{runtime_id}", agent.as_str()))
+}
+
+fn build_session_aware_query(
+    prompt: &str, payload: &Value, agent: AgentId, db: Option<&DesktopDb>,
+) -> String {
     let trimmed = prompt.trim();
+    let Some(db) = db else { return trimmed.to_owned(); };
     if trimmed.chars().count() >= 40 {
         return trimmed.to_owned();
     }
-    let (_, messages) = collect(payload);
+    let (session, messages) = collect(payload);
+    let Some(runtime_id) = session.as_deref().or_else(|| messages.first().map(|m| m.key.as_str())) else {
+        return trimmed.to_owned();
+    };
+    let session = privacy_session_key(agent, runtime_id);
     let recent_user: Vec<&str> = messages
         .iter()
         .rev()
         .filter(|m| m.role == "user")
+        .filter(|m| match db.is_privacy_excluded(&session, &m.key) {
+            Ok(excluded) => !excluded,
+            Err(error) => { eprintln!("OpenViking privacy watermark: {error}"); false }
+        })
         .map(|m| m.content.trim())
         .filter(|c| !c.is_empty() && *c != trimmed)
         .take(2)

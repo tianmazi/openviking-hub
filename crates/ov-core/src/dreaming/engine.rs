@@ -39,7 +39,7 @@ pub async fn run_dreaming(
     };
     let hit_stats = db.hit_stats_by_uri_for_profile(&profile_key)?;
     let run_id = format!("dream-{}", Uuid::new_v4().simple());
-    let mut run = db.create_run_for_profile(&profile_key, &run_id, trigger_source)?;
+    db.create_run_for_profile(&profile_key, &run_id, trigger_source)?;
     let now = Utc::now().timestamp();
     let stale_cutoff = now - (policy.lifecycle.archival.stale_days as i64 * 86_400);
 
@@ -274,7 +274,7 @@ pub async fn run_dreaming(
 
                                 let (frontmatter, primary_body) = split_frontmatter(&content);
                                 let (_, peer_body) = split_frontmatter(&other_content);
-                                let (relation, merged_body, reflector_label, custom_rationale, rel_conf) =
+                                let (relation, merged_body, reflector_label, custom_rationale, rel_conf, classified) =
                                     match reflect_merge(
                                         &policy.lifecycle.dreaming,
                                         uri,
@@ -290,6 +290,7 @@ pub async fn run_dreaming(
                                             res.engine_label,
                                             res.rationale,
                                             res.confidence.unwrap_or(score as f32),
+                                            res.classified,
                                         ),
                                         None => (
                                             KnowledgeRelation::Duplicates,
@@ -297,6 +298,7 @@ pub async fn run_dreaming(
                                             "deterministic".to_string(),
                                             None,
                                             score as f32,
+                                            false,
                                         ),
                                     };
 
@@ -311,7 +313,10 @@ pub async fn run_dreaming(
                                 prov.evidence_uris = vec![uri.to_string(), other_uri.clone()];
                                 let merged_with_prov =
                                     render_frontmatter(frontmatter, &merged_body, &prov);
-                                let risk_level = relation.default_risk(score);
+                                let risk_level = match relation.default_risk(score) {
+                                    RiskLevel::Low if !classified => RiskLevel::Medium,
+                                    risk => risk,
+                                };
                                 let archives_peer = matches!(
                                     relation,
                                     KnowledgeRelation::Duplicates
@@ -420,57 +425,25 @@ pub async fn run_dreaming(
     }
 
     let mut auto_applied_count = 0usize;
-    let mut auto_snapshot_id: Option<String> = None;
     if policy.lifecycle.dreaming.auto_apply_low_risk {
-        let mut low_ids = Vec::new();
-        for chg in &staged {
-            if chg.risk_level == RiskLevel::Low {
-                db.update_change_decision_for_profile(
-                    &profile_key,
-                    &chg.id,
-                    ReviewStatus::Accepted,
-                    None,
-                )?;
-                low_ids.push(chg.id.clone());
-            }
-        }
+        let low_ids: Vec<_> = staged.iter()
+            .filter(|chg| chg.risk_level == RiskLevel::Low)
+            .map(|chg| chg.id.clone())
+            .collect();
         if !low_ids.is_empty() {
-            if let Ok(report) = apply_accepted_changes(client, db, policy).await {
-                auto_applied_count = report.applied_ids.len();
-                auto_snapshot_id = report.snapshot_id;
-                for chg in &mut staged {
-                    if report.applied_ids.contains(&chg.id) {
-                        chg.status = ReviewStatus::Applied;
-                        chg.snapshot_id = auto_snapshot_id.clone();
+            match apply_changes_internal(client, db, policy, Some(&low_ids), true, false).await {
+                Ok(report) => {
+                    auto_applied_count = report.applied_ids.len();
+                    if !report.failed_items.is_empty() {
+                        counts["auto_apply_failures"] = json!(report.failed_items);
                     }
                 }
+                Err(error) => counts["auto_apply_error"] = json!(error),
             }
         }
     }
     counts["auto_applied"] = json!(auto_applied_count);
-
-    let has_pending = staged.iter().any(|c| c.status == ReviewStatus::Pending);
-    let summary_str = counts.to_string();
-    let final_status = if has_pending {
-        "ready_for_review"
-    } else if auto_applied_count > 0 {
-        "applied"
-    } else {
-        "ready_for_review"
-    };
-    db.update_run_status_for_profile(
-        &profile_key,
-        &run_id,
-        final_status,
-        auto_snapshot_id.as_deref(),
-        Some(&summary_str),
-    )?;
-    run.status = final_status.to_string();
-    run.snapshot_id = auto_snapshot_id;
-    run.summary_json = summary_str;
-    run.finished_at = Some(Utc::now().timestamp());
-
-    Ok((run, staged))
+    db.finalize_dreaming_run(&profile_key, &run_id, &counts.to_string())
 }
 
 /// Stage 4: Claim and apply this profile's accepted changes:
@@ -482,25 +455,45 @@ pub async fn apply_accepted_changes(
     db: &DesktopDb,
     policy: &PolicyConfig,
 ) -> Result<ApplyReport, String> {
-    let profile_key = client.profile_key();
-    let claimed = db.claim_accepted_changes_for_profile(&profile_key)?;
-    let snapshot_paths: Vec<String> = claimed
-        .iter()
-        .flat_map(|change| match change.action {
-            ChangeAction::WikiCompile => change.destination_uri.iter().map(String::as_str).collect::<Vec<_>>(),
-            ChangeAction::MoveFromInbox | ChangeAction::Archive => {
-                std::iter::once(change.target_uri.as_str())
-                    .chain(change.destination_uri.as_deref())
-                    .collect()
-            }
-            _ => vec![change.target_uri.as_str()],
-        })
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    apply_changes_internal(client, db, policy, None, false, true).await
+}
 
-    let snapshot_id = if policy.lifecycle.dreaming.auto_snapshot_before_run && !claimed.is_empty() {
+async fn apply_changes_internal(
+    client: &OvClient,
+    db: &DesktopDb,
+    policy: &PolicyConfig,
+    only_ids: Option<&[String]>,
+    force_snapshot: bool,
+    mark_verified: bool,
+) -> Result<ApplyReport, String> {
+    let profile_key = client.profile_key();
+    let (claimed, retry_status) = match only_ids {
+        Some(ids) => (
+            db.claim_auto_apply_changes_for_profile(&profile_key, ids)?,
+            ReviewStatus::Pending,
+        ),
+        None => (
+            db.claim_accepted_changes_for_profile(&profile_key)?,
+            ReviewStatus::Accepted,
+        ),
+    };
+    let mut snapshot_paths = BTreeSet::new();
+    for change in &claimed {
+        if change.action != ChangeAction::WikiCompile {
+            snapshot_paths.insert(change.target_uri.clone());
+        }
+        if change.action == ChangeAction::Merge {
+            let evidence = serde_json::from_str(&change.evidence_json).unwrap_or(Value::Null);
+            if let Some((peer, archive)) = archived_peer(change, &evidence) {
+                snapshot_paths.extend([peer.to_owned(), archive.to_owned()]);
+            }
+        } else if let Some(destination) = &change.destination_uri {
+            snapshot_paths.insert(destination.clone());
+        }
+    }
+    let snapshot_paths: Vec<_> = snapshot_paths.into_iter().collect();
+
+    let snapshot_id = if (force_snapshot || policy.lifecycle.dreaming.auto_snapshot_before_run) && !claimed.is_empty() {
         let label = format!("dreaming-commit-{}", Utc::now().format("%Y%m%dT%H%M%SZ"));
         let snapshot = client
             .snapshot_commit(&label, Some(snapshot_paths.clone()))
@@ -514,7 +507,7 @@ pub async fn apply_accepted_changes(
         match snapshot {
             Ok(id) => Some(id),
             Err(e) => {
-                if let Err(release_err) = db.release_claim_for_profile(&profile_key, &claimed) {
+                if let Err(release_err) = db.release_claim_for_profile(&profile_key, &claimed, retry_status) {
                     return Err(format!(
                         "Snapshot failed: {e}; could not release claims: {release_err}"
                     ));
@@ -531,23 +524,29 @@ pub async fn apply_accepted_changes(
     let mut failed_items = Vec::new();
 
     for (index, chg) in claimed.iter().enumerate() {
-        let matches_base = match (chg.action, chg.base_hash.as_deref()) {
+        let mut matches_base = match (chg.action, chg.base_hash.as_deref()) {
             (ChangeAction::WikiCompile, _) => true,
             (_, Some(expected)) => match read_text(client, &chg.target_uri).await {
                 Ok(live) => sha256_hex(&live) == expected,
                 Err(error) => {
-                    db.release_claim_for_profile(&profile_key, std::slice::from_ref(chg))?;
-                    failed_items.push((chg.id.clone(), error));
+                    db.release_claim_for_profile(&profile_key, std::slice::from_ref(chg), retry_status)?;
+                    failed_items.push((chg.id.clone(), error.to_string()));
                     continue;
                 }
             },
             (_, None) => false,
         };
-        let protection = check_write_protection(db, policy, &profile_key, chg);
+        let evidence = if chg.action == ChangeAction::Merge {
+            serde_json::from_str(&chg.evidence_json).unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        };
+        let peer = archived_peer(chg, &evidence);
+        let protection = check_write_protection(db, policy, &profile_key, chg, peer);
         let blocked = match protection {
             Ok(blocked) => blocked,
             Err(e) => {
-                db.release_claim_for_profile(&profile_key, &claimed[index..])?;
+                db.release_claim_for_profile(&profile_key, &claimed[index..], retry_status)?;
                 return Err(e);
             }
         };
@@ -565,6 +564,20 @@ pub async fn apply_accepted_changes(
             continue;
         }
 
+        if let Some((peer_uri, _)) = peer.filter(|_| matches_base) {
+            matches_base = match evidence["peer_before_content"].as_str() {
+                Some(before) => match read_text(client, peer_uri).await {
+                    Ok(live) => sha256_hex(&live) == sha256_hex(before),
+                    Err(error) if is_not_found(&error) => false,
+                    Err(error) => {
+                        db.release_claim_for_profile(&profile_key, std::slice::from_ref(chg), retry_status)?;
+                        failed_items.push((chg.id.clone(), format!("Could not read merge peer {peer_uri}: {error}")));
+                        continue;
+                    }
+                },
+                None => false,
+            };
+        }
         if !matches_base {
             db.finish_claimed_change_for_profile(
                 &profile_key,
@@ -576,7 +589,7 @@ pub async fn apply_accepted_changes(
             continue;
         }
 
-        match execute_change(client, chg).await {
+        match execute_change(client, chg, peer, mark_verified).await {
             Ok(()) => {
                 db.finish_claimed_change_for_profile(
                     &profile_key,
@@ -618,8 +631,10 @@ fn check_write_protection<'a>(
     policy: &PolicyConfig,
     profile_key: &str,
     change: &'a PendingMemoryChange,
+    peer: Option<(&'a str, &'a str)>,
 ) -> Result<Option<&'a str>, String> {
     for uri in std::iter::once(change.target_uri.as_str()).chain(change.destination_uri.as_deref())
+        .chain(peer.into_iter().flat_map(|(uri, archive)| [uri, archive]))
     {
         if is_protected_rule_path(policy, uri) || db.is_pinned_for_profile(profile_key, uri)? {
             return Ok(Some(uri));
@@ -628,28 +643,57 @@ fn check_write_protection<'a>(
     Ok(None)
 }
 
-async fn execute_change(client: &OvClient, change: &PendingMemoryChange) -> Result<(), String> {
+fn archived_peer<'a>(change: &'a PendingMemoryChange, evidence: &'a Value) -> Option<(&'a str, &'a str)> {
+    let archive = evidence["peer_archive_uri"].as_str()?;
+    let peer = evidence["peer_uri"].as_str().or(change.destination_uri.as_deref())?;
+    Some((peer, archive))
+}
+
+async fn execute_change(
+    client: &OvClient,
+    change: &PendingMemoryChange,
+    peer: Option<(&str, &str)>,
+    mark_verified: bool,
+) -> Result<(), String> {
     let result = match change.action {
         ChangeAction::Merge => {
             let raw_body = change
                 .after_content
                 .as_deref()
                 .ok_or("missing after_content")?;
-            let verified_body = mark_frontmatter_verified(raw_body);
-            let write_res = client.write_content(&change.target_uri, &verified_body).await;
-            if write_res.is_ok() {
-                if let Some(peer_uri) = change.destination_uri.as_deref() {
-                    if let Ok(ev) = serde_json::from_str::<Value>(&change.evidence_json) {
-                        if let Some(archive_dest) = ev.get("peer_archive_uri").and_then(Value::as_str) {
-                            match client.mv(peer_uri, archive_dest).await {
-                                Err(e) if !is_not_found(&e) => return Err(e.to_string()),
-                                _ => {}
-                            }
-                        }
+            let body = if mark_verified {
+                std::borrow::Cow::Owned(mark_frontmatter_verified(raw_body))
+            } else {
+                std::borrow::Cow::Borrowed(raw_body)
+            };
+            if let Some((peer_uri, archive)) = peer {
+                let before = change.before_content.as_deref().ok_or("missing before_content for merge compensation")?;
+                let response = client.write_content(&change.target_uri, &body).await.map_err(|e| e.to_string())?;
+                if let Err(error) = client.mv(peer_uri, archive).await {
+                    let peer_intact = if matches!(error, OvClientError::Api { .. }) {
+                        true
+                    } else {
+                        client.read_content(peer_uri, "l2").await.is_ok()
+                            || client.mv(archive, peer_uri).await.is_ok()
+                    };
+                    if !peer_intact {
+                        return Err(format!(
+                            "Could not archive merge peer {peer_uri}: {error}; peer state is ambiguous so primary {} was kept merged",
+                            change.target_uri,
+                        ));
                     }
+                    return match client.write_content(&change.target_uri, before).await {
+                        Ok(_) => Err(format!("Could not archive merge peer {peer_uri}: {error}")),
+                        Err(compensation) => Err(format!(
+                            "Could not archive merge peer {peer_uri}: {error}; compensation failed for {}: {compensation}",
+                            change.target_uri,
+                        )),
+                    };
                 }
+                Ok(response)
+            } else {
+                client.write_content(&change.target_uri, &body).await
             }
-            write_res
         }
         ChangeAction::PromoteToIndex | ChangeAction::DemoteFromIndex => {
             let body = change
@@ -737,18 +781,15 @@ async fn rollback_change(
                 None => client.snapshot_restore_scoped(snap_id, Some(target)).await,
             };
             if primary_res.is_ok() {
-                if let Some(peer_uri) = change.destination_uri.as_deref() {
-                    if let Ok(ev) = serde_json::from_str::<Value>(&change.evidence_json) {
-                        let archive_dest = ev.get("peer_archive_uri").and_then(Value::as_str);
-                        let peer_before = ev.get("peer_before_content").and_then(Value::as_str);
-                        if let Some(archive_uri) = archive_dest {
-                            match (client.mv(archive_uri, peer_uri).await, peer_before) {
-                                (Err(_), Some(peer_content)) => {
-                                    let _ = client.write_content(peer_uri, peer_content).await;
-                                    let _ = client.delete_fs(archive_uri, false).await;
-                                }
-                                _ => {}
-                            }
+                let evidence = serde_json::from_str(&change.evidence_json).unwrap_or(Value::Null);
+                if let Some((peer_uri, archive_uri)) = archived_peer(change, &evidence) {
+                    if let Err(error) = client.mv(archive_uri, peer_uri).await {
+                        let content = evidence["peer_before_content"].as_str().ok_or_else(|| error.to_string())?;
+                        client.write_content(peer_uri, content).await
+                            .map_err(|e| format!("Could not restore merge peer {peer_uri}: {e}"))?;
+                        match client.delete_fs(archive_uri, false).await {
+                            Err(error) if !is_not_found(&error) => return Err(error.to_string()),
+                            _ => {}
                         }
                     }
                 }
@@ -803,13 +844,13 @@ async fn rollback_change(
     result.map_err(|e| e.to_string())
 }
 
-async fn read_text(client: &OvClient, uri: &str) -> Result<String, String> {
-    let val = client.read_content(uri, "l2").await.map_err(|e| e.to_string())?;
+async fn read_text(client: &OvClient, uri: &str) -> Result<String, OvClientError> {
+    let val = client.read_content(uri, "l2").await?;
     val.as_str()
         .or_else(|| val.get("content").and_then(Value::as_str))
         .or_else(|| val.get("text").and_then(Value::as_str))
         .map(str::to_owned)
-        .ok_or_else(|| format!("Missing text content for {uri}"))
+        .ok_or_else(|| OvClientError::Config(format!("Missing text content for {uri}")))
 }
 
 fn is_not_found(error: &OvClientError) -> bool {

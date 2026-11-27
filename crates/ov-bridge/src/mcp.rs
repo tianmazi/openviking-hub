@@ -201,10 +201,15 @@ pub(crate) async fn call_tool(
             if let Some(uri) = target_uri.as_deref() {
                 check_access(uri)?;
             }
-            let limit = args.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
+            let limit = args.get("limit").and_then(Value::as_u64)
+                .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
 
-            let mut candidates = if let Some(uri) = &target_uri {
-                find_scopes(client, query, uri, peer.as_deref(), limit).await
+            let mut candidates = if limit == Some(0) {
+                Ok(Vec::new())
+            } else if let Some(uri) = &target_uri {
+                // Keep the server's default candidate pool for small combined recall limits.
+                let fetch_limit = if peer.is_some() { limit.filter(|&n| n > 10) } else { limit };
+                find_scopes(client, query, uri, peer.as_deref(), fetch_limit, None).await
             } else {
                 client
                     .search_context(&ContextSearchRequest {
@@ -213,12 +218,11 @@ pub(crate) async fn call_tool(
                         mode: Some("context".to_string()),
                         limit,
                     })
-                    .await.map(parse_candidates)
-            }
-            .map_err(|e| e.to_string())?;
+                    .await.map(parse_candidates).map_err(|e| e.to_string())
+            }?;
 
             candidates.retain(|item| !is_foreign_agent_private_uri(policy, agent, &item.uri));
-            let (text, layer, hits) = render_recall(client, candidates, &budget, &policy.budget.category_quotas).await;
+            let (text, layer, hits) = render_recall(client, candidates, &budget, &policy.budget.category_quotas, limit).await;
             let wrapped = wrap_ifc_readonly(
                 &text,
                 &format!("recall:{}", agent.as_str()),
@@ -449,9 +453,9 @@ fn detect_known_category(uri: &str, item: &Value) -> Option<MemoryCategory> {
     }
 }
 
-fn format_candidate(item: &RecallCandidate) -> String {
+fn format_candidate(item: &RecallCandidate, include_snippet: bool) -> String {
     let cat = item.category.map(|c| c.as_str()).unwrap_or("general");
-    if item.snippet.is_empty() {
+    if !include_snippet || item.snippet.is_empty() {
         format!("- [{}] {} (`{}`, score {:.2})", cat, item.title, item.uri, item.score)
     } else {
         format!(
@@ -522,21 +526,31 @@ pub(crate) async fn find_scopes(
     resource: &str,
     peer: Option<&str>,
     limit: Option<usize>,
-) -> Result<Vec<RecallCandidate>, ov_core::ov_client::OvClientError> {
+    deadline: Option<tokio::time::Instant>,
+) -> Result<Vec<RecallCandidate>, String> {
+    let find = |request: FindRequest| async move {
+        let search = client.find(&request);
+        let result = if let Some(deadline) = deadline {
+            tokio::time::timeout_at(deadline, search).await.map_err(|_| "request timed out")?
+        } else {
+            search.await
+        };
+        result.map_err(|e| e.to_string())
+    };
     let primary = FindRequest {
         query: query.to_owned(),
         target_uri: (!resource.is_empty()).then(|| resource.to_owned()),
         limit,
     };
     let Some(peer) = peer else {
-        return client.find(&primary).await.map(parse_candidates);
+        return find(primary).await.map(parse_candidates);
     };
     let memory = FindRequest {
         query: query.to_owned(),
         target_uri: Some(format!("viking://~/peers/{peer}/memories/")),
         limit,
     };
-    let (a, b) = tokio::join!(client.find(&primary), client.find(&memory));
+    let (a, b) = tokio::join!(find(primary), find(memory));
     match (a, b) {
         (Ok(a), Ok(b)) => {
             let mut candidates = parse_candidates(a);
@@ -571,6 +585,7 @@ pub(crate) async fn render_recall(
     candidates: Vec<RecallCandidate>,
     budget: &ov_core::policy::model::EffectiveBudget,
     category_quotas: &std::collections::HashMap<MemoryCategory, usize>,
+    limit: Option<usize>,
 ) -> (String, String, Vec<(String, f64, bool)>) {
     let ranked = rank_candidates(candidates);
     let ifc_overhead = 240usize;
@@ -578,6 +593,7 @@ pub(crate) async fn render_recall(
 
     // Pre-fetch and reserve budget for top-hit progressive expansion (L0->L1 or default L1/L2)
     let mut detail_block: Option<(String, String)> = None;
+    let mut top_summary_only = false;
     if let Some(top) = ranked.first() {
         let selected = if budget.default_recall_layer == ContextLayer::L0
             && top.score >= budget.auto_expand_l1_threshold as f64
@@ -609,10 +625,18 @@ pub(crate) async fn render_recall(
                         "\n\n--- {heading} ({} | score {:.2}) ---\n",
                         top.uri, top.score
                     );
-                    let max_detail = if ranked.len() > 1 {
-                        (total_max * 60) / 100
+                    let full_entry_len = format_candidate(top, true).len() + 2;
+                    top_summary_only = total_max.saturating_sub(full_entry_len) <= header.len() + 32;
+                    let entry_len = if top_summary_only {
+                        format_candidate(top, false).len() + 2
                     } else {
-                        total_max
+                        full_entry_len
+                    };
+                    let available = total_max.saturating_sub(entry_len);
+                    let max_detail = if ranked.len() > 1 {
+                        available.min(total_max.saturating_mul(60) / 100)
+                    } else {
+                        available
                     };
                     if max_detail > header.len() + 32 {
                         let body_cap = max_detail - header.len();
@@ -635,12 +659,14 @@ pub(crate) async fn render_recall(
 
     let mut text = String::new();
     let mut hits = Vec::new();
+    let mut injected_count = 0usize;
     let mut cat_used: std::collections::HashMap<MemoryCategory, usize> =
         std::collections::HashMap::new();
 
-    for item in ranked {
-        let formatted = format_candidate(&item);
+    for (index, item) in ranked.into_iter().enumerate() {
+        let formatted = format_candidate(&item, index != 0 || !top_summary_only);
         let entry_len = formatted.len() + 2;
+        let within_limit = limit.map_or(true, |max| injected_count < max);
         let within_category_quota = match item.category {
             Some(cat) => {
                 if let Some(&quota_tokens) = category_quotas.get(&cat) {
@@ -653,8 +679,9 @@ pub(crate) async fn render_recall(
             }
             None => true,
         };
-        let injected = within_category_quota && text.len() + entry_len <= list_budget;
+        let injected = within_limit && within_category_quota && text.len() + entry_len <= list_budget;
         if injected {
+            injected_count += 1;
             if !text.is_empty() {
                 text.push_str("\n\n");
             }
@@ -702,7 +729,7 @@ mod recall_tests {
         let candidates = parse_candidates(json!({"memories":[
             {"uri":"viking://~/memories/preferences/git.md", "score":0.92, "title":"Git Rules", "snippet":"Use Conventional Commits", "distance":0.08, "internal_id":"xyz"}
         ]}));
-        let rendered = format_candidate(&candidates[0]);
+        let rendered = format_candidate(&candidates[0], true);
         assert!(rendered.contains("[preferences] Git Rules"));
         assert!(rendered.contains("Use Conventional Commits"));
         assert!(!rendered.contains("internal_id"));

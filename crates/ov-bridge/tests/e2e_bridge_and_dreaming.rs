@@ -10,7 +10,7 @@ use ov_core::dreaming::db::DesktopDb;
 use ov_core::dreaming::engine::{apply_accepted_changes, rollback_dreaming_run, run_dreaming};
 use ov_core::ov_client::{OvCliConfig, OvClient};
 use ov_core::policy::model::{
-    AgentId, ChangeAction, PolicyConfig, ReflectorMode, ReviewStatus, VisibilityScope, WorkspaceMapping,
+    AgentId, ChangeAction, PolicyConfig, ReflectorMode, ReviewStatus, RiskLevel, VisibilityScope, WorkspaceMapping,
 };
 use ov_core::provenance::parse_frontmatter;
 use serde_json::{json, Value};
@@ -30,6 +30,9 @@ struct MockState {
     fail_snapshot: bool,
     fail_post_snapshot: bool,
     fail_content_read: bool,
+    fail_read_uri: Option<(&'static str, &'static str)>,
+    fail_write_uri: Option<&'static str>,
+    fail_move_from: Option<&'static str>,
     fail_session_commit: bool,
     fail_append_after_write: bool,
     memories_status: Option<&'static str>,
@@ -38,6 +41,10 @@ struct MockState {
     session_configs: Vec<Value>,
     session_commits: usize,
     scoped_searches: Vec<Value>,
+    stalled_scope_prefix: Option<&'static str>,
+    long_overview: bool,
+    merge_score: Option<f64>,
+    merge_reflector_response: Option<&'static str>,
     files: HashMap<String, String>,
     snapshots: Vec<Value>,
     snapshot_files: HashMap<String, HashMap<String, String>>,
@@ -151,7 +158,10 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                     }
                     ("GET", "/api/v1/content/read") => {
                         let guard = st.lock().unwrap();
-                        if guard.fail_content_read {
+                        if let Some((_, failure)) = guard.fail_read_uri.filter(|(uri, _)| *uri == uri_param.as_str()) {
+                            status = failure;
+                            json!({ "status": "error", "message": "Content read failed" })
+                        } else if guard.fail_content_read {
                             status = "503 Service Unavailable";
                             json!({ "status": "error", "message": "Content temporarily unavailable" })
                         } else {
@@ -160,7 +170,8 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                         }
                     }
                     ("GET", "/api/v1/content/overview") => {
-                        json!({ "status": "ok", "result": { "content": format!("L1_OVERVIEW_FOR:{}", uri_param) } })
+                        let suffix = if st.lock().unwrap().long_overview { " detail".repeat(2000) } else { String::new() };
+                        json!({ "status": "ok", "result": { "content": format!("L1_OVERVIEW_FOR:{uri_param}{suffix}") } })
                     }
                     ("GET", "/api/v1/content/abstract") => {
                         json!({ "status": "ok", "result": { "content": format!("L0_ABSTRACT_FOR:{}", uri_param) } })
@@ -169,16 +180,24 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                         let uri = body_json["uri"].as_str().unwrap_or("").to_string();
                         let content = body_json["content"].as_str().unwrap_or("").to_string();
                         let mut guard = st.lock().unwrap();
-                        guard.writes += 1;
-                        guard.files.insert(uri.clone(), content);
-                        json!({ "status": "ok", "result": { "uri": uri, "written": true } })
+                        if guard.fail_write_uri == Some(uri.as_str()) {
+                            status = "503 Service Unavailable";
+                            json!({ "status": "error", "message": "Content write failed" })
+                        } else {
+                            guard.writes += 1;
+                            guard.files.insert(uri.clone(), content);
+                            json!({ "status": "ok", "result": { "uri": uri, "written": true } })
+                        }
                     }
                     ("POST", "/api/v1/fs/mv") => {
                         let from = body_json["from_uri"].as_str().unwrap_or("");
                         let to = body_json["to_uri"].as_str().unwrap_or("").to_string();
                         let mut guard = st.lock().unwrap();
-                        guard.writes += 1;
-                        if let Some(v) = guard.files.remove(from) {
+                        if guard.fail_move_from == Some(from) {
+                            status = "503 Service Unavailable";
+                            json!({ "status": "error", "message": "Move failed" })
+                        } else if let Some(v) = guard.files.remove(from) {
+                            guard.writes += 1;
                             guard.files.insert(to.clone(), v);
                             json!({ "status": "ok", "result": { "moved_to": to } })
                         } else {
@@ -218,7 +237,16 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                         json!({ "status": "error", "message": "Expected context search mode" })
                     }
                     ("POST", "/api/v1/search/find") => {
-                        st.lock().unwrap().scoped_searches.push(body_json.clone());
+                        let (stalled, score) = {
+                            let mut guard = st.lock().unwrap();
+                            guard.scoped_searches.push(body_json.clone());
+                            let uri = body_json["target_uri"].as_str().unwrap_or_default();
+                            (guard.stalled_scope_prefix.is_some_and(|prefix| uri.starts_with(prefix)),
+                             guard.merge_score.unwrap_or(0.89))
+                        };
+                        if stalled {
+                            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                        }
                         if body_json["target_uri"] == "viking://resources/projects/demo/" {
                             json!({
                                 "status": "ok",
@@ -230,7 +258,7 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                             json!({
                                 "status": "ok",
                                 "result": { "memories": [
-                                    { "uri": "viking://~/memories/preferences/git-old.md", "score": 0.89 }
+                                    { "uri": "viking://~/memories/preferences/git-old.md", "score": score }
                                 ] }
                             })
                         }
@@ -253,7 +281,7 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                             }).to_string()
                         } else {
                             assert!(prompt.contains("[Primary URI:"));
-                            "# Reflected memory".to_string()
+                            st.lock().unwrap().merge_reflector_response.unwrap_or("# Reflected memory").to_string()
                         };
                         json!({ "choices": [{ "message": { "content": content } }] })
                     }
@@ -264,13 +292,19 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                     ("POST", "/api/v1/sessions/e2e-session/messages") => {
                         assert!(matches!(body_json["role"].as_str(), Some("assistant" | "user")));
                         let mut guard = st.lock().unwrap();
-                        guard.session_messages.push(body_json["content"].as_str().unwrap().to_string());
-                        guard.session_peers.push(body_json["peer_id"].as_str().map(str::to_owned));
-                        if guard.fail_append_after_write {
-                            status = "500 Internal Server Error";
-                            json!({"status":"error","message":"append response failed"})
+                        let content = body_json["content"].as_str().unwrap();
+                        if content == "permanently rejected" {
+                            status = "422 Unprocessable Entity";
+                            json!({"status":"error","message":"invalid message"})
                         } else {
-                            json!({ "status": "ok", "result": {} })
+                            guard.session_messages.push(content.to_string());
+                            guard.session_peers.push(body_json["peer_id"].as_str().map(str::to_owned));
+                            if guard.fail_append_after_write {
+                                status = "500 Internal Server Error";
+                                json!({"status":"error","message":"append response failed"})
+                            } else {
+                                json!({ "status": "ok", "result": {} })
+                            }
                         }
                     }
                     ("GET", "/api/v1/sessions/e2e-session") => {
@@ -487,6 +521,12 @@ async fn e2e_mcp_recall_and_capture_are_profile_scoped() {
     assert!(state.lock().unwrap().scoped_searches.iter().any(|req|
         req["target_uri"].as_str().is_some_and(|uri|uri.starts_with("viking://~/peers/project-"))));
     assert_eq!(state.lock().unwrap().scoped_searches.len(), 3);
+    state.lock().unwrap().long_overview = true;
+    let limited = json!({ "name": "recall", "arguments": { "query": "git commit style", "limit": 1 } });
+    let text = mcp::call_tool(agent, &limited, &policy, &client, None).await.unwrap();
+    assert!(text.contains("- [general] README.md"));
+    assert!(text.contains("L1_OVERVIEW_FOR:viking://resources/projects/demo/README.md"));
+    assert!(!text.contains("git-old.md"));
     policy.routing.workspace_mappings.clear();
 
     let protected = json!({ "name": "remember", "arguments": {
@@ -769,6 +809,8 @@ async fn e2e_dreaming_snapshot_failure_isolation_and_rollback() {
         assert!(guard.snapshots[1]["message"].as_str().unwrap().starts_with("dreaming-applied-"));
         assert_eq!(guard.snapshots[0]["paths"], json!([
             "viking://resources/desktop-dreaming-wiki/",
+            "viking://~/archive/merged-git-old.md",
+            "viking://~/memories/preferences/git-old.md",
             "viking://~/memories/preferences/git.md",
             CONCURRENT_INBOX,
             INBOX_NOTE,
@@ -917,6 +959,68 @@ async fn e2e_short_prompts_and_pi_temporary_context_are_not_suppressed() {
 }
 
 #[tokio::test]
+async fn e2e_recall_keeps_completed_scope_and_excludes_private_turns_across_routes() {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let url = start_mock_openviking_server(state.clone()).await;
+    let client = test_client(&url, "work");
+    let other = test_client(&url, "personal");
+    let db = DesktopDb::open_in_memory().unwrap();
+    let mut policy = PolicyConfig::default();
+    let tmp = tempdir().unwrap();
+    let route = tmp.path().join("RESOURCE_POLICY.md");
+    std::fs::write(&route, "resource_uri: viking://resources/projects/previous\n").unwrap();
+    let mut input = json!({"cwd":tmp.path(),"session_id":"stable","prompt":"continue","messages":[
+        {"id":"private","role":"user","content":"Private transcript turn"}
+    ]});
+
+    policy.global.capture_enabled = false;
+    hook::execute_hook("stop", AgentId::Pi, &input, &policy, &client, Some(&db)).await;
+    hook::execute_hook("user-prompt-submit", AgentId::Pi, &input, &policy, &client, Some(&db)).await;
+    {
+        let mut guard = state.lock().unwrap();
+        assert!(!guard.scoped_searches.is_empty());
+        assert!(guard.scoped_searches.iter().all(|request| request["query"] == "continue"));
+        guard.scoped_searches.clear();
+        guard.stalled_scope_prefix = Some("viking://~/peers/");
+    }
+
+    policy.global.capture_enabled = true;
+    std::fs::write(&route, "resource_uri: viking://resources/projects/demo\n").unwrap();
+    input["messages"].as_array_mut().unwrap().push(json!({
+        "id":"public","role":"user","content":"Public transcript turn"
+    }));
+    hook::execute_hook("stop", AgentId::Pi, &input, &policy, &other, Some(&db)).await;
+    assert_eq!(ov_core::capture::sync_capture(&db, &other, 0, false).await.unwrap(), 1);
+    let text = hook::execute_hook("user-prompt-submit", AgentId::Pi, &input, &policy, &other, Some(&db)).await;
+    assert!(text.contains("viking://resources/projects/demo/README.md"));
+    let guard = state.lock().unwrap();
+    assert_eq!(guard.session_messages, ["Public transcript turn"]);
+    assert_eq!(guard.scoped_searches.len(), 2);
+    assert!(guard.scoped_searches.iter().all(|request| request["query"] == "Public transcript turn\ncontinue"));
+}
+
+#[tokio::test]
+async fn e2e_capture_drains_healthy_sessions_after_permanent_rejection() {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let url = start_mock_openviking_server(state.clone()).await;
+    let client = test_client(&url, "work");
+    let profile = client.profile_key();
+    let db = DesktopDb::open_in_memory().unwrap();
+    for (session, content) in [("bad", "permanently rejected"), ("good", "healthy")] {
+        let (_, messages) = ov_core::capture::collect(&json!({
+            "messages": [{"role":"user","content":content}]
+        }));
+        db.enqueue_capture(&profile, session, "codex", "viking://resources/projects/demo/", None, &messages, false).unwrap();
+    }
+
+    assert_eq!(ov_core::capture::sync_capture(&db, &client, 0, true).await.unwrap(), 1);
+    assert_eq!(ov_core::capture::sync_capture(&db, &client, 0, true).await.unwrap(), 0);
+    assert!(!db.has_capture_work(&profile).unwrap());
+    assert_eq!(db.capture_health(&profile).unwrap().last_error.as_deref(), Some("Message delivery rejected (HTTP 422)"));
+    assert_eq!(state.lock().unwrap().session_messages, ["healthy"]);
+}
+
+#[tokio::test]
 async fn e2e_dreaming_continues_when_memories_are_absent() {
     let state = Arc::new(Mutex::new(MockState {
         files: HashMap::from([("viking://~/resources/inbox/scratch.md".into(), "# Scratch note".into())]),
@@ -975,12 +1079,83 @@ async fn e2e_merge_archives_peer_upgrades_verified_and_rolls_back_both() {
         assert!(guard.files.contains_key(PEER_ARCHIVED), "peer must be archived");
     }
 
+    {
+        let mut guard = state.lock().unwrap();
+        guard.fail_move_from = Some(PEER_ARCHIVED);
+        guard.fail_write_uri = Some(PEER);
+    }
+    let error = rollback_dreaming_run(&client, &db, &run.id).await.unwrap_err();
+    assert!(error.contains("Could not restore merge peer"));
+    {
+        let mut guard = state.lock().unwrap();
+        assert!(guard.files.contains_key(PEER_ARCHIVED));
+        assert!(!guard.files.contains_key(PEER));
+        guard.fail_write_uri = None;
+    }
     rollback_dreaming_run(&client, &db, &run.id).await.unwrap();
     {
         let guard = state.lock().unwrap();
         assert!(guard.files.contains_key(PEER), "rollback must restore peer");
         assert!(!guard.files.contains_key(PEER_ARCHIVED), "rollback must clear archived peer");
     }
+}
+
+#[tokio::test]
+async fn e2e_merge_detects_peer_drift_and_compensates_archive_failure() {
+    const PRIMARY: &str = "viking://~/memories/preferences/git.md";
+    const PEER: &str = "viking://~/memories/preferences/git-old.md";
+    let original = HashMap::from([
+        (PRIMARY.to_string(), "# Git Style\nUse English Conventional Commits.".to_string()),
+        (PEER.to_string(), "# Git Style\nUse English Conventional Commits.\nOld note.".to_string()),
+    ]);
+    let state = Arc::new(Mutex::new(MockState { files: original.clone(), ..Default::default() }));
+    let url = start_mock_openviking_server(state.clone()).await;
+    let client = test_client(&url, "work");
+    let db = DesktopDb::open_in_memory().unwrap();
+    let policy = PolicyConfig::default();
+    let profile = client.profile_key();
+
+    for missing in [false, true] {
+        let (run, staged) = run_dreaming(&client, &db, &policy, "e2e").await.unwrap();
+        let merge = staged.iter().find(|c| c.action == ChangeAction::Merge).unwrap();
+        db.update_change_decision_for_profile(&profile, &merge.id, ReviewStatus::Accepted, None).unwrap();
+        {
+            let mut guard = state.lock().unwrap();
+            if missing {
+                guard.files.remove(PEER);
+                guard.fail_read_uri = Some((PEER, "404 Not Found"));
+            } else {
+                guard.files.insert(PEER.into(), "Edited during review".into());
+            }
+        }
+        let report = apply_accepted_changes(&client, &db, &policy).await.unwrap();
+        assert_eq!(report.conflict_ids, [merge.id.clone()]);
+        assert_eq!(db.get_run(&run.id).unwrap().unwrap().status, "conflict");
+        let mut guard = state.lock().unwrap();
+        assert_eq!(guard.writes, 0);
+        guard.files = original.clone();
+        guard.fail_read_uri = None;
+    }
+
+    let (run, staged) = run_dreaming(&client, &db, &policy, "e2e").await.unwrap();
+    let merge = staged.iter().find(|c| c.action == ChangeAction::Merge).unwrap();
+    db.update_change_decision_for_profile(&profile, &merge.id, ReviewStatus::Accepted, None).unwrap();
+    state.lock().unwrap().fail_read_uri = Some((PEER, "503 Service Unavailable"));
+    let report = apply_accepted_changes(&client, &db, &policy).await.unwrap();
+    assert!(report.failed_items[0].1.contains("503"));
+    assert!(report.conflict_ids.is_empty());
+    assert_eq!(db.list_pending_changes_for_profile(&profile, Some("accepted")).unwrap()[0].id, merge.id);
+    {
+        let mut guard = state.lock().unwrap();
+        assert_eq!(guard.writes, 0);
+        guard.fail_read_uri = None;
+        guard.fail_move_from = Some(PEER);
+    }
+    let report = apply_accepted_changes(&client, &db, &policy).await.unwrap();
+    assert!(report.applied_ids.is_empty());
+    assert!(report.failed_items[0].1.contains("Could not archive merge peer"));
+    assert_eq!(state.lock().unwrap().files, original);
+    assert_eq!(db.get_run(&run.id).unwrap().unwrap().status, "partial_failure");
 }
 
 
@@ -998,13 +1173,37 @@ async fn e2e_auto_apply_low_risk_applies_low_and_keeps_medium_high_pending() {
             (PRIMARY.into(), "# Git Style\nUse English Conventional Commits.".into()),
             (PEER.into(), "# Git Style\nUse English Conventional Commits.\nOld note.".into()),
         ]),
+        merge_score: Some(0.96),
+        merge_reflector_response: Some(r#"{"relation":"CONFLICTS","merged_content":"Both positions need review."}"#),
         ..Default::default()
     }));
     let url = start_mock_openviking_server(state.clone()).await;
     let client = test_client(&url, "work");
     let db = DesktopDb::open_in_memory().unwrap();
     let mut policy = PolicyConfig::default();
+    policy.lifecycle.dreaming.reflector_mode = ReflectorMode::OpenaiCompatible;
+    policy.lifecycle.dreaming.reflector_endpoint = format!("{url}/v1");
+    policy.lifecycle.dreaming.reflector_model = "e2e-reflector".into();
+    let (_, older) = run_dreaming(&client, &db, &policy, "e2e").await.unwrap();
+    let older_high = older.iter().find(|c| c.risk_level == RiskLevel::High).unwrap();
+    let profile = client.profile_key();
+    db.update_change_decision_for_profile(&profile, &older_high.id, ReviewStatus::Accepted, None).unwrap();
+
+    policy.lifecycle.dreaming.reflector_mode = ReflectorMode::Deterministic;
     policy.lifecycle.dreaming.auto_apply_low_risk = true;
+    policy.lifecycle.dreaming.auto_snapshot_before_run = false;
+    state.lock().unwrap().fail_snapshot = true;
+    let (failed_run, failed_staged) = run_dreaming(&client, &db, &policy, "e2e").await.unwrap();
+    assert_eq!(failed_run.status, "ready_for_review");
+    assert!(failed_run.snapshot_id.is_none());
+    assert!(failed_staged.iter().all(|c| c.status == ReviewStatus::Pending));
+    assert!(serde_json::from_str::<Value>(&failed_run.summary_json).unwrap()["auto_apply_error"]
+        .as_str().unwrap().contains("Snapshot failed"));
+    {
+        let mut guard = state.lock().unwrap();
+        assert_eq!(guard.writes, 0);
+        guard.fail_snapshot = false;
+    }
 
     let (run, staged) = run_dreaming(&client, &db, &policy, "e2e").await.unwrap();
     assert_eq!(run.status, "ready_for_review");
@@ -1019,5 +1218,35 @@ async fn e2e_auto_apply_low_risk_applies_low_and_keeps_medium_high_pending() {
     let merge = staged.iter().find(|c| c.action == ChangeAction::Merge).unwrap();
     let ev: Value = serde_json::from_str(&merge.evidence_json).unwrap();
     assert_eq!(ev["relation"], "DUPLICATES");
-    assert_eq!(merge.status, ReviewStatus::Pending, "Medium-risk Merge (score 0.89 < 0.92) must stay pending");
+    assert_eq!(merge.risk_level, RiskLevel::Medium);
+    assert_eq!(merge.status, ReviewStatus::Pending);
+    let accepted = db.list_pending_changes_for_profile(&profile, Some("accepted")).unwrap();
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(accepted[0].id, older_high.id);
+
+    policy.lifecycle.dreaming.reflector_mode = ReflectorMode::OpenaiCompatible;
+    state.lock().unwrap().merge_reflector_response = None;
+    let (_, plain) = run_dreaming(&client, &db, &policy, "e2e").await.unwrap();
+    let merge = plain.iter().find(|c| c.action == ChangeAction::Merge).unwrap();
+    assert_eq!(merge.risk_level, RiskLevel::Medium);
+    assert_eq!(merge.status, ReviewStatus::Pending);
+
+    state.lock().unwrap().merge_reflector_response =
+        Some(r#"{"relation":"DUPLICATES","merged_content":"# Classified merged note"}"#);
+    state.lock().unwrap().fail_move_from = Some(PEER);
+    let (run, failed) = run_dreaming(&client, &db, &policy, "e2e").await.unwrap();
+    let failed_merge = failed.iter().find(|c| c.action == ChangeAction::Merge).unwrap();
+    assert_eq!(run.status, "partial_failure");
+    assert_eq!(failed_merge.status, ReviewStatus::Conflict);
+    assert_eq!(db.list_pending_changes_for_profile(&profile, Some("failed")).unwrap()[0].id, failed_merge.id);
+    state.lock().unwrap().fail_move_from = None;
+
+    let (run, classified) = run_dreaming(&client, &db, &policy, "e2e").await.unwrap();
+    let merge = classified.iter().find(|c| c.action == ChangeAction::Merge).unwrap();
+    assert_eq!(merge.risk_level, RiskLevel::Low);
+    assert_eq!(merge.status, ReviewStatus::Applied);
+    assert_eq!(merge.snapshot_id, run.snapshot_id);
+    let guard = state.lock().unwrap();
+    assert!(!parse_frontmatter(&guard.files[PRIMARY]).0.unwrap().verified);
+    assert!(!guard.files.contains_key(PEER));
 }

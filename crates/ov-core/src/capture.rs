@@ -116,6 +116,11 @@ impl DesktopDb {
     /// The unique message key is the durable capture watermark. Enqueueing is atomic.
     pub fn enqueue_capture(&self, profile: &str, session: &str, agent: &str,
         uri: &str, peer: Option<&str>, messages: &[CapturedMessage], flush: bool) -> Result<usize,String> {
+        self.enqueue_capture_for_route(profile, session, session, agent, uri, peer, messages, flush)
+    }
+
+    pub fn enqueue_capture_for_route(&self, profile: &str, session: &str, privacy_session: &str,
+        agent: &str, uri: &str, peer: Option<&str>, messages: &[CapturedMessage], flush: bool) -> Result<usize,String> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
         tx.execute("INSERT OR IGNORE INTO capture_sessions(profile_key,session_key,agent,resource_uri,peer_id) VALUES (?1,?2,?3,?4,?5)",
@@ -126,8 +131,11 @@ impl DesktopDb {
         }
         let mut added = 0;
         for msg in messages {
-            added += tx.execute("INSERT OR IGNORE INTO capture_outbox(profile_key,session_key,event_key,role,content) VALUES (?1,?2,?3,?4,?5)",
-                params![profile,session,msg.key,msg.role,msg.content]).map_err(|e| e.to_string())?;
+            added += tx.execute("INSERT OR IGNORE INTO capture_outbox(profile_key,session_key,event_key,role,content)
+                SELECT ?1,?2,?3,?4,?5 WHERE NOT EXISTS (
+                    SELECT 1 FROM privacy_exclusions WHERE session_key IN (?6,'') AND event_key=?3
+                )",
+                params![profile,session,msg.key,msg.role,msg.content,privacy_session]).map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(added)
@@ -139,6 +147,19 @@ impl DesktopDb {
         &self,
         profile: &str,
         session: &str,
+        agent: &str,
+        uri: &str,
+        peer: Option<&str>,
+        messages: &[CapturedMessage],
+    ) -> Result<usize, String> {
+        self.skip_capture_for_route(profile, session, session, agent, uri, peer, messages)
+    }
+
+    pub fn skip_capture_for_route(
+        &self,
+        profile: &str,
+        session: &str,
+        privacy_session: &str,
         agent: &str,
         uri: &str,
         peer: Option<&str>,
@@ -157,7 +178,12 @@ impl DesktopDb {
         )
         .map_err(|e| e.to_string())?;
         let mut skipped = 0;
+        let now = Utc::now().timestamp();
         for msg in messages {
+            tx.execute(
+                "INSERT OR IGNORE INTO privacy_exclusions(session_key,event_key,created_at) VALUES (?1,?2,?3)",
+                params![privacy_session, msg.key, now],
+            ).map_err(|e| e.to_string())?;
             skipped += tx
                 .execute(
                     "INSERT OR IGNORE INTO capture_outbox(profile_key,session_key,event_key,role,content,state) VALUES (?1,?2,?3,?4,'','skipped')",
@@ -167,6 +193,15 @@ impl DesktopDb {
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(skipped)
+    }
+
+    pub fn is_privacy_excluded(&self, session: &str, event_key: &str) -> Result<bool, String> {
+        self.lock_conn()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM privacy_exclusions WHERE session_key IN (?1,'') AND event_key=?2)
+                 OR EXISTS(SELECT 1 FROM capture_outbox WHERE session_key=?1 AND event_key=?2 AND state='skipped')",
+            params![session, event_key],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())
     }
 
     fn claim_capture(&self, profile: &str, threshold: u64, reconcile: bool) -> Result<Option<Session>, String> {
@@ -290,7 +325,7 @@ pub async fn refresh_extraction_tasks(db: &DesktopDb, client: &OvClient) -> Resu
 pub async fn sync_capture(db: &DesktopDb, client: &OvClient, threshold: u64, reconcile: bool) -> Result<usize,String> {
     let profile = client.profile_key();
     let mut committed = 0;
-    while let Some(mut session) = db.claim_capture(&profile,threshold,reconcile)? {
+    'sessions: while let Some(mut session) = db.claim_capture(&profile,threshold,reconcile)? {
         if session.needs_reconciliation {
             match reconcile_session(db,client,&profile,&session).await {
                 Ok(id) => session.remote_id = id,
@@ -324,12 +359,35 @@ pub async fn sync_capture(db: &DesktopDb, client: &OvClient, threshold: u64, rec
                 }
             }
         };
+        let mut rejected_error: Option<String> = None;
         for (seq,role,content) in db.capture_rows(&profile,&session.key)? {
             if let Err(error) = client.add_session_message_for_peer(&remote,&role,&content,session.peer_id.as_deref()).await {
+                if let OvClientError::Api { status: status @ (400 | 413 | 415 | 422), .. } = &error {
+                    db.lock_conn()?.execute(
+                        "UPDATE capture_outbox SET state='rejected',content='' WHERE seq=?1",
+                        [seq],
+                    ).map_err(|e| e.to_string())?;
+                    rejected_error = Some(format!("Message delivery rejected (HTTP {status})"));
+                    continue;
+                }
                 db.capture_state(&profile,&session.key,if write_rejected(&error) {"idle"} else {"unknown"},Some("Message delivery failed"))?;
                 return Err(error.to_string());
             }
             db.lock_conn()?.execute("UPDATE capture_outbox SET state='sent' WHERE seq=?1",[seq]).map_err(|e| e.to_string())?;
+        }
+        let has_sent: bool = db.lock_conn()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM capture_outbox WHERE profile_key=?1 AND session_key=?2 AND state='sent')",
+            params![profile, session.key],
+            |r| r.get(0),
+        ).map_err(|e| e.to_string())?;
+        if !has_sent {
+            db.lock_conn()?.execute(
+                "UPDATE capture_sessions SET state='idle',last_error=?3,
+                 flush_requested=CASE WHEN EXISTS (SELECT 1 FROM capture_outbox o WHERE o.profile_key=?1 AND o.session_key=?2 AND o.state='pending') THEN flush_requested ELSE 0 END
+                 WHERE profile_key=?1 AND session_key=?2",
+                params![profile, session.key, rejected_error.as_deref()],
+            ).map_err(|e| e.to_string())?;
+            continue 'sessions;
         }
         match client.commit_session(&remote).await {
             Ok(result) => {
@@ -342,10 +400,10 @@ pub async fn sync_capture(db: &DesktopDb, client: &OvClient, threshold: u64, rec
                     tx.execute("INSERT OR IGNORE INTO capture_tasks(profile_key,task_id) VALUES (?1,?2)",
                         params![profile,task_id]).map_err(|e| e.to_string())?;
                 }
-                tx.execute("UPDATE capture_sessions SET state='idle',last_error=NULL,
+                tx.execute("UPDATE capture_sessions SET state='idle',last_error=?3,
                     flush_requested=CASE WHEN EXISTS (SELECT 1 FROM capture_outbox o WHERE o.profile_key=?1 AND o.session_key=?2 AND o.state='pending') THEN flush_requested ELSE 0 END
                     WHERE profile_key=?1 AND session_key=?2",
-                    params![profile,session.key]).map_err(|e| e.to_string())?;
+                    params![profile,session.key,rejected_error.as_deref()]).map_err(|e| e.to_string())?;
                 tx.commit().map_err(|e| e.to_string())?;
                 drop(conn);
                 db.record_event_for_profile(&profile, &RecallEvent {
@@ -416,5 +474,16 @@ mod tests {
             1
         );
         assert_eq!(db.capture_health("p").unwrap().pending, 1);
+        assert!(db.is_privacy_excluded("sess", &private_msgs[0].key).unwrap());
+        assert_eq!(
+            db.enqueue_capture_for_route(
+                "other", "other-route-session", "sess", "codex", "viking://resources/other/",
+                None, &resumed_msgs, false,
+            ).unwrap(),
+            1
+        );
+        assert_eq!(db.capture_rows("other", "other-route-session").unwrap()[0].2,
+            "public decision after resume");
+        assert!(!db.is_privacy_excluded("different-session", &private_msgs[0].key).unwrap());
     }
 }
