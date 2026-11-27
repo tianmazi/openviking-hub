@@ -394,6 +394,19 @@ pub async fn sync_capture(db: &DesktopDb, client: &OvClient, threshold: u64, rec
                 let task = text(&result,&["task_id"]);
                 let mut conn = db.lock_conn()?;
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+                tx.execute(
+                    "INSERT INTO committed_transcript_evidence (profile_key, session_key, role, content, committed_at)
+                     SELECT profile_key, session_key, role, content, ?3 FROM capture_outbox
+                     WHERE profile_key=?1 AND session_key=?2 AND state='sent' AND content!=''
+                     ORDER BY seq ASC",
+                    params![profile, session.key, Utc::now().timestamp()],
+                ).map_err(|e| e.to_string())?;
+                tx.execute(
+                    "DELETE FROM committed_transcript_evidence WHERE profile_key=?1 AND seq NOT IN (
+                         SELECT seq FROM committed_transcript_evidence WHERE profile_key=?1 ORDER BY seq DESC LIMIT 500
+                     )",
+                    params![profile],
+                ).map_err(|e| e.to_string())?;
                 tx.execute("UPDATE capture_outbox SET state='committed',content='' WHERE profile_key=?1 AND session_key=?2 AND state='sent'",
                     params![profile,session.key]).map_err(|e| e.to_string())?;
                 if let Some(task_id) = &task {

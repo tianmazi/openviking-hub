@@ -6,11 +6,11 @@ mod hook;
 #[path = "../src/mcp.rs"]
 mod mcp;
 
-use ov_core::dreaming::db::DesktopDb;
+use ov_core::dreaming::db::{DesktopDb, RecallEvent};
 use ov_core::dreaming::engine::{apply_accepted_changes, rollback_dreaming_run, run_dreaming};
 use ov_core::ov_client::{OvCliConfig, OvClient};
 use ov_core::policy::model::{
-    AgentId, ChangeAction, PolicyConfig, ReflectorMode, ReviewStatus, RiskLevel, VisibilityScope, WorkspaceMapping,
+    AgentId, ChangeAction, ContextLayer, PolicyConfig, ReflectorMode, ReviewStatus, RiskLevel, VisibilityScope, WorkspaceMapping,
 };
 use ov_core::provenance::parse_frontmatter;
 use serde_json::{json, Value};
@@ -30,6 +30,7 @@ struct MockState {
     fail_snapshot: bool,
     fail_post_snapshot: bool,
     fail_content_read: bool,
+    fail_find: bool,
     fail_read_uri: Option<(&'static str, &'static str)>,
     fail_write_uri: Option<&'static str>,
     fail_move_from: Option<&'static str>,
@@ -41,10 +42,14 @@ struct MockState {
     session_configs: Vec<Value>,
     session_commits: usize,
     scoped_searches: Vec<Value>,
+    recall_results: Option<Value>,
+    l2_reads: Vec<String>,
+    memory_mod_time: Option<&'static str>,
     stalled_scope_prefix: Option<&'static str>,
     long_overview: bool,
     merge_score: Option<f64>,
     merge_reflector_response: Option<&'static str>,
+    transcript_prompts: Vec<String>,
     files: HashMap<String, String>,
     snapshots: Vec<Value>,
     snapshot_files: HashMap<String, HashMap<String, String>>,
@@ -151,13 +156,14 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                                 .files
                                 .keys()
                                 .filter(|k| k.starts_with(&uri_param))
-                                .map(|k| json!({ "uri": k, "isDir": false }))
+                                .map(|k| json!({ "uri": k, "isDir": false, "modTime": guard.memory_mod_time }))
                                 .collect();
                             json!({ "status": "ok", "result": items })
                         }
                     }
                     ("GET", "/api/v1/content/read") => {
-                        let guard = st.lock().unwrap();
+                        let mut guard = st.lock().unwrap();
+                        guard.l2_reads.push(uri_param.clone());
                         if let Some((_, failure)) = guard.fail_read_uri.filter(|(uri, _)| *uri == uri_param.as_str()) {
                             status = failure;
                             json!({ "status": "error", "message": "Content read failed" })
@@ -174,7 +180,10 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                         json!({ "status": "ok", "result": { "content": format!("L1_OVERVIEW_FOR:{uri_param}{suffix}") } })
                     }
                     ("GET", "/api/v1/content/abstract") => {
-                        json!({ "status": "ok", "result": { "content": format!("L0_ABSTRACT_FOR:{}", uri_param) } })
+                        let guard = st.lock().unwrap();
+                        let text = guard.files.get(&uri_param).cloned()
+                            .unwrap_or_else(|| format!("L0_ABSTRACT_FOR:{uri_param}"));
+                        json!({ "status": "ok", "result": { "content": text } })
                     }
                     ("POST", "/api/v1/content/write") => {
                         let uri = body_json["uri"].as_str().unwrap_or("").to_string();
@@ -222,7 +231,8 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                         json!({ "status": "error", "message": "Context search cannot be scoped" })
                     }
                     ("POST", "/api/v1/search/search") if body_json["mode"] == "context" => {
-                        json!({
+                        let result = st.lock().unwrap().recall_results.clone();
+                        result.map(|items| json!({ "status": "ok", "result": { "memories": items } })).unwrap_or_else(|| json!({
                             "status": "ok",
                             "result": {
                                 "memories": [
@@ -230,24 +240,29 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                                     { "uri": "viking://~/memories/agents/pi/notes.md", "score": 0.99, "snippet": "Private search result" }
                                 ]
                             }
-                        })
+                        }))
                     }
                     ("POST", "/api/v1/search/search") => {
                         status = "400 Bad Request";
                         json!({ "status": "error", "message": "Expected context search mode" })
                     }
                     ("POST", "/api/v1/search/find") => {
-                        let (stalled, score) = {
+                        let (stalled, score, fail, results) = {
                             let mut guard = st.lock().unwrap();
                             guard.scoped_searches.push(body_json.clone());
                             let uri = body_json["target_uri"].as_str().unwrap_or_default();
                             (guard.stalled_scope_prefix.is_some_and(|prefix| uri.starts_with(prefix)),
-                             guard.merge_score.unwrap_or(0.89))
+                             guard.merge_score.unwrap_or(0.89), guard.fail_find, guard.recall_results.clone())
                         };
                         if stalled {
                             tokio::time::sleep(std::time::Duration::from_secs(4)).await;
                         }
-                        if body_json["target_uri"] == "viking://resources/projects/demo/" {
+                        if fail {
+                            status = "503 Service Unavailable";
+                            json!({ "status": "error", "message": "Find temporarily unavailable" })
+                        } else if let Some(items) = results {
+                            json!({ "status": "ok", "result": { "memories": items } })
+                        } else if body_json["target_uri"] == "viking://resources/projects/demo/" {
                             json!({
                                 "status": "ok",
                                 "result": { "entries": [
@@ -279,6 +294,9 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                                 "destination_dir": destination_dir,
                                 "rationale": "Matches demo"
                             }).to_string()
+                        } else if prompt.contains("[Recent Committed Transcripts (Ground Truth)]") {
+                            st.lock().unwrap().transcript_prompts.push(prompt.to_string());
+                            r##"{"contradicted":true,"corrected_content":"# Corrected from evidence","rationale":"Matched the captured turn"}"##.to_string()
                         } else {
                             assert!(prompt.contains("[Primary URI:"));
                             st.lock().unwrap().merge_reflector_response.unwrap_or("# Reflected memory").to_string()
@@ -894,15 +912,33 @@ async fn e2e_failed_commit_can_retry_without_replaying_messages() {
     let state = Arc::new(Mutex::new(MockState::default()));
     let url = start_mock_openviking_server(state.clone()).await;
     let client = test_client(&url, "work");
-    let db = DesktopDb::open_in_memory().unwrap();
-    let (_, messages) = ov_core::capture::collect(&json!({"messages":[{"role":"assistant","content":"one decision"}]}));
-    db.enqueue_capture(&client.profile_key(),"session","codex","viking://resources/projects/demo/",None,&messages,false).unwrap();
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("desktop.sqlite");
+    let db = DesktopDb::open(&path).unwrap();
+    let (_, messages) = ov_core::capture::collect(&json!({"messages":[
+        {"role":"user","content":"privacy-skipped turn"},
+        {"role":"assistant","content":"one decision"}
+    ]}));
+    let profile = client.profile_key();
+    let resource = "viking://resources/projects/demo/";
+    db.skip_capture(&profile, "session", "codex", resource, None, &messages[..1]).unwrap();
+    assert_eq!(db.enqueue_capture(&profile, "session", "codex", resource, None, &messages, false).unwrap(), 1);
     state.lock().unwrap().fail_session_commit = true;
     assert!(ov_core::capture::sync_capture(&db,&client,0,false).await.is_err());
-    assert_eq!(db.capture_health(&client.profile_key()).unwrap().uncertain_sessions,0);
+    assert!(db.recent_committed_transcripts_for_profile(&profile, 0, 10).unwrap().is_empty());
+    assert_eq!(db.capture_health(&profile).unwrap().uncertain_sessions,0);
     state.lock().unwrap().fail_session_commit = false;
     assert_eq!(ov_core::capture::sync_capture(&db,&client,0,false).await.unwrap(),1);
-    assert_eq!(state.lock().unwrap().session_messages.len(),1);
+    assert_eq!(state.lock().unwrap().session_messages, ["one decision"]);
+    drop(db);
+
+    let db = DesktopDb::open(&path).unwrap();
+    let evidence = db.recent_committed_transcripts_for_profile(&profile, 0, 10).unwrap();
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(evidence[0].session_key, "session");
+    assert_eq!(evidence[0].role, "assistant");
+    assert_eq!(evidence[0].content, "one decision");
+    assert_eq!(db.max_committed_outbox_seq_for_profile(&profile).unwrap(), evidence[0].seq);
 }
 
 #[tokio::test]
@@ -1081,21 +1117,20 @@ async fn e2e_merge_archives_peer_upgrades_verified_and_rolls_back_both() {
 
     {
         let mut guard = state.lock().unwrap();
-        guard.fail_move_from = Some(PEER_ARCHIVED);
         guard.fail_write_uri = Some(PEER);
     }
     let error = rollback_dreaming_run(&client, &db, &run.id).await.unwrap_err();
     assert!(error.contains("Could not restore merge peer"));
     {
         let mut guard = state.lock().unwrap();
-        assert!(guard.files.contains_key(PEER_ARCHIVED));
-        assert!(!guard.files.contains_key(PEER));
+        assert!(!guard.files.contains_key(PEER_ARCHIVED));
+        assert!(ov_core::provenance::is_superseded(&guard.files[PEER]));
         guard.fail_write_uri = None;
     }
     rollback_dreaming_run(&client, &db, &run.id).await.unwrap();
     {
         let guard = state.lock().unwrap();
-        assert!(guard.files.contains_key(PEER), "rollback must restore peer");
+        assert_eq!(guard.files[PEER], "# Git Style\nUse English Conventional Commits.\nOld note.");
         assert!(!guard.files.contains_key(PEER_ARCHIVED), "rollback must clear archived peer");
     }
 }
@@ -1156,6 +1191,19 @@ async fn e2e_merge_detects_peer_drift_and_compensates_archive_failure() {
     assert!(report.failed_items[0].1.contains("Could not archive merge peer"));
     assert_eq!(state.lock().unwrap().files, original);
     assert_eq!(db.get_run(&run.id).unwrap().unwrap().status, "partial_failure");
+
+    let (_, staged) = run_dreaming(&client, &db, &policy, "e2e").await.unwrap();
+    let merge = staged.iter().find(|c| c.action == ChangeAction::Merge).unwrap();
+    db.update_change_decision_for_profile(&profile, &merge.id, ReviewStatus::Accepted, None).unwrap();
+    {
+        let mut guard = state.lock().unwrap();
+        guard.fail_move_from = None;
+        guard.fail_write_uri = Some("viking://~/archive/merged-git-old.md");
+    }
+    let report = apply_accepted_changes(&client, &db, &policy).await.unwrap();
+    assert!(report.applied_ids.is_empty());
+    assert!(report.failed_items[0].1.contains("Could not stamp merge peer"));
+    assert_eq!(state.lock().unwrap().files, original);
 }
 
 
@@ -1284,41 +1332,88 @@ async fn e2e_minja_poisoning_isolated_superseded_filtered_and_score_gated() {
 
 
 #[tokio::test]
-async fn e2e_ttl_expiry_filtered_from_recall_and_archived_by_dreaming() {
+async fn e2e_recall_and_startup_filter_authoritative_lifecycle_data() {
+    const ACTIVE: &str = "viking://~/memories/preferences/active.md";
+    const SUPERSEDED: &str = "viking://~/memories/preferences/superseded.md";
+    const EXPIRED: &str = "viking://~/memories/events/expired.md";
+    const USER_MEMORIES: &str = ov_core::policy::router::USER_MEMORIES_URI;
+    let state = Arc::new(Mutex::new(MockState {
+        recall_results: Some(json!([
+            {"uri": "viking://~/memories/preferences/stale-status.md", "score": 1.0, "status": "superseded"},
+            {"uri": SUPERSEDED, "score": 0.99, "snippet": "Outdated advice"},
+            {"uri": EXPIRED, "score": 0.98, "snippet": "Old meeting"},
+            {"uri": "viking://~/memories/events/stale-metadata.md", "score": 0.97, "expires_at": "2020-01-01T00:00:00Z"},
+            {"uri": ACTIVE, "score": 0.90, "snippet": "Example body text says status: expired and status: superseded"}
+        ])),
+        files: HashMap::from([
+            (SUPERSEDED.into(), "---\nstatus: superseded\n---\nOutdated advice".into()),
+            (EXPIRED.into(), "---\nexpires_at: 2020-01-01T00:00:00Z\n---\nOld meeting detail".into()),
+            (ACTIVE.into(), "Active detail\nstatus: expired".into()),
+            (USER_MEMORIES.into(), "---\nexpires_at: 2020-01-01T00:00:00Z\n---\nExpired startup material".into()),
+        ]),
+        ..Default::default()
+    }));
+    let url = start_mock_openviking_server(state.clone()).await;
+    let client = test_client(&url, "work");
+    let mut policy = PolicyConfig::default();
+    policy.budget.default_recall_layer = ContextLayer::L2;
+    policy.budget.agent_overrides.clear();
+    policy.routing.auto_map_git_repo = false;
+    policy.routing.respect_project_policy_file = false;
+    let params = json!({"name":"recall", "arguments":{"query":"recall lifecycle notes"}});
+    let payload = json!({"prompt":"recall lifecycle notes"});
+
+    for respect_ttl_expiry in [true, false] {
+        policy.lifecycle.archival.respect_ttl_expiry = respect_ttl_expiry;
+        let mcp_text = mcp::call_tool(AgentId::Codex, &params, &policy, &client, None).await.unwrap();
+        for text in [
+            mcp_text,
+            hook::execute_hook("user-prompt-submit", AgentId::Codex, &payload, &policy, &client, None).await,
+            hook::execute_hook("pre-invocation", AgentId::Antigravity, &payload, &policy, &client, None).await,
+        ] {
+            assert!(!text.contains(SUPERSEDED));
+            assert!(!text.contains("stale-status.md"));
+            assert!(text.contains("Example body text"));
+            assert_eq!(text.contains(EXPIRED), !respect_ttl_expiry);
+            assert_eq!(text.contains("stale-metadata.md"), !respect_ttl_expiry);
+            assert_eq!(text.contains("Active detail"), respect_ttl_expiry);
+            assert_eq!(text.contains("Old meeting detail"), !respect_ttl_expiry);
+        }
+        let startup = hook::execute_hook("session-start", AgentId::Codex, &payload, &policy, &client, None).await;
+        assert_eq!(startup.contains("Expired startup material"), !respect_ttl_expiry);
+    }
+
+    policy.lifecycle.dreaming.max_index_entry_bytes = 24;
+    let long_entry = "長".repeat(24);
+    state.lock().unwrap().files.insert(USER_MEMORIES.into(), format!("- First entry\n- {long_entry}\n- Last entry"));
+    let startup = hook::execute_hook("session-start", AgentId::Codex, &payload, &policy, &client, None).await;
+    assert!(startup.contains("- First entry\n- 長"));
+    assert!(startup.contains("\n- Last entry"));
+    assert!(startup.lines().find(|line| line.starts_with("- 長")).unwrap().len() <= 24);
+    state.lock().unwrap().files.insert(USER_MEMORIES.into(), "---\nstatus: superseded\n---\nStale startup material".into());
+    let startup = hook::execute_hook("session-start", AgentId::Codex, &payload, &policy, &client, None).await;
+    assert!(!startup.contains("Stale startup material"));
+}
+
+#[tokio::test]
+async fn e2e_ttl_archive_honors_explicit_expiry_and_restores_original() {
     let expired_uri = "viking://~/memories/events/temp-meeting.md";
     let expired_doc = "---\nsource_agent: codex\nstatus: active\nevent_time: 2020-01-01T09:00:00Z\nexpires_at: 2020-01-02T09:00:00Z\n---\nTemporary standup at 3pm tomorrow.";
+    let future_uri = "viking://~/memories/events/valid-meeting.md";
+    let future_doc = expired_doc.replace("expires_at: 2020", "expires_at: 2100");
     let state = Arc::new(Mutex::new(MockState::default()));
     {
         let mut s = state.lock().unwrap();
         s.files.insert(expired_uri.to_string(), expired_doc.to_string());
+        s.files.insert(future_uri.to_string(), future_doc);
     }
     let url = start_mock_openviking_server(state.clone()).await;
     let client = test_client(&url, "ttl-profile");
     let db = DesktopDb::open_in_memory().unwrap();
-    let policy = PolicyConfig::default();
-
-    // 1. Recall must immediately drop expired TTL candidate
-    let cand = mcp::RecallCandidate {
-        uri: expired_uri.to_string(),
-        title: "Temp Meeting".to_string(),
-        score: 0.95,
-        snippet: expired_doc.to_string(),
-        category: Some(ov_core::policy::model::MemoryCategory::Events),
-    };
-    let budget = policy.budget.resolve_for(AgentId::Codex);
-    let (rendered, _, hits) = mcp::render_recall(
-        &client,
-        vec![cand],
-        &budget,
-        &policy.budget.category_quotas,
-        Some(3),
-    )
-    .await;
-    assert!(rendered.is_empty(), "Expired TTL memory must be excluded from recall");
-    assert!(hits.is_empty());
-
-    // 2. Dreaming must stage and apply TTL archive to archive/expired-* with status: expired
-    let (_run, staged) = run_dreaming(&client, &db, &policy, "e2e-ttl").await.unwrap();
+    let mut policy = PolicyConfig::default();
+    policy.lifecycle.archival.episode_default_ttl_days = 1;
+    let (_, staged) = run_dreaming(&client, &db, &policy, "e2e-ttl").await.unwrap();
+    assert!(staged.iter().all(|change| change.target_uri != future_uri));
     let ttl_chg = staged
         .iter()
         .find(|c| c.target_uri == expired_uri && c.action == ChangeAction::Archive)
@@ -1331,18 +1426,38 @@ async fn e2e_ttl_expiry_filtered_from_recall_and_archived_by_dreaming() {
         .contains("expired-temp-meeting.md"));
     db.update_change_decision_for_profile(&client.profile_key(), &ttl_chg.id, ReviewStatus::Accepted, None)
         .unwrap();
+    state.lock().unwrap().fail_write_uri = Some("viking://~/archive/expired-temp-meeting.md");
     let report = apply_accepted_changes(&client, &db, &policy).await.unwrap();
-    assert_eq!(report.applied_ids.len(), 1);
+    assert!(report.applied_ids.is_empty());
+    assert!(report.failed_items[0].1.contains("Could not stamp archive"));
+    {
+        let mut guard = state.lock().unwrap();
+        assert_eq!(guard.files[expired_uri], expired_doc);
+        assert!(!guard.files.contains_key(ttl_chg.destination_uri.as_deref().unwrap()));
+        guard.fail_write_uri = None;
+    }
+
+    let (run, staged) = run_dreaming(&client, &db, &policy, "e2e-ttl").await.unwrap();
+    let ttl_chg = staged.iter().find(|c| c.target_uri == expired_uri).unwrap();
+    db.update_change_decision_for_profile(&client.profile_key(), &ttl_chg.id, ReviewStatus::Accepted, None).unwrap();
+    let report = apply_accepted_changes(&client, &db, &policy).await.unwrap();
+    assert_eq!(report.applied_ids, [ttl_chg.id.clone()]);
     let dest = ttl_chg.destination_uri.as_deref().unwrap();
+    {
+        let guard = state.lock().unwrap();
+        assert!(!guard.files.contains_key(expired_uri));
+        assert_eq!(parse_frontmatter(&guard.files[dest]).0.unwrap().status, "expired");
+    }
+    rollback_dreaming_run(&client, &db, &run.id).await.unwrap();
     let guard = state.lock().unwrap();
-    assert!(!guard.files.contains_key(expired_uri));
-    let archived = guard.files.get(dest).expect("Archived expired file must exist");
-    assert!(ov_core::provenance::is_expired(archived, chrono::Utc::now().timestamp()));
+    assert_eq!(guard.files[expired_uri], expired_doc);
+    assert!(!guard.files.contains_key(dest));
 }
 
 #[tokio::test]
 async fn e2e_demote_from_index_oversized_and_rollback() {
     let oversized_uri = "viking://~/memories/preferences/oversized-rule.md";
+    let normal_uri = "viking://~/memories/preferences/normal-rule.md";
     let huge_body = "Detailed rule line.\n".repeat(150);
     let doc = format!(
         "---\nsource_agent: claude-code\nverified: true\nindex_priority: high\n---\n# Giant Rule\n{}",
@@ -1352,13 +1467,34 @@ async fn e2e_demote_from_index_oversized_and_rollback() {
     {
         let mut s = state.lock().unwrap();
         s.files.insert(oversized_uri.to_string(), doc.clone());
+        s.files.insert(normal_uri.to_string(), "---\nverified: true\nindex_priority: normal\n---\nUse the project formatter.".into());
     }
     let url = start_mock_openviking_server(state.clone()).await;
     let client = test_client(&url, "demote-profile");
     let db = DesktopDb::open_in_memory().unwrap();
     let policy = PolicyConfig::default();
+    for i in 0..5 {
+        let event = RecallEvent {
+            id: format!("index-recall-{i}"),
+            agent_id: (if i % 2 == 0 { "codex" } else { "claude-code" }).into(),
+            event_type: "recall".into(),
+            query: None,
+            target_uri: None,
+            layer: Some("l0".into()),
+            tokens_used: 0,
+            latency_ms: 0,
+            blocked_by_privacy: false,
+            created_at: chrono::Utc::now().timestamp(),
+        };
+        db.record_event_for_profile(&client.profile_key(), &event).unwrap();
+        db.record_recall_hits(&event.id, &[(oversized_uri.into(), 0.9, true), (normal_uri.into(), 0.9, true)]).unwrap();
+    }
 
     let (run, staged) = run_dreaming(&client, &db, &policy, "e2e-demote").await.unwrap();
+    let promotions: Vec<_> = staged.iter().filter(|change| change.action == ChangeAction::PromoteToIndex).collect();
+    assert_eq!(promotions.len(), 1);
+    assert_eq!(promotions[0].target_uri, normal_uri);
+    assert!(ov_core::provenance::has_index_priority_high(promotions[0].after_content.as_deref().unwrap()));
     let demote = staged
         .iter()
         .find(|c| c.target_uri == oversized_uri && c.action == ChangeAction::DemoteFromIndex)
@@ -1376,9 +1512,115 @@ async fn e2e_demote_from_index_oversized_and_rollback() {
         assert!(after.contains("index_priority: normal"));
     }
 
+    // Re-running dreaming must not re-promote the demoted oversized note.
+    let (_, rerun_staged) = run_dreaming(&client, &db, &policy, "e2e-demote-rerun").await.unwrap();
+    assert!(
+        rerun_staged.iter().all(|c| !(c.target_uri == oversized_uri && c.action == ChangeAction::PromoteToIndex)),
+        "Oversized demoted note must not oscillate back into PromoteToIndex"
+    );
+
     // Rollback must restore index_priority: high
     rollback_dreaming_run(&client, &db, &run.id).await.unwrap();
     let guard = state.lock().unwrap();
     let restored = guard.files.get(oversized_uri).unwrap();
     assert!(ov_core::provenance::has_index_priority_high(restored));
+}
+
+#[tokio::test]
+async fn e2e_transcript_verification_advances_only_past_evidence_used_on_mutable_notes() {
+    const IMMUTABLE: &str = "viking://~/memories/events/immutable.md";
+    const MUTABLE: &str = "viking://~/memories/preferences/mutable.md";
+    let note = "Use the previous runtime for all development builds.";
+    let state = Arc::new(Mutex::new(MockState {
+        files: HashMap::from([(IMMUTABLE.into(), note.into())]),
+        ..Default::default()
+    }));
+    let url = start_mock_openviking_server(state.clone()).await;
+    let client = test_client(&url, "transcripts");
+    let db = DesktopDb::open_in_memory().unwrap();
+    let profile = client.profile_key();
+    let cursor_key = format!("dreaming.last_transcript_seq.{profile}");
+    let mut policy = PolicyConfig::default();
+    policy.lifecycle.archival.enabled = false;
+    let dreaming = &mut policy.lifecycle.dreaming;
+    dreaming.dedupe_and_merge = false;
+    dreaming.incremental_mode = false;
+    dreaming.reflector_mode = ReflectorMode::OpenaiCompatible;
+    dreaming.reflector_endpoint = format!("{url}/v1");
+    let messages: Vec<_> = (0..35).map(|i| ov_core::capture::CapturedMessage {
+        key: format!("turn-{i}"),
+        role: "user".into(),
+        content: format!("turn-{i:02} {}", "x".repeat(180)),
+    }).collect();
+    db.enqueue_capture(&profile, "transcript", "codex", "viking://resources/projects/demo/", None, &messages, true).unwrap();
+    ov_core::capture::sync_capture(&db, &client, 0, false).await.unwrap();
+    let rows = db.recent_committed_transcripts_for_profile(&profile, 0, 35).unwrap();
+    assert_eq!(rows.len(), 35);
+
+    let (_, staged) = run_dreaming(&client, &db, &policy, "e2e").await.unwrap();
+    assert!(staged.iter().all(|change| change.target_uri != IMMUTABLE));
+    assert!(state.lock().unwrap().transcript_prompts.is_empty());
+    assert_eq!(db.get_kv(&cursor_key).unwrap(), None);
+    state.lock().unwrap().files.insert(MUTABLE.into(), note.into());
+
+    let (_, staged) = run_dreaming(&client, &db, &policy, "e2e").await.unwrap();
+    assert!(staged.iter().any(|change| change.target_uri == MUTABLE && change.action == ChangeAction::Merge));
+    assert!(staged.iter().all(|change| change.target_uri != IMMUTABLE));
+    // Each formatted turn takes 197 or more characters, so only 17 fit in 3500.
+    let expected_cursor = rows[16].seq.to_string();
+    assert_eq!(db.get_kv(&cursor_key).unwrap().as_deref(), Some(expected_cursor.as_str()));
+    {
+        let guard = state.lock().unwrap();
+        assert_eq!(guard.transcript_prompts.len(), 1);
+        let prompt = &guard.transcript_prompts[0];
+        assert!(prompt.contains("turn-16"));
+        assert!(!prompt.contains("turn-17"));
+    }
+
+    policy.lifecycle.dreaming.verify_against_transcripts = false;
+    run_dreaming(&client, &db, &policy, "e2e").await.unwrap();
+    assert_eq!(db.get_kv(&cursor_key).unwrap().as_deref(), Some(expected_cursor.as_str()));
+    policy.lifecycle.dreaming.verify_against_transcripts = true;
+    run_dreaming(&client, &db, &policy, "e2e").await.unwrap();
+    let guard = state.lock().unwrap();
+    assert!(guard.transcript_prompts[1].contains("turn-17"));
+    assert!(!guard.transcript_prompts[1].contains("turn-16"));
+}
+
+#[tokio::test]
+async fn e2e_incremental_scan_retries_read_and_find_failures_then_skips_unchanged_l2() {
+    const NOTE: &str = "viking://~/memories/preferences/git.md";
+    let state = Arc::new(Mutex::new(MockState {
+        files: HashMap::from([(NOTE.into(), "Use Conventional Commits across every repository.".into())]),
+        memory_mod_time: Some("2020-01-01T00:00:00Z"),
+        merge_score: Some(0.5),
+        fail_content_read: true,
+        ..Default::default()
+    }));
+    let url = start_mock_openviking_server(state.clone()).await;
+    let client = test_client(&url, "incremental");
+    let db = DesktopDb::open_in_memory().unwrap();
+    let watermark = format!("dreaming.last_scan_ts.{}", client.profile_key());
+    db.set_kv(&watermark, "1").unwrap();
+    let mut policy = PolicyConfig::default();
+    policy.lifecycle.archival.enabled = false;
+    policy.lifecycle.dreaming.demote_cold_index = false;
+
+    run_dreaming(&client, &db, &policy, "e2e").await.unwrap();
+    assert_eq!(db.get_kv(&watermark).unwrap().as_deref(), Some("1"));
+    {
+        let mut guard = state.lock().unwrap();
+        assert_eq!(guard.l2_reads, [NOTE]);
+        guard.fail_content_read = false;
+        guard.fail_find = true;
+    }
+    run_dreaming(&client, &db, &policy, "e2e").await.unwrap();
+    assert_eq!(db.get_kv(&watermark).unwrap().as_deref(), Some("1"));
+    state.lock().unwrap().fail_find = false;
+    run_dreaming(&client, &db, &policy, "e2e").await.unwrap();
+    assert!(db.get_kv(&watermark).unwrap().unwrap().parse::<i64>().unwrap() > 1);
+    run_dreaming(&client, &db, &policy, "e2e").await.unwrap();
+    let guard = state.lock().unwrap();
+    assert_eq!(guard.l2_reads, [NOTE, NOTE, NOTE]);
+    assert_eq!(guard.scoped_searches.len(), 2);
 }

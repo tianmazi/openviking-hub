@@ -1,14 +1,17 @@
 use crate::dreaming::db::{DesktopDb, DreamingRun};
-use crate::dreaming::reflector::{reflect_inbox_route, reflect_merge, reflect_transcript_verify};
+use crate::dreaming::reflector::{
+    reflect_inbox_route, reflect_merge, reflect_transcript_verify_checked,
+};
 use crate::fs_util::sha256_hex;
 use crate::ov_client::{snapshot_commit_id, FindRequest, OvClient, OvClientError};
 use crate::policy::model::{
-    ChangeAction, KnowledgeRelation, MemoryCategory, PendingMemoryChange, PolicyConfig, ReviewStatus, RiskLevel,
+    ChangeAction, KnowledgeRelation, MemoryCategory, PendingMemoryChange, PolicyConfig,
+    ReflectorMode, ReviewStatus, RiskLevel,
 };
 use crate::policy::router::{is_protected_rule_path, USER_MEMORIES_URI};
 use crate::provenance::{
-    has_index_priority_high, is_expired, is_write_gate_verified, parse_frontmatter,
-    render_frontmatter, split_frontmatter, stamp_expired, stamp_index_priority_normal,
+    has_index_priority_high, is_write_gate_verified, parse_frontmatter, render_frontmatter,
+    split_frontmatter, stamp_expired, stamp_index_priority_high, stamp_index_priority_normal,
     stamp_superseded, MemoryProvenance,
 };
 use chrono::{DateTime, Utc};
@@ -45,28 +48,27 @@ pub async fn run_dreaming(
     let now = Utc::now().timestamp();
     let stale_cutoff = now - (policy.lifecycle.archival.stale_days as i64 * 86_400);
     let demote_cutoff = now - (policy.lifecycle.dreaming.demote_stale_days as i64 * 86_400);
-    let last_run_at_key = format!("dreaming_last_run_at:{profile_key}");
-    let last_outbox_seq_key = format!("dreaming_last_outbox_seq:{profile_key}");
-    let last_run_at: i64 = db
-        .get_kv(&last_run_at_key)
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let last_outbox_seq: i64 = db
-        .get_kv(&last_outbox_seq_key)
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let recent_transcripts = if policy.lifecycle.dreaming.verify_against_transcripts {
-        db.recent_committed_transcripts_for_profile(&profile_key, last_outbox_seq, 30)
-            .unwrap_or_default()
+    let last_scan_key = format!("dreaming.last_scan_ts.{profile_key}");
+    // Evidence has its own sequence. An outbox watermark cannot be reused here.
+    let last_transcript_key = format!("dreaming.last_transcript_seq.{profile_key}");
+    let last_scan_ts: i64 = db.get_kv(&last_scan_key)?.and_then(|v| v.parse().ok()).unwrap_or(0);
+    let dreaming = &policy.lifecycle.dreaming;
+    let archival = &policy.lifecycle.archival;
+    let verify_transcripts = dreaming.verify_against_transcripts
+        && dreaming.reflector_mode != ReflectorMode::Deterministic;
+    let recent_transcripts = if verify_transcripts {
+        let last_seq = db.get_kv(&last_transcript_key)?.and_then(|v| v.parse().ok()).unwrap_or(0);
+        db.recent_committed_transcripts_for_profile(&profile_key, last_seq, 31)?
     } else {
         Vec::new()
     };
-    let transcript_excerpt = build_transcript_excerpt(&recent_transcripts, 3500);
+    let (transcript_excerpt, excerpt_max_seq, has_more_transcripts) =
+        build_transcript_excerpt(&recent_transcripts, 3500, 30);
     let mut verified_against_transcripts_count = 0usize;
+    let mut transcript_verify_succeeded = 0usize;
+    let mut had_transcript_verify_error = false;
+    let mut had_verify_read_failure = false;
+    let mut had_transient_scan_error = false;
 
     let mut staged: Vec<PendingMemoryChange> = Vec::new();
     let mut counts = json!({
@@ -179,26 +181,50 @@ pub async fn run_dreaming(
                 .and_then(|time| DateTime::parse_from_rfc3339(time).ok())
                 .map(|time| time.timestamp());
             let is_recently_changed_or_hit = !policy.lifecycle.dreaming.incremental_mode
-                || last_run_at == 0
-                || mod_time_ts.is_none_or(|ts| ts >= last_run_at)
-                || last_hit >= last_run_at;
-            let cached_content = read_text(client, uri).await.ok();
+                || last_scan_ts == 0
+                || mod_time_ts.is_none_or(|ts| ts >= last_scan_ts)
+                || last_hit >= last_scan_ts;
+            let analyze_mutable = is_recently_changed_or_hit && policy.lifecycle.is_mutable(category);
+            let can_verify = verify_transcripts && analyze_mutable
+                && excerpt_max_seq.is_some() && verified_against_transcripts_count < 5;
+            let can_merge = dreaming.dedupe_and_merge && analyze_mutable;
+            let can_check_ttl = archival.enabled && archival.respect_ttl_expiry;
+            let can_promote = dreaming.promote_hot_notes && hit_count >= 5 && agents.len() >= 2;
+            let can_archive_cold = archival.enabled && hit_count < archival.min_hit_count
+                && ((hit_count > 0 && last_hit < stale_cutoff)
+                    || (hit_count == 0 && mod_time_ts.is_some_and(|ts| ts < stale_cutoff)));
+            if !(can_check_ttl || dreaming.demote_cold_index || can_promote || can_archive_cold
+                || can_verify || can_merge)
+            {
+                continue;
+            }
+            let cached_content = read_text(client, uri)
+                .await
+                .inspect_err(|error| had_transient_scan_error |= is_transient_scan_error(error))
+                .ok();
 
             // 3d. Event TTL expiry check (archive expired memories immediately without waiting stale_days)
-            if policy.lifecycle.archival.enabled && policy.lifecycle.archival.respect_ttl_expiry {
+            if can_check_ttl {
                 if let Some(ref raw) = cached_content {
-                    let explicit_expired = is_expired(raw, now);
+                    let (provenance, _) = parse_frontmatter(raw);
+                    let expires_at = provenance.as_ref().and_then(|p| p.expires_at.as_deref());
+                    let explicit_expiry_ts = expires_at
+                        .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+                        .map(|dt| dt.timestamp());
+                    let explicit_expired = provenance.as_ref()
+                        .is_some_and(|p| p.status.eq_ignore_ascii_case("expired"))
+                        || explicit_expiry_ts.is_some_and(|ts| ts <= now);
                     let episode_ttl_expired = !explicit_expired
+                        && explicit_expiry_ts.is_none()
                         && category == MemoryCategory::Events
                         && policy.lifecycle.archival.episode_default_ttl_days > 0
                         && {
                             let ttl_cutoff = now
                                 - (policy.lifecycle.archival.episode_default_ttl_days as i64
                                     * 86_400);
-                            let event_ts = parse_frontmatter(raw)
-                                .0
-                                .and_then(|p| p.event_time.or(Some(p.created_at)))
-                                .and_then(|ts| DateTime::parse_from_rfc3339(&ts).ok())
+                            let event_ts = provenance.as_ref()
+                                .map(|p| p.event_time.as_deref().unwrap_or(&p.created_at))
+                                .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
                                 .map(|dt| dt.timestamp())
                                 .or(mod_time_ts);
                             event_ts.is_some_and(|ts| ts < ttl_cutoff)
@@ -211,11 +237,10 @@ pub async fn run_dreaming(
                             policy.lifecycle.archival.archive_uri.trim_end_matches('/'),
                             file_name
                         );
-                        let expires_at = parse_frontmatter(raw).0.and_then(|p| p.expires_at);
                         let rationale = if explicit_expired {
                             format!(
                                 "事件记忆已超过有效期（expires_at: {}），建议立即归档并标记为 expired。",
-                                expires_at.as_deref().unwrap_or("status: expired")
+                                expires_at.unwrap_or("status: expired")
                             )
                         } else {
                             format!(
@@ -319,11 +344,18 @@ pub async fn run_dreaming(
             }
 
             // 3a. Hot memory promotion with Anti-Contagion Write-Gate
-            if policy.lifecycle.dreaming.promote_hot_notes && hit_count >= 5 && agents.len() >= 2 {
+            if can_promote {
                 let content = cached_content.clone();
                 let gate_ok = content
                     .as_deref()
-                    .map(|raw| is_write_gate_verified(raw, i64::from(hit_count), agents.len()))
+                    .map(|raw| {
+                        let body_bytes = split_frontmatter(raw).1.len();
+                        let is_oversized = policy.lifecycle.dreaming.max_index_entry_bytes > 0
+                            && body_bytes > policy.lifecycle.dreaming.max_index_entry_bytes;
+                        !is_oversized
+                            && !has_index_priority_high(raw)
+                            && is_write_gate_verified(raw, i64::from(hit_count), agents.len())
+                    })
                     .unwrap_or(false);
                 if gate_ok {
                     let base_hash = content.as_deref().map(sha256_hex);
@@ -362,11 +394,7 @@ pub async fn run_dreaming(
             }
 
             // 3b. Cold memory archival check
-            if policy.lifecycle.archival.enabled
-                && hit_count < policy.lifecycle.archival.min_hit_count
-                && ((hit_count > 0 && last_hit < stale_cutoff)
-                    || (hit_count == 0 && mod_time_ts.is_some_and(|ts| ts < stale_cutoff)))
-            {
+            if can_archive_cold && cached_content.is_some() {
                 let content = cached_content.clone();
                 let base_hash = content.as_deref().map(sha256_hex);
                 let file_name = uri.rsplit('/').next().unwrap_or("memory.md");
@@ -407,16 +435,12 @@ pub async fn run_dreaming(
             }
 
             // 2b. Ground-truth verification against recent committed local transcripts
-            if policy.lifecycle.dreaming.verify_against_transcripts
-                && is_recently_changed_or_hit
-                && !transcript_excerpt.is_empty()
-                && verified_against_transcripts_count < 5
-            {
+            if can_verify {
                 if let Some(ref content) = cached_content {
                     let (frontmatter, primary_body) = split_frontmatter(content);
                     if primary_body.trim().len() >= 20 {
                         verified_against_transcripts_count += 1;
-                        if let Some(res) = reflect_transcript_verify(
+                        match reflect_transcript_verify_checked(
                             &policy.lifecycle.dreaming,
                             uri,
                             primary_body,
@@ -424,57 +448,65 @@ pub async fn run_dreaming(
                         )
                         .await
                         {
-                            let mut prov = MemoryProvenance::new(
-                                "dreaming",
-                                "shared",
-                                false,
-                                res.confidence,
-                            );
-                            prov.updated_by =
-                                format!("dreaming:transcript_verify:{}", res.engine_label);
-                            prov.evidence_uris = vec![uri.to_string()];
-                            let corrected_with_prov =
-                                render_frontmatter(frontmatter, &res.corrected_content, &prov);
-                            let change = PendingMemoryChange {
-                                id: format!("chg-{}", Uuid::new_v4().simple()),
-                                run_id: run_id.clone(),
-                                snapshot_id: None,
-                                created_at: now,
-                                action: ChangeAction::Merge,
-                                risk_level: RiskLevel::Medium,
-                                target_uri: uri.to_string(),
-                                destination_uri: None,
-                                category,
-                                base_hash: Some(sha256_hex(content)),
-                                before_content: Some(content.clone()),
-                                after_content: Some(corrected_with_prov),
-                                rationale: format!(
-                                    "[TRANSCRIPT_VERIFY] {}（{}）",
-                                    res.rationale, res.engine_label
-                                ),
-                                evidence_json: json!({
-                                    "source": "transcript_verify",
-                                    "reflector": res.engine_label,
-                                    "confidence": res.confidence,
-                                    "transcript_excerpt": transcript_excerpt.chars().take(600).collect::<String>(),
-                                })
-                                .to_string(),
-                                status: ReviewStatus::Pending,
-                            };
-                            db.insert_pending_change_for_profile(&profile_key, &change)?;
-                            staged.push(change);
-                            counts["transcript_verify"] =
-                                json!(counts["transcript_verify"].as_u64().unwrap_or(0) + 1);
+                            Ok(Some(res)) => {
+                                transcript_verify_succeeded += 1;
+                                let mut prov = MemoryProvenance::new(
+                                    "dreaming",
+                                    "shared",
+                                    false,
+                                    res.confidence,
+                                );
+                                prov.updated_by =
+                                    format!("dreaming:transcript_verify:{}", res.engine_label);
+                                prov.evidence_uris = vec![uri.to_string()];
+                                let corrected_with_prov =
+                                    render_frontmatter(frontmatter, &res.corrected_content, &prov);
+                                let change = PendingMemoryChange {
+                                    id: format!("chg-{}", Uuid::new_v4().simple()),
+                                    run_id: run_id.clone(),
+                                    snapshot_id: None,
+                                    created_at: now,
+                                    action: ChangeAction::Merge,
+                                    risk_level: RiskLevel::Medium,
+                                    target_uri: uri.to_string(),
+                                    destination_uri: None,
+                                    category,
+                                    base_hash: Some(sha256_hex(content)),
+                                    before_content: Some(content.clone()),
+                                    after_content: Some(corrected_with_prov),
+                                    rationale: format!(
+                                        "[TRANSCRIPT_VERIFY] {}（{}）",
+                                        res.rationale, res.engine_label
+                                    ),
+                                    evidence_json: json!({
+                                        "source": "transcript_verify",
+                                        "reflector": res.engine_label,
+                                        "confidence": res.confidence,
+                                        "transcript_excerpt": transcript_excerpt.chars().take(600).collect::<String>(),
+                                    })
+                                    .to_string(),
+                                    status: ReviewStatus::Pending,
+                                };
+                                db.insert_pending_change_for_profile(&profile_key, &change)?;
+                                staged.push(change);
+                                counts["transcript_verify"] =
+                                    json!(counts["transcript_verify"].as_u64().unwrap_or(0) + 1);
+                            }
+                            Ok(None) => {
+                                transcript_verify_succeeded += 1;
+                            }
+                            Err(_) => {
+                                had_transcript_verify_error = true;
+                            }
                         }
                     }
+                } else {
+                    had_verify_read_failure = true;
                 }
             }
 
             // 2. Semantic conflict & dedupe merger (strictly mutable categories only; incremental when enabled)
-            if policy.lifecycle.dreaming.dedupe_and_merge
-                && policy.lifecycle.is_mutable(category)
-                && is_recently_changed_or_hit
-            {
+            if can_merge {
                 if let Some(content) = cached_content.clone() {
                     let snippet: String = content.chars().take(240).collect();
                     if snippet.trim().len() >= 20 {
@@ -486,6 +518,7 @@ pub async fn run_dreaming(
                                 limit: Some(4),
                             })
                             .await
+                            .inspect_err(|error| had_transient_scan_error |= is_transient_scan_error(error))
                         {
                             for (other_uri, score) in extract_scored_uris(&found) {
                                 if other_uri.as_str() == uri
@@ -502,7 +535,9 @@ pub async fn run_dreaming(
                                 if !seen_merge_pairs.insert(pair) {
                                     continue;
                                 }
-                                let Ok(other_content) = read_text(client, &other_uri).await
+                                let Ok(other_content) = read_text(client, &other_uri)
+                                    .await
+                                    .inspect_err(|error| had_transient_scan_error |= is_transient_scan_error(error))
                                 else {
                                     continue;
                                 };
@@ -678,11 +713,21 @@ pub async fn run_dreaming(
         }
     }
     counts["auto_applied"] = json!(auto_applied_count);
-    let _ = db.set_kv(&last_run_at_key, &now.to_string());
-    if let Ok(max_seq) = db.max_committed_outbox_seq_for_profile(&profile_key) {
-        if max_seq > last_outbox_seq {
-            let _ = db.set_kv(&last_outbox_seq_key, &max_seq.to_string());
-        }
+    let keep_notes_in_scope = had_transient_scan_error
+        || had_transcript_verify_error
+        || had_verify_read_failure
+        || has_more_transcripts
+        || (excerpt_max_seq.is_some() && transcript_verify_succeeded == 0);
+    if !keep_notes_in_scope {
+        db.set_kv(&last_scan_key, &now.to_string())?;
+    }
+    if let Some(max_seq) = excerpt_max_seq.filter(|_| {
+        transcript_verify_succeeded > 0
+            && !had_transcript_verify_error
+            && !had_verify_read_failure
+            && !had_transient_scan_error
+    }) {
+        db.set_kv(&last_transcript_key, &max_seq.to_string())?;
     }
     db.finalize_dreaming_run(&profile_key, &run_id, &counts.to_string())
 }
@@ -840,7 +885,7 @@ async fn apply_changes_internal(
                 )?;
                 applied_ids.push(chg.id.clone());
             }
-            Err(e) => {
+            Err(ExecuteError::Clean(e)) => {
                 db.finish_claimed_change_for_profile(
                     &profile_key,
                     chg,
@@ -848,6 +893,20 @@ async fn apply_changes_internal(
                     "failed",
                 )?;
                 failed_items.push((chg.id.clone(), e));
+            }
+            Err(ExecuteError::Partial { message, primary_only }) => {
+                let status = if primary_only {
+                    "partial_primary_failed"
+                } else {
+                    "partial_failed"
+                };
+                db.finish_claimed_change_for_profile(
+                    &profile_key,
+                    chg,
+                    snapshot_id.as_deref(),
+                    status,
+                )?;
+                failed_items.push((chg.id.clone(), message));
             }
         }
     }
@@ -890,26 +949,37 @@ fn archived_peer<'a>(change: &'a PendingMemoryChange, evidence: &'a Value) -> Op
     Some((peer, archive))
 }
 
+enum ExecuteError {
+    Clean(String),
+    Partial { message: String, primary_only: bool },
+}
+
 async fn execute_change(
     client: &OvClient,
     change: &PendingMemoryChange,
     peer: Option<(&str, &str)>,
     mark_verified: bool,
-) -> Result<(), String> {
-    let result = match change.action {
+) -> Result<(), ExecuteError> {
+    match change.action {
         ChangeAction::Merge => {
             let raw_body = change
                 .after_content
                 .as_deref()
-                .ok_or("missing after_content")?;
+                .ok_or_else(|| ExecuteError::Clean("missing after_content".into()))?;
             let body = if mark_verified {
                 std::borrow::Cow::Owned(mark_frontmatter_verified(raw_body))
             } else {
                 std::borrow::Cow::Borrowed(raw_body)
             };
             if let Some((peer_uri, archive)) = peer {
-                let before = change.before_content.as_deref().ok_or("missing before_content for merge compensation")?;
-                let response = client.write_content(&change.target_uri, &body).await.map_err(|e| e.to_string())?;
+                let before = change
+                    .before_content
+                    .as_deref()
+                    .ok_or_else(|| ExecuteError::Clean("missing before_content for merge compensation".into()))?;
+                client
+                    .write_content(&change.target_uri, &body)
+                    .await
+                    .map_err(|e| ExecuteError::Clean(e.to_string()))?;
                 if let Err(error) = client.mv(peer_uri, archive).await {
                     let peer_intact = if matches!(error, OvClientError::Api { .. }) {
                         true
@@ -918,70 +988,138 @@ async fn execute_change(
                             || client.mv(archive, peer_uri).await.is_ok()
                     };
                     if !peer_intact {
-                        return Err(format!(
-                            "Could not archive merge peer {peer_uri}: {error}; peer state is ambiguous so primary {} was kept merged",
-                            change.target_uri,
-                        ));
+                        return Err(ExecuteError::Partial {
+                            message: format!(
+                                "Could not archive merge peer {peer_uri}: {error}; peer state is ambiguous so primary {} was kept merged",
+                                change.target_uri,
+                            ),
+                            primary_only: false,
+                        });
                     }
                     return match client.write_content(&change.target_uri, before).await {
-                        Ok(_) => Err(format!("Could not archive merge peer {peer_uri}: {error}")),
-                        Err(compensation) => Err(format!(
-                            "Could not archive merge peer {peer_uri}: {error}; compensation failed for {}: {compensation}",
-                            change.target_uri,
-                        )),
+                        Ok(_) => Err(ExecuteError::Clean(format!(
+                            "Could not archive merge peer {peer_uri}: {error}"
+                        ))),
+                        Err(compensation) => Err(ExecuteError::Partial {
+                            message: format!(
+                                "Could not archive merge peer {peer_uri}: {error}; compensation failed for {}: {compensation}",
+                                change.target_uri,
+                            ),
+                            primary_only: true,
+                        }),
                     };
                 }
                 if let Ok(ev) = serde_json::from_str::<Value>(&change.evidence_json) {
                     if let Some(peer_before) = ev.get("peer_before_content").and_then(Value::as_str) {
                         let superseded = stamp_superseded(peer_before, &change.target_uri);
-                        let _ = client.write_content(archive, &superseded).await;
+                        if let Err(error) = client.write_content(archive, &superseded).await {
+                            let error = format!("Could not stamp merge peer {archive}: {error}");
+                            client.mv(archive, peer_uri).await.map_err(|compensation| {
+                                ExecuteError::Partial {
+                                    message: format!(
+                                        "{error}; could not move peer back to {peer_uri}: {compensation}"
+                                    ),
+                                    primary_only: false,
+                                }
+                            })?;
+                            // The failed request may have reached the server before the error.
+                            let peer_restore = client.write_content(peer_uri, peer_before).await;
+                            let primary_restore = client.write_content(&change.target_uri, before).await;
+                            return Err(match (peer_restore, primary_restore) {
+                                (Ok(_), Ok(_)) => ExecuteError::Clean(error),
+                                (peer, primary) => ExecuteError::Partial {
+                                    message: format!(
+                                        "{error}; compensation failed (peer: {:?}, primary: {:?})",
+                                        peer.err(), primary.err()
+                                    ),
+                                    primary_only: false,
+                                },
+                            });
+                        }
                     }
                 }
-                Ok(response)
+                Ok(())
             } else {
-                client.write_content(&change.target_uri, &body).await
+                client
+                    .write_content(&change.target_uri, &body)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| ExecuteError::Clean(e.to_string()))
             }
         }
         ChangeAction::PromoteToIndex | ChangeAction::DemoteFromIndex => {
             let body = change
                 .after_content
                 .as_deref()
-                .ok_or("missing after_content")?;
-            client.write_content(&change.target_uri, body).await
+                .ok_or_else(|| ExecuteError::Clean("missing after_content".into()))?;
+            client
+                .write_content(&change.target_uri, body)
+                .await
+                .map(|_| ())
+                .map_err(|e| ExecuteError::Clean(e.to_string()))
         }
         ChangeAction::MoveFromInbox | ChangeAction::Archive => {
             let dest = change
                 .destination_uri
                 .as_deref()
-                .ok_or("missing destination_uri")?;
-            match client.mv(&change.target_uri, dest).await {
-                Ok(response) => {
-                    if change.action == ChangeAction::Archive {
-                        if let Some(stamped) = change.after_content.as_deref() {
-                            let _ = client.write_content(dest, stamped).await;
+                .ok_or_else(|| ExecuteError::Clean("missing destination_uri".into()))?;
+            client
+                .mv(&change.target_uri, dest)
+                .await
+                .map_err(|e| ExecuteError::Clean(e.to_string()))?;
+            if change.action == ChangeAction::Archive {
+                if let Some(stamped) = change.after_content.as_deref() {
+                    if let Err(error) = client.write_content(dest, stamped).await {
+                        let error = format!("Could not stamp archive {dest}: {error}");
+                        client.mv(dest, &change.target_uri).await.map_err(|compensation| {
+                            ExecuteError::Partial {
+                                message: format!(
+                                    "{error}; could not move archive back to {}: {compensation}",
+                                    change.target_uri
+                                ),
+                                primary_only: false,
+                            }
+                        })?;
+                        if let Some(before) = change.before_content.as_deref() {
+                            client
+                                .write_content(&change.target_uri, before)
+                                .await
+                                .map_err(|compensation| ExecuteError::Partial {
+                                    message: format!(
+                                        "{error}; could not restore original archive content: {compensation}"
+                                    ),
+                                    primary_only: false,
+                                })?;
                         }
+                        return Err(ExecuteError::Clean(error));
                     }
-                    Ok(response)
                 }
-                Err(err) => Err(err),
             }
+            Ok(())
         }
         ChangeAction::WikiCompile => {
             let dest = change
                 .destination_uri
                 .as_deref()
-                .ok_or("missing Wiki destination URI")?;
-            let evidence: Value =
-                serde_json::from_str(&change.evidence_json).map_err(|e| e.to_string())?;
+                .ok_or_else(|| ExecuteError::Clean("missing Wiki destination URI".into()))?;
+            let evidence: Value = serde_json::from_str(&change.evidence_json)
+                .map_err(|e| ExecuteError::Clean(e.to_string()))?;
             let projects = evidence
                 .get("projects")
                 .and_then(Value::as_array)
-                .ok_or("missing Wiki source directories")?;
-            let sources = projects.iter().filter_map(Value::as_str).map(str::to_owned).collect();
-            client.trigger_compile(dest, sources).await
+                .ok_or_else(|| ExecuteError::Clean("missing Wiki source directories".into()))?;
+            let sources = projects
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect();
+            client
+                .trigger_compile(dest, sources)
+                .await
+                .map(|_| ())
+                .map_err(|e| ExecuteError::Clean(e.to_string()))
         }
-    };
-    result.map(|_| ()).map_err(|e| e.to_string())
+    }
 }
 
 /// Reverse the files and Wiki output changed by a previously applied Dreaming run.
@@ -1008,11 +1146,11 @@ pub async fn rollback_dreaming_run(
         return Err(format!("Run {run_id} has no applied changes"));
     }
     // Reverse the order used by claim_accepted_changes_for_profile.
-    changes.sort_unstable_by(|a, b| a.created_at.cmp(&b.created_at).then(b.id.cmp(&a.id)));
+    changes.sort_unstable_by(|(a, _), (b, _)| a.created_at.cmp(&b.created_at).then(b.id.cmp(&a.id)));
     let mut restored = Vec::with_capacity(changes.len());
-    for change in &changes {
+    for (change, primary_only) in &changes {
         let change_snapshot = change.snapshot_id.as_deref().unwrap_or(&snap_id);
-        let response = rollback_change(client, change_snapshot, change)
+        let response = rollback_change(client, change_snapshot, change, *primary_only)
             .await
             .map_err(|e| format!("Restore failed for {}: {e}", change.target_uri))?;
         restored.push(response);
@@ -1028,6 +1166,7 @@ async fn rollback_change(
     client: &OvClient,
     snap_id: &str,
     change: &PendingMemoryChange,
+    primary_only: bool,
 ) -> Result<Value, String> {
     let target = &change.target_uri;
     let before = change.before_content.as_deref();
@@ -1037,13 +1176,14 @@ async fn rollback_change(
                 Some(content) => client.write_content(target, content).await,
                 None => client.snapshot_restore_scoped(snap_id, Some(target)).await,
             };
-            if primary_res.is_ok() {
+            if primary_res.is_ok() && !primary_only {
                 let evidence = serde_json::from_str(&change.evidence_json).unwrap_or(Value::Null);
                 if let Some((peer_uri, archive_uri)) = archived_peer(change, &evidence) {
                     match client.mv(archive_uri, peer_uri).await {
                         Ok(_) => {
                             if let Some(content) = evidence["peer_before_content"].as_str() {
-                                let _ = client.write_content(peer_uri, content).await;
+                                client.write_content(peer_uri, content).await
+                                    .map_err(|e| format!("Could not restore merge peer {peer_uri}: {e}"))?;
                             }
                         }
                         Err(error) => {
@@ -1072,6 +1212,10 @@ async fn rollback_change(
                 .as_deref()
                 .ok_or("missing destination_uri")?;
             match (client.mv(dest, target).await, before) {
+                (Ok(response), Some(content)) if change.action == ChangeAction::Archive => {
+                    client.write_content(target, content).await.map_err(|e| e.to_string())?;
+                    Ok(response)
+                }
                 (Err(_), Some(content)) => {
                     let response = client
                         .write_content(target, content)
@@ -1120,6 +1264,13 @@ async fn read_text(client: &OvClient, uri: &str) -> Result<String, OvClientError
 fn is_not_found(error: &OvClientError) -> bool {
     matches!(error, OvClientError::Api { status, code, .. }
         if *status == 404 || (code == "NOT_FOUND" && matches!(*status, 200..=299 | 400)))
+}
+
+fn is_transient_scan_error(error: &OvClientError) -> bool {
+    matches!(error, OvClientError::Http(_))
+        || matches!(error, OvClientError::Api { status, code, .. }
+            if matches!(*status, 408 | 425 | 429 | 500..=599)
+                || matches!(code.as_str(), "UNAVAILABLE" | "TIMEOUT" | "RATE_LIMITED"))
 }
 
 async fn list_project_dirs(client: &OvClient, root: &str) -> Vec<String> {
@@ -1243,30 +1394,64 @@ fn mark_frontmatter_verified(raw: &str) -> String {
     raw.to_string()
 }
 
-fn stamp_index_priority_high(raw: &str) -> String {
-    if let Some(rest) = raw.strip_prefix("---\n") {
-        if let Some(end) = rest.find("\n---\n") {
-            let yaml = &rest[..end];
-            if yaml.contains("index_priority:") {
-                return raw.to_string();
-            }
-            return format!("---\n{}\nindex_priority: high\n---\n{}", yaml, &rest[end + 5..]);
-        }
-    }
-    format!("---\nindex_priority: high\n---\n{}", raw)
-}
-
 fn build_transcript_excerpt(
     rows: &[crate::dreaming::db::CommittedTranscriptRow],
     max_chars: usize,
-) -> String {
+    max_rows: usize,
+) -> (String, Option<i64>, bool) {
     let mut out = String::new();
-    for row in rows {
-        let line = format!("[{}:{}] {}\n", row.session_key.chars().take(8).collect::<String>(), row.role, row.content.trim());
-        if out.chars().count() + line.chars().count() > max_chars {
+    let mut used_chars = 0;
+    let mut max_seq = None;
+    let mut included = 0usize;
+    for row in rows.iter().take(max_rows) {
+        let line = format!(
+            "[{}:{}] {}\n",
+            row.session_key.chars().take(8).collect::<String>(),
+            row.role,
+            row.content.trim()
+        );
+        let line_chars = line.chars().count();
+        if used_chars + line_chars > max_chars {
+            if used_chars == 0 && max_chars > 0 {
+                let truncated: String = line.chars().take(max_chars).collect();
+                out.push_str(&truncated);
+                max_seq = Some(row.seq);
+                included += 1;
+            }
             break;
         }
         out.push_str(&line);
+        used_chars += line_chars;
+        max_seq = Some(row.seq);
+        included += 1;
     }
-    out
+    (out, max_seq, included < rows.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dreaming::db::CommittedTranscriptRow;
+
+    #[test]
+    fn build_transcript_excerpt_truncates_oversized_head_turn_and_flags_more() {
+        let rows = vec![
+            CommittedTranscriptRow {
+                seq: 10,
+                session_key: "sess-12345678".into(),
+                role: "user".into(),
+                content: "a".repeat(5000),
+            },
+            CommittedTranscriptRow {
+                seq: 11,
+                session_key: "sess-12345678".into(),
+                role: "assistant".into(),
+                content: "follow-up".into(),
+            },
+        ];
+        let (excerpt, max_seq, has_more) = build_transcript_excerpt(&rows, 3500, 30);
+        assert_eq!(excerpt.chars().count(), 3500);
+        assert_eq!(max_seq, Some(10));
+        assert!(has_more);
+    }
 }

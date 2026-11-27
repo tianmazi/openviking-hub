@@ -6,7 +6,9 @@ use ov_core::policy::router::{
     is_foreign_agent_private_uri, is_protected_rule_path, project_peer, resolve_route_for_agent,
 };
 use ov_core::policy::store::PolicyStore;
-use ov_core::provenance::{render_with_provenance, wrap_ifc_readonly, MemoryProvenance};
+use ov_core::provenance::{
+    is_expired, is_superseded, render_with_provenance, wrap_ifc_readonly, MemoryProvenance,
+};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 use std::time::Instant;
@@ -222,7 +224,10 @@ pub(crate) async fn call_tool(
             }?;
 
             candidates.retain(|item| !is_foreign_agent_private_uri(policy, agent, &item.uri));
-            let (text, layer, hits) = render_recall(client, candidates, &budget, &policy.budget.category_quotas, limit).await;
+            let (text, layer, hits) = render_recall(
+                client, candidates, &budget, &policy.budget.category_quotas,
+                policy.lifecycle.archival.respect_ttl_expiry, limit,
+            ).await;
             let wrapped = wrap_ifc_readonly(
                 &text,
                 &format!("recall:{}", agent.as_str()),
@@ -397,6 +402,8 @@ pub(crate) struct RecallCandidate {
     pub(crate) title: String,
     pub(crate) category: Option<MemoryCategory>,
     pub(crate) snippet: String,
+    status: Option<String>,
+    expires_at: Option<i64>,
 }
 
 fn filter_private_entries(value: &mut Value, policy: &PolicyConfig, agent: AgentId) {
@@ -501,13 +508,28 @@ fn parse_candidates(value: Value) -> Vec<RecallCandidate> {
                         .unwrap_or(&uri)
                         .to_owned()
                 });
-            let snippet = ["abstract", "overview", "snippet", "summary", "content", "text", "description"]
+            let raw_snippet = ["abstract", "overview", "snippet", "summary", "content", "text", "description"]
                 .iter()
                 .filter_map(|k| item.get(*k).and_then(Value::as_str))
                 .map(str::trim)
                 .find(|text| !text.is_empty())
-                .map(|text| text.chars().take(600).collect::<String>())
                 .unwrap_or_default();
+            let (fm_prov, _) = ov_core::provenance::parse_frontmatter(raw_snippet);
+            let status = item["status"]
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| fm_prov.as_ref().map(|p| p.status.clone()));
+            let expires_at = item["expires_at"]
+                .as_i64()
+                .or_else(|| {
+                    let timestamp = item["expires_at"].as_str()?;
+                    chrono::DateTime::parse_from_rfc3339(timestamp).ok().map(|dt| dt.timestamp())
+                })
+                .or_else(|| {
+                    let timestamp = fm_prov.as_ref()?.expires_at.as_deref()?;
+                    chrono::DateTime::parse_from_rfc3339(timestamp).ok().map(|dt| dt.timestamp())
+                });
+            let snippet = raw_snippet.chars().take(600).collect::<String>();
             let category = detect_known_category(&uri, item);
             Some(RecallCandidate {
                 uri,
@@ -515,6 +537,8 @@ fn parse_candidates(value: Value) -> Vec<RecallCandidate> {
                 title,
                 category,
                 snippet,
+                status,
+                expires_at,
             })
         })
         .collect()
@@ -576,36 +600,59 @@ fn rank_candidates(mut candidates: Vec<RecallCandidate>) -> Vec<RecallCandidate>
     candidates
 }
 
+pub(crate) fn is_recall_excluded(raw: &str, respect_ttl_expiry: bool, now_ts: i64) -> bool {
+    is_superseded(raw) || (respect_ttl_expiry && is_expired(raw, now_ts))
+}
+
+fn filter_candidates(
+    candidates: &mut Vec<RecallCandidate>,
+    min_score: f64,
+    respect_ttl_expiry: bool,
+    now_ts: i64,
+) {
+    let mut excluded_uris = std::collections::HashSet::new();
+    for item in candidates.iter() {
+        let status = item.status.as_deref().unwrap_or_default();
+        let expired = status.eq_ignore_ascii_case("expired")
+            || item.expires_at.is_some_and(|ts| ts <= now_ts);
+        if status.eq_ignore_ascii_case("superseded")
+            || (respect_ttl_expiry && expired)
+            || is_recall_excluded(&item.snippet, respect_ttl_expiry, now_ts)
+        {
+            excluded_uris.insert(item.uri.clone());
+        }
+    }
+    candidates.retain(|item| !excluded_uris.contains(&item.uri) && item.score >= min_score);
+}
+
 /// Context Assembly II:
 /// 1. Rank & deduplicate once by URI.
 /// 2. Reserve progressive L1/L2 expansion budget for the top hit BEFORE packing remaining L0 items.
 /// 3. Enforce per-category soft quotas (`category_quotas`) and total budget including formatting & IFC overhead.
 pub(crate) async fn render_recall(
     client: &OvClient,
-    candidates: Vec<RecallCandidate>,
+    mut candidates: Vec<RecallCandidate>,
     budget: &ov_core::policy::model::EffectiveBudget,
     category_quotas: &std::collections::HashMap<MemoryCategory, usize>,
+    respect_ttl_expiry: bool,
     limit: Option<usize>,
 ) -> (String, String, Vec<(String, f64, bool)>) {
-    let now_ts = chrono::Utc::now().timestamp();
-    let ranked: Vec<RecallCandidate> = rank_candidates(candidates)
-        .into_iter()
-        .filter(|item| {
-            let lower = item.snippet.to_ascii_lowercase();
-            item.score >= budget.min_recall_score as f64
-                && !lower.contains("status: superseded")
-                && !lower.contains("status: expired")
-                && !ov_core::provenance::is_superseded(&item.snippet)
-                && !ov_core::provenance::is_expired(&item.snippet, now_ts)
-        })
-        .collect();
+    let now_ts = Utc::now().timestamp();
+    filter_candidates(
+        &mut candidates,
+        budget.min_recall_score as f64,
+        respect_ttl_expiry,
+        now_ts,
+    );
+    let mut ranked = rank_candidates(candidates).into_iter().peekable();
     let ifc_overhead = 240usize;
     let total_max = budget.max_recall_tokens.saturating_mul(4).saturating_sub(ifc_overhead);
 
     // Pre-fetch and reserve budget for top-hit progressive expansion (L0->L1 or default L1/L2)
     let mut detail_block: Option<(String, String)> = None;
     let mut top_summary_only = false;
-    if let Some(top) = ranked.first() {
+    let detail_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while let Some(top) = ranked.peek() {
         let selected = if budget.default_recall_layer == ContextLayer::L0
             && top.score >= budget.auto_expand_l1_threshold as f64
         {
@@ -614,8 +661,8 @@ pub(crate) async fn render_recall(
             budget.default_recall_layer
         };
         if selected != ContextLayer::L0 {
-            if let Ok(Ok(value)) = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
+            if let Ok(Ok(value)) = tokio::time::timeout_at(
+                detail_deadline,
                 client.read_content(&top.uri, selected.as_str()),
             )
             .await
@@ -624,12 +671,13 @@ pub(crate) async fn render_recall(
                     .as_str()
                     .or_else(|| value["content"].as_str())
                     .or_else(|| value["text"].as_str())
-                    .unwrap_or_default()
-                    .trim();
-                if !content.is_empty()
-                    && !ov_core::provenance::is_superseded(content)
-                    && !ov_core::provenance::is_expired(content, now_ts)
-                {
+                    .unwrap_or_default();
+                if is_recall_excluded(content, respect_ttl_expiry, now_ts) {
+                    let _ = ranked.next();
+                    continue;
+                }
+                let content = content.trim();
+                if !content.is_empty() {
                     let heading = if selected == ContextLayer::L1 {
                         "Auto-Expanded L1 Overview"
                     } else {
@@ -666,6 +714,7 @@ pub(crate) async fn render_recall(
                 }
             }
         }
+        break;
     }
 
     let reserved_for_detail = detail_block.as_ref().map(|(d, _)| d.len()).unwrap_or(0);
@@ -678,7 +727,7 @@ pub(crate) async fn render_recall(
     let mut injected_count = 0usize;
     let max_items = budget.max_recall_items.max(1);
 
-    for (index, item) in ranked.into_iter().enumerate() {
+    for (index, item) in ranked.enumerate() {
         let formatted = format_candidate(&item, index != 0 || !top_summary_only);
         let entry_len = formatted.len() + 2;
         let within_limit = limit.map_or(true, |max| injected_count < max);
@@ -749,5 +798,28 @@ mod recall_tests {
         assert!(rendered.contains("Use Conventional Commits"));
         assert!(!rendered.contains("internal_id"));
         assert!(!rendered.contains("distance"));
+    }
+
+    #[test]
+    fn excluded_uri_is_removed_across_duplicate_copies() {
+        let mut candidates = parse_candidates(json!({"memories":[
+            {"uri":"viking://~/memories/preferences/old.md", "score":0.95, "status":"superseded", "snippet":"superseded copy"},
+            {"uri":"viking://~/memories/preferences/old.md", "score":0.80, "snippet":"plain duplicate without metadata"},
+            {"uri":"viking://~/memories/preferences/keep.md", "score":0.85, "snippet":"active memory"}
+        ]}));
+        filter_candidates(&mut candidates, 0.6, true, Utc::now().timestamp());
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].uri, "viking://~/memories/preferences/keep.md");
+    }
+
+    #[test]
+    fn superseded_long_frontmatter_snippet_is_excluded_before_truncation() {
+        let padding = "x".repeat(650);
+        let long_fm = format!("---\nstatus: superseded\nnotes: {padding}\n---\nActive-looking body");
+        let mut candidates = parse_candidates(json!({"memories":[
+            {"uri":"viking://~/memories/preferences/long.md", "score":0.95, "snippet": long_fm}
+        ]}));
+        filter_candidates(&mut candidates, 0.6, true, Utc::now().timestamp());
+        assert!(candidates.is_empty());
     }
 }

@@ -204,6 +204,16 @@ impl DesktopDb {
                 state TEXT NOT NULL DEFAULT 'pending',
                 UNIQUE(profile_key, session_key, event_key)
             );
+            CREATE TABLE IF NOT EXISTS committed_transcript_evidence (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_key TEXT NOT NULL,
+                session_key TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                committed_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS committed_transcript_evidence_profile_seq
+                ON committed_transcript_evidence (profile_key, seq);
             CREATE TABLE IF NOT EXISTS privacy_exclusions (
                 session_key TEXT NOT NULL,
                 event_key TEXT NOT NULL,
@@ -478,7 +488,7 @@ impl DesktopDb {
         let mut stmt = conn.prepare(&format!(
             "SELECT {CHANGE_COLUMNS} FROM pending_memory_changes
              WHERE profile_key = ?1 AND (?2 IS NULL OR status = ?2 OR
-                   (?2 = 'conflict' AND status = 'failed'))
+                   (?2 = 'conflict' AND status IN ('failed', 'partial_failed', 'partial_primary_failed')))
              ORDER BY created_at DESC",
         )).map_err(|e| e.to_string())?;
         let rows = stmt.query_map(params![profile_key, status_filter], map_change_row)
@@ -490,13 +500,19 @@ impl DesktopDb {
         &self,
         profile_key: &str,
         run_id: &str,
-    ) -> Result<Vec<PendingMemoryChange>, String> {
+    ) -> Result<Vec<(PendingMemoryChange, bool)>, String> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {CHANGE_COLUMNS} FROM pending_memory_changes
-             WHERE profile_key = ?1 AND run_id = ?2 AND status = 'applied'",
+             WHERE profile_key = ?1 AND run_id = ?2
+               AND status IN ('applied', 'partial_failed', 'partial_primary_failed')",
         )).map_err(|e| e.to_string())?;
-        let rows = stmt.query_map(params![profile_key, run_id], map_change_row)
+        let rows = stmt
+            .query_map(params![profile_key, run_id], |row| {
+                let status_str: String = row.get(13)?;
+                let primary_only = status_str == "partial_primary_failed";
+                Ok((map_change_row(row)?, primary_only))
+            })
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
     }
@@ -731,8 +747,8 @@ impl DesktopDb {
         let mut stmt = conn
             .prepare(
                 "SELECT seq, session_key, role, content
-                 FROM capture_outbox
-                 WHERE profile_key = ?1 AND state = 'committed' AND seq > ?2 AND content != ''
+                 FROM committed_transcript_evidence
+                 WHERE profile_key = ?1 AND seq > ?2
                  ORDER BY seq ASC
                  LIMIT ?3",
             )
@@ -757,7 +773,7 @@ impl DesktopDb {
     pub fn max_committed_outbox_seq_for_profile(&self, profile_key: &str) -> Result<i64, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.query_row(
-            "SELECT COALESCE(MAX(seq), 0) FROM capture_outbox WHERE profile_key = ?1 AND state = 'committed'",
+            "SELECT COALESCE(MAX(seq), 0) FROM committed_transcript_evidence WHERE profile_key = ?1",
             params![profile_key],
             |r| r.get(0),
         )
@@ -811,12 +827,13 @@ fn refresh_run_outcomes(conn: &Connection, profile_key: &str, run_id: &str) -> r
         "WITH outcomes AS (
             SELECT COUNT(*) FILTER (WHERE status IN ('applying', 'auto_applying')) AS applying,
                    COUNT(*) FILTER (WHERE status IN ('pending', 'accepted')) AS review,
-                   COUNT(*) FILTER (WHERE status = 'failed') AS failed,
+                   COUNT(*) FILTER (WHERE status IN ('failed', 'partial_failed', 'partial_primary_failed')) AS failed,
                    COUNT(*) FILTER (WHERE status = 'conflict') AS conflicts,
                    COUNT(*) FILTER (WHERE status = 'applied') AS applied,
                    (SELECT snapshot_id FROM pending_memory_changes
                     WHERE run_id = ?1 AND profile_key = ?2
-                      AND status = 'applied' AND snapshot_id IS NOT NULL
+                      AND status IN ('applied', 'partial_failed', 'partial_primary_failed')
+                      AND snapshot_id IS NOT NULL
                     ORDER BY rowid ASC LIMIT 1) AS snapshot
             FROM pending_memory_changes WHERE run_id = ?1 AND profile_key = ?2
          )
@@ -878,7 +895,7 @@ fn map_change_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingMemoryChan
         .unwrap_or(MemoryCategory::Patterns);
     let status = match status_str.as_str() {
         "applying" | "auto_applying" => ReviewStatus::Accepted,
-        "failed" => ReviewStatus::Conflict,
+        "failed" | "partial_failed" | "partial_primary_failed" => ReviewStatus::Conflict,
         _ => serde_json::from_str(&format!("\"{}\"", status_str))
             .unwrap_or(ReviewStatus::Pending),
     };
@@ -1099,23 +1116,25 @@ mod tests {
     }
 
     #[test]
-    fn recent_committed_transcripts_excludes_skipped_privacy_rows() {
+    fn recent_committed_transcripts_are_profile_scoped_and_paginated() {
         let db = DesktopDb::open_in_memory().unwrap();
         {
             let conn = db.conn.lock().unwrap();
             conn.execute(
-                "INSERT INTO capture_outbox (profile_key, session_key, event_key, role, content, state) VALUES
-                 ('p1', 'sess-1', 'e1', 'user', 'We switched to Rust 1.85', 'committed'),
-                 ('p1', 'sess-1', 'e2', 'user', 'Private secret turn', 'skipped'),
-                 ('p1', 'sess-1', 'e3', 'assistant', 'Confirmed Cargo.toml uses 1.85', 'committed'),
-                 ('p2', 'sess-2', 'e4', 'user', 'Other profile message', 'committed')",
+                "INSERT INTO committed_transcript_evidence (profile_key, session_key, role, content, committed_at) VALUES
+                 ('p1', 'sess-1', 'user', 'We switched to Rust 1.85', 100),
+                 ('p2', 'sess-2', 'user', 'Other profile message', 100),
+                 ('p1', 'sess-1', 'assistant', 'Confirmed Cargo.toml uses 1.85', 100)",
                 [],
             )
             .unwrap();
         }
         let rows = db.recent_committed_transcripts_for_profile("p1", 0, 10).unwrap();
         assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|r| !r.content.contains("Private")));
+        assert_eq!(rows[0].role, "user");
+        assert_eq!(rows[1].role, "assistant");
+        let page = db.recent_committed_transcripts_for_profile("p1", rows[0].seq, 1).unwrap();
+        assert_eq!(page[0].seq, rows[1].seq);
         let max_seq = db.max_committed_outbox_seq_for_profile("p1").unwrap();
         assert_eq!(max_seq, rows.last().unwrap().seq);
         let next = db.recent_committed_transcripts_for_profile("p1", max_seq, 10).unwrap();

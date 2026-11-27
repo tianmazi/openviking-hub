@@ -51,6 +51,11 @@ export function PolicyView({ policy, onSave }: PolicyViewProps) {
   );
 
   const handleSave = async () => {
+    const score = draft.budget.min_recall_score ?? 0.6;
+    if (!Number.isFinite(score) || score < 0 || score > 1) {
+      setMsg("保存失败：最低召回相似度门控必须在 0.0 到 1.0 之间。");
+      return;
+    }
     setSaving(true);
     setMsg(null);
     try {
@@ -328,12 +333,14 @@ export function PolicyView({ policy, onSave }: PolicyViewProps) {
               max={1}
               step={0.05}
               value={draft.budget.min_recall_score ?? 0.6}
-              onChange={(e) =>
+              onChange={(e) => {
+                const raw = Number(e.target.value);
+                const clamped = Number.isFinite(raw) ? Math.min(1, Math.max(0, raw)) : 0;
                 setDraft({
                   ...draft,
-                  budget: { ...draft.budget, min_recall_score: Number(e.target.value) },
-                })
-              }
+                  budget: { ...draft.budget, min_recall_score: clamped },
+                });
+              }}
               className="w-20 bg-surface-1 border border-border-subtle rounded px-2 py-1 font-mono text-zinc-200"
             />
           </div>
@@ -348,12 +355,14 @@ export function PolicyView({ policy, onSave }: PolicyViewProps) {
               max={10}
               step={1}
               value={draft.budget.max_recall_items ?? 3}
-              onChange={(e) =>
+              onChange={(e) => {
+                const raw = Number(e.target.value);
+                const next = Number.isFinite(raw) ? Math.max(1, Math.floor(raw)) : 1;
                 setDraft({
                   ...draft,
-                  budget: { ...draft.budget, max_recall_items: Math.max(1, Number(e.target.value)) },
-                })
-              }
+                  budget: { ...draft.budget, max_recall_items: next },
+                });
+              }}
               className="w-20 bg-surface-1 border border-border-subtle rounded px-2 py-1 font-mono text-zinc-200"
             />
           </div>

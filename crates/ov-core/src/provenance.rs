@@ -274,13 +274,13 @@ pub(crate) fn render_frontmatter(yaml: Option<&str>, body: &str, next: &MemoryPr
 
 /// Mark an older memory as superseded by a newer URI, preserving full causal lineage.
 pub fn stamp_superseded(raw: &str, superseded_by_uri: &str) -> String {
-    let (existing_opt, body) = parse_frontmatter(raw);
+    let (existing_opt, _) = parse_frontmatter(raw);
     let mut prov = existing_opt.unwrap_or_else(|| MemoryProvenance::new("dreaming", "shared", false, 0.5));
     prov.status = "superseded".to_string();
     prov.superseded_by = Some(superseded_by_uri.to_string());
     prov.updated_at = Utc::now().to_rfc3339();
     prov.updated_by = "dreaming:supersede".to_string();
-    render_with_provenance(body, &prov)
+    render_with_provenance(raw, &prov)
 }
 
 pub fn is_superseded(raw: &str) -> bool {
@@ -328,6 +328,15 @@ pub fn has_index_priority_high(raw: &str) -> bool {
     })
 }
 
+pub(crate) fn stamp_index_priority_high(raw: &str) -> String {
+    if has_index_priority_high(raw) {
+        return raw.to_string();
+    }
+    let (yaml, body) = split_frontmatter(raw);
+    let yaml = with_index_priority(yaml, "high");
+    format!("---\n{yaml}\n---\n{body}")
+}
+
 /// Demote a memory's `index_priority` from `high` to `normal` while updating provenance timestamp.
 pub fn stamp_index_priority_normal(raw: &str) -> String {
     let (existing_opt, _) = parse_frontmatter(raw);
@@ -336,32 +345,25 @@ pub fn stamp_index_priority_normal(raw: &str) -> String {
     prov.updated_at = Utc::now().to_rfc3339();
     prov.updated_by = "dreaming:demote".to_string();
 
-    let (yaml_opt, body) = split_frontmatter(raw);
-    let updated_yaml = match yaml_opt {
-        Some(yaml) => {
-            let mut replaced = false;
-            let mut lines: Vec<String> = Vec::new();
-            for line in yaml.lines() {
-                if line == line.trim_start()
-                    && line
-                        .split_once(':')
-                        .is_some_and(|(k, _)| unquote(k).eq_ignore_ascii_case("index_priority"))
-                {
-                    lines.push("index_priority: normal".to_string());
-                    replaced = true;
-                } else {
-                    lines.push(line.to_string());
-                }
-            }
-            if !replaced {
-                lines.push("index_priority: normal".to_string());
-            }
-            Some(lines.join("
-"))
-        }
-        None => Some("index_priority: normal".to_string()),
-    };
-    render_frontmatter(updated_yaml.as_deref(), body, &prov)
+    let (yaml, body) = split_frontmatter(raw);
+    let yaml = with_index_priority(yaml, "normal");
+    render_frontmatter(Some(&yaml), body, &prov)
+}
+
+fn with_index_priority(yaml: Option<&str>, priority: &str) -> String {
+    let field = format!("index_priority: {priority}");
+    let mut lines: Vec<_> = yaml
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| {
+            line != &line.trim_start()
+                || !line.split_once(':').is_some_and(|(key, _)| {
+                    unquote(key).eq_ignore_ascii_case("index_priority")
+                })
+        })
+        .collect();
+    lines.push(&field);
+    lines.join("\n")
 }
 
 /// Write-Gate check: only memories explicitly marked `verified: true` in provenance
@@ -547,6 +549,25 @@ Meeting at 3pm tomorrow.";
     }
 
     #[test]
+    fn lifecycle_checks_ignore_body_text() {
+        let raw = "---\nstatus: active\n---\nstatus: superseded\nstatus: expired\nexpires_at: 2020-01-01T00:00:00Z";
+        assert!(!is_superseded(raw));
+        assert!(!is_expired(raw, i64::MAX));
+        let body = parse_frontmatter(raw).1;
+        assert!(!is_superseded(body));
+        assert!(!is_expired(body, i64::MAX));
+    }
+
+    #[test]
+    fn supersede_preserves_custom_frontmatter() {
+        let raw = "---\ntitle: Git rules\ntags:\n  - git\nindex_priority: high\n---\n# Git\nUse Git.";
+        let stamped = stamp_superseded(raw, "viking://resources/git.md");
+        assert!(is_superseded(&stamped));
+        assert!(stamped.contains("title: Git rules\ntags:\n  - git\nindex_priority: high"));
+        assert_eq!(parse_frontmatter(&stamped).1, "# Git\nUse Git.");
+    }
+
+    #[test]
     fn test_index_priority_high_and_demote_normal() {
         let promoted = "---
 source_agent: claude-code
@@ -562,5 +583,9 @@ Always run tests.";
         let (prov, body) = parse_frontmatter(&demoted);
         assert_eq!(prov.unwrap().updated_by, "dreaming:demote");
         assert!(body.contains("Always run tests."));
+        let promoted_again = stamp_index_priority_high(&demoted);
+        assert!(has_index_priority_high(&promoted_again));
+        assert_eq!(promoted_again.matches("index_priority:").count(), 1);
+        assert_eq!(parse_frontmatter(&promoted_again).1, body);
     }
 }

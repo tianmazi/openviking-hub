@@ -1,4 +1,4 @@
-use crate::mcp::{find_scopes, render_recall};
+use crate::mcp::{find_scopes, is_recall_excluded, render_recall};
 use chrono::Utc;
 use ov_core::dreaming::db::{DesktopDb, RecallEvent};
 use ov_core::ov_client::OvClient;
@@ -95,6 +95,7 @@ pub(crate) async fn execute_hook(
 ) -> String {
     let start = Instant::now();
     let budget = policy.budget.resolve_for(agent);
+    let respect_ttl_expiry = policy.lifecycle.archival.respect_ttl_expiry;
     let cwd = payload_text(payload, &["cwd"])
         .or_else(|| {
             ["workspacePaths", "workspace_paths"]
@@ -166,7 +167,10 @@ pub(crate) async fn execute_hook(
                 route.target_resource_uri,
                 policy.routing.protected_rule_globs.join(", ")
             );
-            if !project_text.trim().is_empty() {
+            let now_ts = evt.created_at;
+            if !project_text.trim().is_empty()
+                && !is_recall_excluded(&project_text, respect_ttl_expiry, now_ts)
+            {
                 project_sec.push_str(&format!(
                     "\n- Project Overview ({}):\n{}",
                     budget.default_recall_layer.as_str().to_uppercase(),
@@ -188,25 +192,29 @@ pub(crate) async fn execute_hook(
             }
             sections.push(toc);
 
-            let now_ts = chrono::Utc::now().timestamp();
             // 3. Recent Context (only included when actual active peer memory exists)
+            let has_user_profile = !user_mem_l0.trim().is_empty()
+                && !is_recall_excluded(&user_mem_l0, respect_ttl_expiry, now_ts);
             if !recent_peer_l0.trim().is_empty()
-                && !ov_core::provenance::is_superseded(&recent_peer_l0)
-                && !ov_core::provenance::is_expired(&recent_peer_l0, now_ts)
+                && !is_recall_excluded(&recent_peer_l0, respect_ttl_expiry, now_ts)
             {
-                let rendered = compact_startup_entry(
+                let mut rendered = compact_startup_entry(
                     &recent_peer_l0,
                     peer_mem_uri.as_deref().unwrap_or("peer"),
                     policy.lifecycle.dreaming.max_index_entry_bytes,
                 );
+                if has_user_profile {
+                    rendered = enforce_startup_caps(
+                        &rendered,
+                        (budget.startup_max_lines / 2).max(1),
+                        (budget.startup_max_bytes / 2).max(1),
+                    );
+                }
                 sections.push(format!("## [Recent Project Context]\n{}", rendered));
             }
 
             // 4. User Profile (Recency Advantage)
-            if !user_mem_l0.trim().is_empty()
-                && !ov_core::provenance::is_superseded(&user_mem_l0)
-                && !ov_core::provenance::is_expired(&user_mem_l0, now_ts)
-            {
+            if has_user_profile {
                 let rendered = compact_startup_entry(
                     &user_mem_l0,
                     &route.target_memory_uri,
@@ -244,7 +252,10 @@ pub(crate) async fn execute_hook(
                 Err(error) => { eprintln!("OpenViking recall: {error}"); return String::new(); }
             };
             candidates.retain(|item| !is_foreign_agent_private_uri(policy, agent, &item.uri));
-            let (text, layer, hits) = render_recall(client, candidates, &budget, &policy.budget.category_quotas, Some(5)).await;
+            let (text, layer, hits) = render_recall(
+                client, candidates, &budget, &policy.budget.category_quotas,
+                respect_ttl_expiry, Some(5),
+            ).await;
             evt.target_uri = hits.iter().find(|(_,_,injected)| *injected).map(|(uri,_,_)| uri.clone());
             recall_hits = hits;
             evt.query = Some(prompt.chars().take(120).collect());
@@ -398,11 +409,26 @@ fn compact_startup_entry(raw: &str, uri: &str, max_entry_bytes: usize) -> String
     if max_entry_bytes == 0 || trimmed.len() <= max_entry_bytes {
         return trimmed.to_string();
     }
-    let first_line = trimmed
+    let link = format!(" (index link: `{uri}` — use `read_uri` for full details)");
+    let suffix = if link.len() + 3 < max_entry_bytes {
+        link.as_str()
+    } else if max_entry_bytes > '…'.len_utf8() {
+        "…"
+    } else {
+        ""
+    };
+    trimmed
         .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && *line != "---")
-        .unwrap_or("Memory summary");
-    let preview: String = first_line.chars().take(120).collect();
-    format!("- {} (index link: `{}` — use `read_uri` for full details)", preview, uri)
+        .map(|line| {
+            if line.len() <= max_entry_bytes {
+                return line.to_owned();
+            }
+            let mut end = max_entry_bytes - suffix.len();
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}{suffix}", line[..end].trim_end())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }

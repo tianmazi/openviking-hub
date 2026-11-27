@@ -123,8 +123,20 @@ pub async fn reflect_transcript_verify(
     note_raw: &str,
     transcript_excerpt: &str,
 ) -> Option<TranscriptVerifyResult> {
+    reflect_transcript_verify_checked(policy, note_uri, note_raw, transcript_excerpt)
+        .await
+        .ok()
+        .flatten()
+}
+
+pub(crate) async fn reflect_transcript_verify_checked(
+    policy: &DreamingPolicy,
+    note_uri: &str,
+    note_raw: &str,
+    transcript_excerpt: &str,
+) -> Result<Option<TranscriptVerifyResult>, String> {
     if policy.reflector_mode == ReflectorMode::Deterministic || transcript_excerpt.trim().is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let prompt = format!(
@@ -139,17 +151,27 @@ pub async fn reflect_transcript_verify(
         truncate_chars(transcript_excerpt, 3500)
     );
 
-    let (raw_out, label) = invoke_reflector(policy, &prompt).await?;
-    let parsed = extract_json_object(&raw_out)?;
-    if !parsed.get("contradicted").and_then(Value::as_bool).unwrap_or(false) {
-        return None;
+    let Some((raw_out, label)) = invoke_reflector(policy, &prompt).await else {
+        return Err("reflector invocation failed or timed out".to_string());
+    };
+    let Some(parsed) = extract_json_object(&raw_out) else {
+        return Err("reflector returned invalid JSON".to_string());
+    };
+    let Some(contradicted) = parsed.get("contradicted").and_then(Value::as_bool) else {
+        return Err("reflector response missing boolean contradicted field".to_string());
+    };
+    if !contradicted {
+        return Ok(None);
     }
-    let corrected = parsed
+    let Some(corrected) = parsed
         .get("corrected_content")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|s| !s.is_empty())?
-        .to_string();
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+    else {
+        return Err("reflector flagged contradiction without corrected_content".to_string());
+    };
     let rationale = parsed
         .get("rationale")
         .and_then(Value::as_str)
@@ -162,12 +184,12 @@ pub async fn reflect_transcript_verify(
         .and_then(Value::as_f64)
         .map(|v| (v as f32).clamp(0.0, 1.0))
         .unwrap_or(0.8);
-    Some(TranscriptVerifyResult {
+    Ok(Some(TranscriptVerifyResult {
         corrected_content: corrected,
         rationale,
         confidence,
         engine_label: label,
-    })
+    }))
 }
 
 fn directory_uri(uri: &str) -> String {
