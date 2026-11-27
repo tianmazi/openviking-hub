@@ -3,7 +3,7 @@ use chrono::Utc;
 use ov_core::dreaming::db::{DesktopDb, RecallEvent};
 use ov_core::ov_client::OvClient;
 use ov_core::policy::model::{AgentId, PolicyConfig};
-use ov_core::policy::router::{project_peer, resolve_route_for_agent};
+use ov_core::policy::router::{is_foreign_agent_private_uri, project_peer, resolve_route_for_agent};
 use ov_core::policy::store::PolicyStore;
 use ov_core::provenance::wrap_ifc_readonly;
 use serde_json::{json, Value};
@@ -15,6 +15,13 @@ use std::time::Instant;
 use uuid::Uuid;
 
 pub async fn run_hook(event: &str, agent: AgentId) -> anyhow::Result<()> {
+    if std::env::var("OPENVIKING_DISABLE_HOOKS").as_deref() == Ok("1") {
+        if agent == AgentId::Antigravity || event == "stop" {
+            println!("{{}}");
+        }
+        return Ok(());
+    }
+
     let mut input = String::new();
     let _ = io::stdin().read_to_string(&mut input);
     let payload: Value = serde_json::from_str(&input).unwrap_or_else(|_| json!({}));
@@ -180,12 +187,13 @@ pub(crate) async fn execute_hook(
             ) else {
                 return String::new();
             };
-            let candidates = match tokio::time::timeout(std::time::Duration::from_secs(3),
+            let mut candidates = match tokio::time::timeout(std::time::Duration::from_secs(3),
                 find_scopes(client, prompt, &route.target_resource_uri, peer.as_deref(), Some(5))).await {
                 Ok(Ok(candidates)) => candidates,
                 Ok(Err(_)) => { eprintln!("OpenViking recall request failed"); return String::new(); }
                 Err(_) => { eprintln!("OpenViking recall timed out"); return String::new(); }
             };
+            candidates.retain(|item| !is_foreign_agent_private_uri(policy, agent, &item.uri));
             let (text, layer, hits) = render_recall(client, candidates, &budget).await;
             evt.target_uri = hits.iter().find(|(_,_,injected)| *injected).map(|(uri,_,_)| uri.clone());
             if let Some(db) = db {

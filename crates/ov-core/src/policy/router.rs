@@ -102,6 +102,35 @@ fn with_trailing_slash(uri: &str) -> String {
     format!("{}/", uri.trim_end_matches('/'))
 }
 
+/// Check whether a URI is owned by another agent when namespace isolation is enabled.
+pub fn is_foreign_agent_private_uri(policy: &PolicyConfig, caller: AgentId, uri: &str) -> bool {
+    if !policy.routing.isolate_agent_namespaces {
+        return false;
+    }
+    let Some(path) = uri.trim().strip_prefix("viking://") else {
+        return false;
+    };
+    let mut segments = Vec::new();
+    let path = path.split(['?', '#']).next().unwrap_or_default();
+    for segment in path.split(['/', '\\']) {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            _ => segments.push(segment),
+        }
+    }
+    let owner = match segments.as_slice() {
+        ["agent", owner, ..] => owner,
+        ["memories" | "resources", "agents", owner, ..]
+        | ["~" | "user", "memories" | "resources", "agents", owner, ..]
+        | ["user", _, "memories" | "resources", "agents", owner, ..] => owner,
+        _ => return false,
+    };
+    AgentId::parse_str(owner).is_some_and(|owner| owner != caller)
+}
+
 /// Check if a file path or URI matches any user-protected rule glob (e.g., `CLAUDE.md`, `AGENTS.md`).
 pub fn is_protected_rule_path(policy: &PolicyConfig, candidate: &str) -> bool {
     let mut builder = GlobSetBuilder::new();
@@ -211,6 +240,35 @@ mod tests {
         assert_eq!(Some(a.clone()), project_identity("ssh://git@github.com/team/payment.git"));
         assert_ne!(Some(a.clone()), project_identity("https://github.com/other/payment"));
         assert_ne!(Some(a), project_identity("https://gitlab.example/team/payment"));
+    }
+
+    #[test]
+    fn test_foreign_agent_private_uri() {
+        let mut policy = PolicyConfig::default();
+        for uri in [
+            "viking://agent/claude-code/memories/note.md",
+            "viking://~/memories/agents/claude-code/",
+            "viking://~/resources/agents/claude-code",
+            "viking://user/alice/memories/agents/claude-code/note.md",
+            "viking://~/resources/projects/../agents//claude-code/note.md",
+        ] {
+            assert!(is_foreign_agent_private_uri(&policy, AgentId::Codex, uri));
+            assert!(!is_foreign_agent_private_uri(&policy, AgentId::ClaudeCode, uri));
+        }
+        for uri in [
+            "viking://agent/skills/llm-wiki",
+            "viking://~/memories/agents/unknown/note.md",
+            "viking://resources/projects/demo/agents/claude-code/note.md",
+            "viking://~/memories/agents/codex/note.md",
+        ] {
+            assert!(!is_foreign_agent_private_uri(&policy, AgentId::Codex, uri));
+        }
+        policy.routing.isolate_agent_namespaces = false;
+        assert!(!is_foreign_agent_private_uri(
+            &policy,
+            AgentId::Codex,
+            "viking://agent/claude-code/memories/"
+        ));
     }
 
     #[test]

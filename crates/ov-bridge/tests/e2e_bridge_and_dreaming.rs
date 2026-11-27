@@ -22,13 +22,17 @@ use tempfile::tempdir;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
+const CLAUDE_PRIVATE_URI: &str = "viking://agent/claude-code/memories/private.md";
+
 #[derive(Default)]
 struct MockState {
     writes: usize,
     fail_snapshot: bool,
+    fail_post_snapshot: bool,
     fail_content_read: bool,
     fail_session_commit: bool,
     fail_append_after_write: bool,
+    memories_status: Option<&'static str>,
     session_messages: Vec<String>,
     session_peers: Vec<Option<String>>,
     session_configs: Vec<Value>,
@@ -36,6 +40,7 @@ struct MockState {
     scoped_searches: Vec<Value>,
     files: HashMap<String, String>,
     snapshots: Vec<Value>,
+    snapshot_files: HashMap<String, HashMap<String, String>>,
     restored: Vec<Value>,
     compiled: Vec<String>,
 }
@@ -108,6 +113,13 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                             { "uri": "viking://resources/projects/readme.md", "isDir": false }
                         ] })
                     }
+                    ("GET", "/api/v1/fs/ls") if uri_param == "viking://~/resources/projects/" => {
+                        json!({ "status": "ok", "result": [
+                            { "uri": "viking://~/resources/projects/demo", "isDir": true },
+                            { "uri": "viking://~/resources/projects/readme.md", "isDir": false },
+                            { "uri": "viking://resources/projects/demo/", "isDir": true }
+                        ] })
+                    }
                     ("GET", "/api/v1/fs/ls") => {
                         let guard = st.lock().unwrap();
                         let items: Vec<Value> = guard
@@ -120,13 +132,22 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                     }
                     ("GET", "/api/v1/fs/tree") => {
                         let guard = st.lock().unwrap();
-                        let items: Vec<Value> = guard
-                            .files
-                            .keys()
-                            .filter(|k| k.starts_with(&uri_param))
-                            .map(|k| json!({ "uri": k, "isDir": false }))
-                            .collect();
-                        json!({ "status": "ok", "result": items })
+                        if uri_param == "viking://user/memories/" {
+                            status = "403 Forbidden";
+                            json!({ "status": "error", "message": "Legacy alias denied" })
+                        } else if let Some(failure) = guard.memories_status {
+                            status = failure;
+                            let code = if failure.starts_with("503") { "UNAVAILABLE" } else { "NOT_FOUND" };
+                            json!({ "status": "error", "error": { "code": code, "message": "Memories unavailable" } })
+                        } else {
+                            let items: Vec<Value> = guard
+                                .files
+                                .keys()
+                                .filter(|k| k.starts_with(&uri_param))
+                                .map(|k| json!({ "uri": k, "isDir": false }))
+                                .collect();
+                            json!({ "status": "ok", "result": items })
+                        }
                     }
                     ("GET", "/api/v1/content/read") => {
                         let guard = st.lock().unwrap();
@@ -159,8 +180,20 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                         guard.writes += 1;
                         if let Some(v) = guard.files.remove(from) {
                             guard.files.insert(to.clone(), v);
+                            json!({ "status": "ok", "result": { "moved_to": to } })
+                        } else {
+                            status = "404 Not Found";
+                            json!({ "status": "error", "message": "Move source not found" })
                         }
-                        json!({ "status": "ok", "result": { "moved_to": to } })
+                    }
+                    ("DELETE", "/api/v1/fs") => {
+                        let mut guard = st.lock().unwrap();
+                        let prefix = format!("{}/", uri_param.trim_end_matches('/'));
+                        let recursive = query.split('&').any(|part| part == "recursive=true");
+                        guard.files.retain(|uri, _| {
+                            uri != &uri_param && !(recursive && uri.starts_with(&prefix))
+                        });
+                        json!({ "status": "ok", "result": { "deleted": uri_param } })
                     }
                     ("POST", "/api/v1/search/search")
                         if body_json["mode"] == "context"
@@ -174,7 +207,8 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                             "status": "ok",
                             "result": {
                                 "memories": [
-                                    { "uri": "viking://~/memories/preferences/git.md", "score": 0.92, "snippet": "Use Conventional Commits" }
+                                    { "uri": "viking://~/memories/preferences/git.md", "score": 0.92, "snippet": "Use Conventional Commits" },
+                                    { "uri": "viking://~/memories/agents/pi/notes.md", "score": 0.99, "snippet": "Private search result" }
                                 ]
                             }
                         })
@@ -204,10 +238,17 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                     ("POST", "/v1/chat/completions") => {
                         let prompt = body_json["messages"][1]["content"].as_str().unwrap();
                         let content = if prompt.contains("[Existing Project Directories]") {
-                            assert!(prompt.contains("viking://resources/projects/demo/"));
-                            assert!(!prompt.contains("viking://resources/projects/readme.md"));
+                            assert!(prompt.contains("- viking://~/resources/projects/demo/\n"));
+                            assert!(prompt.contains("fallback: viking://~/resources/projects/general/"));
+                            assert!(!prompt.contains("viking://~/resources/projects/readme.md"));
+                            assert!(!prompt.contains("viking://resources/projects/demo/"));
+                            let destination_dir = if prompt.contains("# Misroute") {
+                                "viking://resources/projects/demo/"
+                            } else {
+                                " viking://~/resources/projects/demo// "
+                            };
                             json!({
-                                "destination_dir": "viking://resources/projects/demo/",
+                                "destination_dir": destination_dir,
                                 "rationale": "Matches demo"
                             }).to_string()
                         } else {
@@ -255,7 +296,14 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                         } else {
                             let snap = format!("snap-e2e-{}", guard.snapshots.len() + 1);
                             guard.snapshots.push(body_json.clone());
-                            json!({ "status": "ok", "result": { "commit_oid": snap } })
+                            if guard.fail_post_snapshot && body_json["message"].as_str().unwrap().starts_with("dreaming-applied-") {
+                                status = "500 Internal Server Error";
+                                json!({ "status": "error", "message": "Post-apply snapshot failed" })
+                            } else {
+                                let files = guard.files.clone();
+                                guard.snapshot_files.insert(snap.clone(), files);
+                                json!({ "status": "ok", "result": { "commit_oid": snap } })
+                            }
                         }
                     }
                     ("POST", "/api/v1/snapshot/restore") => {
@@ -269,8 +317,22 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                             status = "403 Forbidden";
                             json!({ "status": "error", "message": "project_dir is required for User API Keys" })
                         } else {
-                            st.lock().unwrap().restored.push(body_json.clone());
-                            json!({ "status": "ok", "result": { "restored": body_json["source_commit"] } })
+                            let mut guard = st.lock().unwrap();
+                            guard.restored.push(body_json.clone());
+                            let scope = body_json["project_dir"].as_str().unwrap().trim_end_matches('/');
+                            let prefix = format!("{scope}/");
+                            let in_scope = |uri: &str| uri == scope || uri.starts_with(&prefix);
+                            let snapshot = &guard.snapshot_files[body_json["source_commit"].as_str().unwrap()];
+                            let files: Vec<_> = snapshot.iter().filter(|(uri, _)| in_scope(uri))
+                                .map(|(uri, content)| (uri.clone(), content.clone())).collect();
+                            if files.is_empty() {
+                                status = "404 Not Found";
+                                json!({ "status": "error", "message": "Directory missing from snapshot" })
+                            } else {
+                                guard.files.retain(|uri, _| !in_scope(uri));
+                                guard.files.extend(files);
+                                json!({ "status": "ok", "result": { "restored": body_json["source_commit"] } })
+                            }
                         }
                     }
                     ("POST", "/api/v1/compile") => {
@@ -279,6 +341,7 @@ async fn start_mock_openviking_server(state: Arc<Mutex<MockState>>) -> String {
                         let to = body_json["to"].as_str().unwrap().to_string();
                         let mut guard = st.lock().unwrap();
                         guard.writes += 1;
+                        guard.files.insert(format!("{to}HOME.md"), "# Generated Wiki".into());
                         guard.compiled.push(to);
                         json!({ "status": "ok", "result": { "task_id": "task-e2e-1" } })
                     }
@@ -316,6 +379,7 @@ fn test_client(url: &str, account: &str) -> OvClient {
 fn e2e_mcp_stdio_handshake_ping_and_parse_error() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ov-bridge"))
         .args(["mcp", "--agent", "claude-code"])
+        .env("OPENVIKING_DISABLE_HOOKS", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -325,12 +389,15 @@ fn e2e_mcp_stdio_handshake_ping_and_parse_error() {
     writeln!(stdin, "malformed JSON").unwrap();
     writeln!(stdin, "{}", json!({ "jsonrpc": "2.0", "id": 2, "method": "ping" })).unwrap();
     writeln!(stdin, "{}", json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" })).unwrap();
+    writeln!(stdin, "{}", json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+        "params": { "name": "recall", "arguments": { "query": "reflector" } }
+    })).unwrap();
 
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     let responses: Vec<Value> = stdout.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
-    assert_eq!(responses.len(), 4);
+    assert_eq!(responses.len(), 5);
     assert!(responses[0]["result"]["protocolVersion"].is_string());
     assert_eq!(responses[1], json!({
         "jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "Parse error"}
@@ -338,6 +405,25 @@ fn e2e_mcp_stdio_handshake_ping_and_parse_error() {
     assert_eq!(responses[2], json!({"jsonrpc": "2.0", "id": 2, "result": {}}));
     assert!(responses[3]["result"]["tools"].as_array().unwrap()
         .iter().any(|tool| tool["name"] == "recall"));
+    assert_eq!(responses[4]["result"]["isError"], true);
+    assert_eq!(responses[4]["result"]["content"][0]["text"], "OpenViking tools are disabled for this reflector process");
+}
+
+#[test]
+fn e2e_reflector_hooks_skip_input_and_emit_host_output() {
+    for (event, agent, expected) in [
+        ("stop", "codex", "{}"),
+        ("pre-invocation", "antigravity", "{}"),
+        ("session-start", "claude-code", ""),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_ov-bridge"))
+            .args(["hook", event, "--agent", agent])
+            .env("OPENVIKING_DISABLE_HOOKS", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
+    }
 }
 
 #[tokio::test]
@@ -357,6 +443,8 @@ async fn e2e_mcp_recall_and_capture_are_profile_scoped() {
     assert!(text.contains("<openviking_memory_reference") && text.contains("readonly=\"true\""));
     assert!(text.contains("Auto-Expanded L1 Overview"));
     assert!(text.contains("L1_OVERVIEW_FOR:viking://~/memories/preferences/git.md"));
+    assert!(!text.contains("Private search result"));
+    assert!(!text.contains("viking://~/memories/agents/pi/notes.md"));
     assert!(state.lock().unwrap().scoped_searches.is_empty());
 
     let scoped = json!({ "name": "recall", "arguments": {
@@ -447,6 +535,31 @@ async fn e2e_mcp_recall_and_capture_are_profile_scoped() {
     let (provenance, body) = parse_frontmatter(saved_private);
     assert_eq!(provenance.unwrap().scope, "agent_private");
     assert_eq!(body, "Agent private scratchpad");
+}
+
+#[tokio::test]
+async fn e2e_mcp_denies_foreign_agent_private_uris() {
+    let state = Arc::new(Mutex::new(MockState {
+        files: HashMap::from([(CLAUDE_PRIVATE_URI.into(), "Claude private content".into())]),
+        ..Default::default()
+    }));
+    let url = start_mock_openviking_server(state.clone()).await;
+    let client = test_client(&url, "work");
+    let policy = PolicyConfig::default();
+    let read = json!({ "name": "read_uri", "arguments": { "uri": CLAUDE_PRIVATE_URI, "layer": "l2" } });
+    for call in [
+        read.clone(),
+        json!({ "name": "remember", "arguments": { "uri": CLAUDE_PRIVATE_URI, "content": "Overwrite" } }),
+        json!({ "name": "list_uri", "arguments": { "uri": "viking://~/resources/agents/claude-code/" } }),
+        json!({ "name": "recall", "arguments": { "target_uri": "viking://user/alice/memories/agents/claude-code/", "query": "private" } }),
+    ] {
+        let result = mcp::call_tool(AgentId::Codex, &call, &policy, &client, None).await;
+        assert_eq!(result.unwrap_err(), "Access denied: URI belongs to another agent's private namespace");
+    }
+    assert_eq!(state.lock().unwrap().writes, 0);
+    assert!(state.lock().unwrap().scoped_searches.is_empty());
+    let result = mcp::call_tool(AgentId::ClaudeCode, &read, &policy, &client, None).await.unwrap();
+    assert!(result.contains("Claude private content"));
 }
 
 #[tokio::test]
@@ -552,9 +665,16 @@ async fn e2e_hook_outputs_and_stop_capture() {
 
 #[tokio::test]
 async fn e2e_dreaming_snapshot_failure_isolation_and_rollback() {
+    const CONCURRENT_INBOX: &str = "viking://~/resources/inbox/concurrent.md";
+    const INBOX_NOTE: &str = "viking://~/resources/inbox/scratch.md";
+    const ROUTED_NOTE: &str = "viking://~/resources/projects/general/scratch.md";
+    const PROJECT_SIBLING: &str = "viking://~/resources/projects/general/new.md";
+    const MEMORY_SIBLING: &str = "viking://~/memories/preferences/new.md";
+    const WIKI_OUTPUT: &str = "viking://resources/desktop-dreaming-wiki/HOME.md";
     let state = Arc::new(Mutex::new(MockState {
         files: HashMap::from([
-            ("viking://~/resources/inbox/scratch.md".to_string(), "# Scratch note".to_string()),
+            (INBOX_NOTE.into(), "# Scratch note".into()),
+            (CONCURRENT_INBOX.into(), "# Note to edit during review".into()),
             (
                 "viking://~/memories/preferences/git.md".to_string(),
                 "# Git Commit Style\nUse English Conventional Commits for clarity.".to_string(),
@@ -575,7 +695,8 @@ async fn e2e_dreaming_snapshot_failure_isolation_and_rollback() {
     let (run, staged) = run_dreaming(&client, &db, &policy, "e2e").await.unwrap();
     assert_eq!(run.status, "ready_for_review");
     assert_eq!(run.profile_key, client.profile_key());
-    let inbox_move = staged.iter().find(|c| c.action == ChangeAction::MoveFromInbox).unwrap();
+    let inbox_move = staged.iter().find(|c| c.target_uri == INBOX_NOTE).unwrap();
+    let conflict = staged.iter().find(|c| c.target_uri == CONCURRENT_INBOX).unwrap();
     let merge = staged.iter().find(|c| c.action == ChangeAction::Merge).unwrap();
     let evidence: Value = serde_json::from_str(&merge.evidence_json).unwrap();
     assert_eq!(evidence["reflector"], "deterministic");
@@ -617,7 +738,8 @@ async fn e2e_dreaming_snapshot_failure_isolation_and_rollback() {
         assert_eq!(guard.writes, 0);
         assert!(guard.snapshots.is_empty());
         guard.fail_snapshot = false;
-        guard.files.insert("viking://~/memories/preferences/git.md".to_string(), "# Concurrent edit".to_string());
+        guard.fail_post_snapshot = true;
+        guard.files.insert(CONCURRENT_INBOX.into(), "# Concurrent edit".into());
     }
     assert_eq!(
         db.list_pending_changes_for_profile(&client.profile_key(), Some("accepted")).unwrap().len(),
@@ -626,11 +748,14 @@ async fn e2e_dreaming_snapshot_failure_isolation_and_rollback() {
 
     let report = apply_accepted_changes(&client, &db, &policy).await.unwrap();
     assert_eq!(report.snapshot_id.as_deref(), Some("snap-e2e-1"));
-    assert!(!report.conflict_ids.is_empty());
+    assert_eq!(report.conflict_ids, [conflict.id.clone()]);
     assert!(report.applied_ids.contains(&inbox_move.id));
-    assert!(report.failed_items.is_empty());
+    assert!(report.applied_ids.contains(&merge.id));
+    assert_eq!(report.failed_items.len(), 1);
+    assert_eq!(report.failed_items[0].0, "post-apply-snapshot");
+    assert!(report.failed_items[0].1.contains("500"));
     {
-        let guard = state.lock().unwrap();
+        let mut guard = state.lock().unwrap();
         assert_eq!(guard.compiled.as_slice(), &["viking://resources/desktop-dreaming-wiki/"]);
         assert_eq!(guard.snapshots.len(), 2);
         assert!(guard.snapshots[0]["message"].as_str().unwrap().starts_with("dreaming-commit-"));
@@ -638,19 +763,32 @@ async fn e2e_dreaming_snapshot_failure_isolation_and_rollback() {
         assert_eq!(guard.snapshots[0]["paths"], json!([
             "viking://resources/desktop-dreaming-wiki/",
             "viking://~/memories/preferences/git.md",
-            "viking://~/resources/inbox/scratch.md",
-            "viking://~/resources/projects/general/scratch.md",
+            CONCURRENT_INBOX,
+            INBOX_NOTE,
+            "viking://~/resources/projects/general/concurrent.md",
+            ROUTED_NOTE,
         ]));
         assert_eq!(guard.snapshots[1]["paths"], guard.snapshots[0]["paths"]);
+        assert_eq!(guard.files[ROUTED_NOTE], "# Scratch note");
+        assert_eq!(guard.files[&merge.target_uri], merge.after_content.as_deref().unwrap());
+        assert!(guard.files.contains_key(WIKI_OUTPUT));
+        guard.files.insert(PROJECT_SIBLING.into(), "# New project note".into());
+        guard.files.insert(MEMORY_SIBLING.into(), "# New memory".into());
     }
     assert!(rollback_dreaming_run(&other, &db, &run.id).await.is_err());
     assert!(state.lock().unwrap().restored.is_empty());
     rollback_dreaming_run(&client, &db, &run.id).await.unwrap();
-    assert_eq!(state.lock().unwrap().restored.as_slice(), &[
+    let guard = state.lock().unwrap();
+    assert_eq!(guard.restored.as_slice(), &[
         json!({ "source_commit": "snap-e2e-1", "project_dir": "viking://resources/desktop-dreaming-wiki" }),
-        json!({ "source_commit": "snap-e2e-1", "project_dir": "viking://~/resources/inbox" }),
-        json!({ "source_commit": "snap-e2e-1", "project_dir": "viking://~/resources/projects/general" }),
     ]);
+    assert_eq!(guard.files[INBOX_NOTE], "# Scratch note");
+    assert_eq!(guard.files[CONCURRENT_INBOX], "# Concurrent edit");
+    assert_eq!(guard.files[&merge.target_uri], merge.before_content.as_deref().unwrap());
+    assert_eq!(guard.files[PROJECT_SIBLING], "# New project note");
+    assert_eq!(guard.files[MEMORY_SIBLING], "# New memory");
+    assert!(!guard.files.contains_key(ROUTED_NOTE));
+    assert!(!guard.files.contains_key(WIKI_OUTPUT));
     assert_eq!(db.get_run(&run.id).unwrap().unwrap().status, "rolled_back");
 }
 
@@ -659,9 +797,10 @@ async fn e2e_dreaming_reflector_routes_inbox_and_adds_merge_provenance() {
     let state = Arc::new(Mutex::new(MockState {
         files: HashMap::from([
             ("viking://~/resources/inbox/scratch.md".into(), "# Scratch note".into()),
+            ("viking://~/resources/inbox/misroute.md".into(), "# Misroute".into()),
             (
                 "viking://~/memories/preferences/git.md".into(),
-                "# Git Commit Style\nUse English Conventional Commits.".into(),
+                "---\nsource_agent: claude-code\ntitle: Commit Style\ntags: [git]\n---\n# Git Commit Style\nUse English Conventional Commits.".into(),
             ),
             (
                 "viking://~/memories/preferences/git-old.md".into(),
@@ -679,15 +818,22 @@ async fn e2e_dreaming_reflector_routes_inbox_and_adds_merge_provenance() {
     policy.lifecycle.dreaming.reflector_model = "e2e-reflector".into();
 
     let (_, staged) = run_dreaming(&client, &db, &policy, "e2e").await.unwrap();
-    let inbox = staged.iter().find(|c| c.action == ChangeAction::MoveFromInbox).unwrap();
-    assert_eq!(inbox.destination_uri.as_deref(), Some("viking://resources/projects/demo/scratch.md"));
+    let inbox = staged.iter().find(|c| c.target_uri.ends_with("/scratch.md")).unwrap();
+    assert_eq!(inbox.destination_uri.as_deref(), Some("viking://~/resources/projects/demo/scratch.md"));
     let evidence: Value = serde_json::from_str(&inbox.evidence_json).unwrap();
     assert_eq!(evidence["reflector"], "llm:e2e-reflector");
+    let misroute = staged.iter().find(|c| c.target_uri.ends_with("/misroute.md")).unwrap();
+    assert_eq!(misroute.destination_uri.as_deref(), Some("viking://~/resources/projects/general/misroute.md"));
+    let evidence: Value = serde_json::from_str(&misroute.evidence_json).unwrap();
+    assert_eq!(evidence["reflector"], "deterministic");
 
     let merge = staged.iter().find(|c| c.action == ChangeAction::Merge).unwrap();
-    let (provenance, body) = parse_frontmatter(merge.after_content.as_deref().unwrap());
+    let content = merge.after_content.as_deref().unwrap();
+    assert!(content.contains("\ntitle: Commit Style\ntags: [git]\n"));
+    let (provenance, body) = parse_frontmatter(content);
     assert_eq!(body, "# Reflected memory");
     let provenance = provenance.unwrap();
+    assert_eq!(provenance.source_agent, "claude-code");
     assert_eq!(provenance.updated_by, "dreaming:llm:e2e-reflector");
     assert!(provenance.verified);
     assert_eq!(provenance.evidence_uris.len(), 2);
@@ -710,7 +856,6 @@ async fn e2e_failed_commit_can_retry_without_replaying_messages() {
     assert_eq!(state.lock().unwrap().session_messages.len(),1);
 }
 
-
 #[tokio::test]
 async fn e2e_capture_threshold_and_forced_flush() {
     let state = Arc::new(Mutex::new(MockState::default()));
@@ -728,7 +873,6 @@ async fn e2e_capture_threshold_and_forced_flush() {
     assert_eq!(guard.session_peers,vec![Some("project-demo".to_string())]);
     assert_eq!(guard.session_commits,1);
 }
-
 
 #[tokio::test]
 async fn e2e_manual_sync_reconciles_append_acknowledgement_loss() {
@@ -749,7 +893,6 @@ async fn e2e_manual_sync_reconciles_append_acknowledgement_loss() {
     assert_eq!(state.lock().unwrap().session_messages.len(),1);
 }
 
-
 #[tokio::test]
 async fn e2e_short_prompts_and_pi_temporary_context_are_not_suppressed() {
     let state = Arc::new(Mutex::new(MockState::default()));
@@ -764,4 +907,26 @@ async fn e2e_short_prompts_and_pi_temporary_context_are_not_suppressed() {
     let second = hook::execute_hook("user-prompt-submit",AgentId::Pi,&input,&policy,&client,Some(&db)).await;
     assert!(first.contains("viking://resources/projects/demo/README.md"));
     assert_eq!(first,second);
+}
+
+#[tokio::test]
+async fn e2e_dreaming_continues_when_memories_are_absent() {
+    let state = Arc::new(Mutex::new(MockState {
+        files: HashMap::from([("viking://~/resources/inbox/scratch.md".into(), "# Scratch note".into())]),
+        ..Default::default()
+    }));
+    let url = start_mock_openviking_server(state.clone()).await;
+    let client = test_client(&url, "work");
+    let db = DesktopDb::open_in_memory().unwrap();
+    let policy = PolicyConfig::default();
+
+    for status in ["404 Not Found", "200 OK"] {
+        state.lock().unwrap().memories_status = Some(status);
+        let (_, staged) = run_dreaming(&client, &db, &policy, "e2e").await.unwrap();
+        let actions: Vec<_> = staged.iter().map(|change| change.action).collect();
+        assert_eq!(actions, [ChangeAction::MoveFromInbox, ChangeAction::WikiCompile]);
+    }
+    state.lock().unwrap().memories_status = Some("503 Service Unavailable");
+    let error = run_dreaming(&client, &db, &policy, "e2e").await.unwrap_err();
+    assert!(error.contains("503"));
 }
