@@ -20,7 +20,8 @@ fn text(payload: &Value, keys: &[&str]) -> Option<String> {
         .find(|value| !value.trim().is_empty()).map(str::to_owned)
 }
 
-/// Remove injected references and redact explicit credential values, not technical prose.
+/// Strip injected `<openviking_memory_reference>` blocks to prevent echo-chamber re-capture.
+/// Per project design, pre-ingest secret scrubbing is intentionally omitted; use Privacy Mode instead.
 fn sanitize(input: &str) -> String {
     let mut remaining = input;
     let mut clean = String::new();
@@ -33,34 +34,7 @@ fn sanitize(input: &str) -> String {
         remaining = &remaining[start + end + "</openviking_memory_reference>".len()..];
     }
     clean.push_str(remaining);
-    clean.lines().map(redact_credentials).collect::<Vec<_>>()
-        .join("\n").trim().chars().take(12000).collect()
-}
-
-fn redact_credentials(line: &str) -> String {
-    if let Some(index) = line.find([':', '=']) {
-        let key = line[..index].trim().trim_matches(['"', '\'']).to_ascii_lowercase();
-        if matches!(key.as_str(), "authorization" | "api_key" | "api-key" | "apikey"
-            | "password" | "secret_key" | "access_token" | "refresh_token" | "client_secret") {
-            let value = line[index + 1..].trim();
-            if !value.is_empty() {
-                let redacted = if key == "authorization" && value.to_ascii_lowercase().starts_with("bearer ") {
-                    "Bearer [REDACTED]"
-                } else {
-                    "[REDACTED]"
-                };
-                return format!("{} {redacted}", &line[..=index]);
-            }
-        }
-    }
-    line.split_inclusive(char::is_whitespace).map(|word| {
-        let token = word.trim_matches(|c: char| c.is_whitespace() || c == '\u{60}' || "\"'(),;[]{}".contains(c));
-        if token.len() >= 20 && ["sk-", "ghp_", "github_pat_"].iter().any(|prefix| token.starts_with(prefix)) {
-            word.replace(token, "[REDACTED]")
-        } else {
-            word.to_owned()
-        }
-    }).collect::<Vec<_>>().concat()
+    clean.trim().chars().take(12000).collect()
 }
 
 fn message(entry: &Value, ordinal: usize) -> Option<CapturedMessage> {
@@ -295,7 +269,7 @@ pub async fn sync_capture(db: &DesktopDb, client: &OvClient, threshold: u64, rec
             None => {
                 let mut config = json!({"session_id":session.key,"auto_commit_policy":null});
                 if session.peer_id.is_some() {
-                    config["memory_policy"] = json!({"self":{"enabled":false},"peer":{"enabled":true}});
+                    config["memory_policy"] = json!({"self":{"enabled":true},"peer":{"enabled":true}});
                 }
                 match client.create_session(config).await {
                 Ok(result) => {
@@ -360,25 +334,16 @@ pub async fn sync_capture(db: &DesktopDb, client: &OvClient, threshold: u64, rec
 mod tests {
     use super::*;
     #[test]
-    fn collects_user_and_assistant_without_injected_memory_or_credentials() {
+    fn collects_user_and_assistant_stripping_injected_references() {
         let payload = json!({"session_id":"one","messages":[
-            {"role":"user","content":"Fix payment\nAuthorization: Bearer secret"},
+            {"role":"user","content":"Fix payment\nUse Conventional Commits"},
             {"role":"assistant","content":[{"type":"text","text":"<openviking_memory_reference>old</openviking_memory_reference>\nFixed"},{"type":"thinking","text":"internal"}]}
         ]});
         let (session,messages) = collect(&payload);
         assert_eq!(session.as_deref(),Some("one"));
         assert_eq!(messages.len(),2);
-        assert_eq!(messages[0].content,"Fix payment\nAuthorization: Bearer [REDACTED]");
+        assert_eq!(messages[0].content,"Fix payment\nUse Conventional Commits");
         assert_eq!(messages[1].content,"Fixed");
-    }
-
-    #[test]
-    fn technical_prose_survives_credential_redaction() {
-        let prose = "Password fields use BCrypt\nRefresh token expires after 7 days\nTask-based architecture\nUse access_token for authentication";
-        assert_eq!(sanitize(prose),prose);
-        assert_eq!(sanitize("api_key=actual-secret"),"api_key= [REDACTED]");
-        assert_eq!(sanitize("Use sk-example"),"Use sk-example");
-        assert_eq!(sanitize("token ghp_abcdefghijklmnopqrstuvwxyz"),"token [REDACTED]");
     }
 
     #[test]

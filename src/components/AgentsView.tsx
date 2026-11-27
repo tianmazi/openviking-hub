@@ -36,6 +36,7 @@ export function AgentsView({
 }: AgentsViewProps) {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [captureHealth, setCaptureHealth] = useState<CaptureHealth | null>(null);
+  const [syncingCapture, setSyncingCapture] = useState(false);
   useEffect(() => {
     let active = true;
     api.getCaptureHealth().then(value => { if (active) setCaptureHealth(value); })
@@ -120,15 +121,45 @@ export function AgentsView({
         </button>
       </div>
 
-      <section className="rounded-lg border border-border p-3 text-sm">
-        <h3 className="font-medium mb-2">当前 Profile · 记忆同步</h3>
-        {captureHealth ? (
-          <>
-            <p>待发送 {captureHealth.pending} · 已发送待归档 {captureHealth.sent} · 待核对会话 {captureHealth.uncertain_sessions}</p>
-            <p className="text-xs text-muted-foreground mt-1">最近记录的提取任务：{captureHealth.extraction_tasks.length} · 完成 {captureHealth.extraction_tasks.filter(([, status]) => status === "completed").length}</p>
-            {captureHealth.last_error && <p className="text-xs text-red-500 mt-1">{captureHealth.last_error}</p>}
-          </>
-        ) : <p className="text-muted-foreground">同步状态暂不可用</p>}
+      <section className="rounded-xl bg-surface-1 border border-border-subtle p-4 flex flex-wrap items-center justify-between gap-3">
+        <div className="space-y-1">
+          <h3 className="text-xs font-semibold text-zinc-200">当前 Profile · 记忆同步队列</h3>
+          {captureHealth ? (
+            <>
+              <p className="text-xs text-zinc-300 font-mono">
+                待发送 {captureHealth.pending} · 已发送待归档 {captureHealth.sent} · 待核对会话 {captureHealth.uncertain_sessions}
+              </p>
+              <p className="text-[11px] text-zinc-400">
+                最近记录的提取任务：{captureHealth.extraction_tasks.length} · 完成{" "}
+                {captureHealth.extraction_tasks.filter(([, status]) => status === "completed").length}
+              </p>
+              {captureHealth.last_error && (
+                <p className="text-[11px] text-rose-400">{captureHealth.last_error}</p>
+              )}
+            </>
+          ) : (
+            <p className="text-xs text-zinc-500">同步状态暂不可用</p>
+          )}
+        </div>
+        <button
+          disabled={syncingCapture}
+          onClick={async () => {
+            setSyncingCapture(true);
+            try {
+              const next = await api.syncCaptureNow();
+              setCaptureHealth(next);
+              onNotify("success", "已完成记忆队列同步与远端会话核对。");
+            } catch (e) {
+              onNotify("error", `记忆同步失败：${String(e)}`);
+            } finally {
+              setSyncingCapture(false);
+            }
+          }}
+          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-surface-2 hover:bg-surface-3 border border-border-subtle text-xs text-zinc-200 disabled:opacity-40 shrink-0"
+        >
+          <RefreshCw className={`w-3.5 h-3.5 ${syncingCapture ? "animate-spin" : ""}`} />
+          {syncingCapture ? "同步核对中..." : "立即同步 / 核对"}
+        </button>
       </section>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {agents.map((agent) => (

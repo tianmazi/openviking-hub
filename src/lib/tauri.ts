@@ -198,6 +198,10 @@ export const api = {
     if (isTauriRuntime()) return callTauri("get_capture_health");
     return { pending: 0, sent: 0, uncertain_sessions: 0, extraction_tasks: [], last_error: null };
   },
+  async syncCaptureNow(): Promise<CaptureHealth> {
+    if (isTauriRuntime()) return callTauri("sync_capture_now");
+    return { pending: 0, sent: 0, uncertain_sessions: 0, extraction_tasks: [], last_error: null };
+  },
   async getServerStatus(): Promise<ServerStatus> {
     if (isTauriRuntime()) return callTauri("get_server_status");
     const active = previewProfiles.profiles[previewProfiles.active];

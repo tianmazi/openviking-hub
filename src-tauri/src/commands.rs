@@ -64,6 +64,15 @@ pub fn get_capture_health() -> Result<ov_core::capture::CaptureHealth, String> {
 }
 
 #[tauri::command]
+pub async fn sync_capture_now() -> Result<ov_core::capture::CaptureHealth, String> {
+    let client = ov_core::ov_client::OvClient::from_local_config().map_err(|e| e.to_string())?;
+    let db = DesktopDb::open_default()?;
+    let _ = ov_core::capture::sync_capture(&db, &client, 0, true).await?;
+    let _ = ov_core::capture::refresh_extraction_tasks(&db, &client).await;
+    db.capture_health(&client.profile_key())
+}
+
+#[tauri::command]
 pub fn detect_agents() -> Vec<AgentStatus> {
     AdapterRegistry::new().detect_all()
 }

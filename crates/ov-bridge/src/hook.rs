@@ -121,6 +121,7 @@ pub(crate) async fn execute_hook(
         created_at: Utc::now().timestamp(),
     };
 
+    let mut recall_hits: Vec<(String, f64, bool)> = Vec::new();
     let text = match event {
         "session-start" => {
             // Position-Biased Structured Index Header (Displacement: Primacy -> Middle TOC -> Recency)
@@ -196,11 +197,7 @@ pub(crate) async fn execute_hook(
             candidates.retain(|item| !is_foreign_agent_private_uri(policy, agent, &item.uri));
             let (text, layer, hits) = render_recall(client, candidates, &budget).await;
             evt.target_uri = hits.iter().find(|(_,_,injected)| *injected).map(|(uri,_,_)| uri.clone());
-            if let Some(db) = db {
-                if let Err(error) = db.record_recall_hits(&evt.id, &hits) {
-                    eprintln!("OpenViking recall hits: {error}");
-                }
-            }
+            recall_hits = hits;
             evt.query = Some(prompt.chars().take(120).collect());
             evt.layer = Some(layer);
             evt.tokens_used = (text.len() / 4) as i64;
@@ -241,6 +238,10 @@ pub(crate) async fn execute_hook(
         evt.latency_ms = start.elapsed().as_millis() as i64;
         if let Err(error) = db.record_event_for_profile(&client.profile_key(), &evt) {
             eprintln!("OpenViking telemetry: {error}");
+        } else if !recall_hits.is_empty() {
+            if let Err(error) = db.record_recall_hits(&evt.id, &recall_hits) {
+                eprintln!("OpenViking recall hits: {error}");
+            }
         }
     }
     wrap_ifc_readonly(&text, &format!("{event}:{}", agent.as_str()), "reference")

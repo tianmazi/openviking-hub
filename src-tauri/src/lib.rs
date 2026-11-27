@@ -181,6 +181,7 @@ pub fn run() {
             commands::save_profiles,
             commands::detect_agents,
             commands::get_capture_health,
+            commands::sync_capture_now,
             commands::detect_wsl,
             commands::connect_wsl_agent,
             commands::connect_agent,
