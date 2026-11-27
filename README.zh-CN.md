@@ -70,6 +70,16 @@ flowchart LR
 ### 2. 连接 OpenViking 服务
 打开 **OpenViking Hub**，填入你的 OpenViking 服务地址和 API Key（支持多套工作/个人 Profile 隔离切换），点击 **测试连通**。
 
+> **本机还没启动 OpenViking Server？** 用 `uv` 或 Docker 约 1 分钟即可拉起本地服务（详见 [OpenViking 官方快速开始](https://docs.openviking.ai/en/getting-started/02-quickstart)）：
+> ```bash
+> # 方式 A：uv（Python 3.13）
+> uv tool install --python 3.13 openviking && openviking-server init && openviking-server
+>
+> # 方式 B：Docker（国内如拉取慢可替换为 openviking-cn-beijing.cr.volces.com/volcengine/openviking:latest）
+> docker run -d --name openviking -p 127.0.0.1:1933:1933 -v ~/.openviking:/app/.openviking ghcr.io/volcengine/openviking:latest
+> ```
+> 如果只想先体验界面，直接运行 `npm run dev` 即可进入零后端 Mock 预览模式。
+
 ### 3. 一键接入本地 Agent
 进入 **Agents** 页面，勾选本机已安装的 Agent（Claude Code、Codex、pi、Antigravity 或 WSL 发行版），点击 **一键接入**：
 - 内置 `ov-bridge` 单文件二进制会自动释放至 `~/.openviking/bin/`，**无需宿主机安装 Node.js、`npx`、Python 或 Bash**。

@@ -68,6 +68,16 @@ Download the installer for your OS from [GitHub Releases](https://github.com/tia
 ### 2. Connect Your OpenViking Server
 Open **OpenViking Hub**, enter your OpenViking server URL and API Key (multi-profile supported), and click **Test Connection**.
 
+> **Don't have a local OpenViking Server running yet?** Spin one up in ~1 minute with either `uv` or Docker (see [OpenViking Quickstart](https://docs.openviking.ai/en/getting-started/02-quickstart)):
+> ```bash
+> # Option A: uv (Python 3.13)
+> uv tool install --python 3.13 openviking && openviking-server init && openviking-server
+>
+> # Option B: Docker
+> docker run -d --name openviking -p 127.0.0.1:1933:1933 -v ~/.openviking:/app/.openviking ghcr.io/volcengine/openviking:latest
+> ```
+> Want to explore the UI first without a server? Run `npm run dev` for the built-in mock preview.
+
 ### 3. One-Click Connect Your Agents
 Go to the **Agents** tab, pick your installed agents (Claude Code, Codex, pi, Antigravity, or WSL distros), and click **Connect**.
 - `ov-bridge` is automatically extracted to `~/.openviking/bin/` — **no Node.js, `npx`, Python, or Bash required**.

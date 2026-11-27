@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { CheckCircle2, Plus, Trash2, Wifi, X, XCircle } from "lucide-react";
+import { Check, CheckCircle2, Copy, ExternalLink, Plus, RefreshCw, Terminal, Trash2, Wifi, X, XCircle } from "lucide-react";
 import { api } from "../lib/tauri";
 import type { OvProfile, ProfileStore, ServerStatus } from "../types/openviking";
 
@@ -19,6 +19,30 @@ export function ProfileModal({ open, store, onClose, onSaveStore }: ProfileModal
   const [user, setUser] = useState("");
   const [testResult, setTestResult] = useState<ServerStatus | null>(null);
   const [testing, setTesting] = useState(false);
+  const [copiedCmd, setCopiedCmd] = useState<"uv" | "docker" | null>(null);
+
+  const isLocalTarget = (() => {
+    try {
+      const parsed = new URL(url.trim());
+      return ["127.0.0.1", "localhost", "::1"].includes(parsed.hostname.toLowerCase());
+    } catch {
+      return /(127\.0\.0\.1|localhost)/i.test(url);
+    }
+  })();
+
+  const uvCmd = "uv tool install --python 3.13 openviking && openviking-server init && openviking-server";
+  const dockerCmd =
+    "docker run -d --name openviking -p 127.0.0.1:1933:1933 -v ~/.openviking:/app/.openviking ghcr.io/volcengine/openviking:latest";
+
+  const copyCommand = async (kind: "uv" | "docker", cmd: string) => {
+    try {
+      await navigator.clipboard.writeText(cmd);
+      setCopiedCmd(kind);
+      window.setTimeout(() => setCopiedCmd((prev) => (prev === kind ? null : prev)), 1800);
+    } catch {
+      // Ignore clipboard failure in restricted contexts
+    }
+  };
   const openerRef = useRef<HTMLElement | null>(null);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
@@ -237,6 +261,78 @@ export function ProfileModal({ open, store, onClose, onSaveStore }: ProfileModal
                     ? `连通正常（延迟 ${testResult.latency_ms} ms）`
                     : `连接失败：${testResult.error ?? "服务不可达"}`}
                 </span>
+              </div>
+            )}
+
+            {testResult && !testResult.reachable && isLocalTarget && (
+              <div className="p-3 rounded-lg bg-surface-2 border border-amber-500/25 space-y-2.5 text-[11px]">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5 font-medium text-amber-200">
+                    <Terminal className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                    <span>未检测到本地 OpenViking 服务（端口 1933）</span>
+                  </div>
+                  <a
+                    href="https://docs.openviking.ai/en/getting-started/02-quickstart"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1 text-indigo-300 hover:underline shrink-0"
+                  >
+                    官方指南
+                    <ExternalLink className="w-3 h-3" />
+                  </a>
+                </div>
+                <p className="text-zinc-400">
+                  任选以下一种方式在终端启动本地服务，完成后点击重新检测：
+                </p>
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between gap-2 bg-surface-1 border border-border-subtle rounded px-2 py-1.5">
+                    <div className="min-w-0 flex-1">
+                      <span className="text-[10px] text-zinc-500 mr-1.5">uv:</span>
+                      <code className="font-mono text-[10px] text-zinc-200 break-all">{uvCmd}</code>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void copyCommand("uv", uvCmd)}
+                      className="p-1 text-zinc-400 hover:text-zinc-100 shrink-0"
+                      title="复制 uv 启动命令"
+                    >
+                      {copiedCmd === "uv" ? (
+                        <Check className="w-3.5 h-3.5 text-emerald-400" />
+                      ) : (
+                        <Copy className="w-3.5 h-3.5" />
+                      )}
+                    </button>
+                  </div>
+                  <div className="flex items-center justify-between gap-2 bg-surface-1 border border-border-subtle rounded px-2 py-1.5">
+                    <div className="min-w-0 flex-1">
+                      <span className="text-[10px] text-zinc-500 mr-1.5">Docker:</span>
+                      <code className="font-mono text-[10px] text-zinc-200 break-all">{dockerCmd}</code>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void copyCommand("docker", dockerCmd)}
+                      className="p-1 text-zinc-400 hover:text-zinc-100 shrink-0"
+                      title="复制 Docker 启动命令"
+                    >
+                      {copiedCmd === "docker" ? (
+                        <Check className="w-3.5 h-3.5 text-emerald-400" />
+                      ) : (
+                        <Copy className="w-3.5 h-3.5" />
+                      )}
+                    </button>
+                  </div>
+                </div>
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    onClick={handleTest}
+                    disabled={testing}
+                    className="inline-flex items-center gap-1 text-[11px] text-amber-200 hover:text-amber-100"
+                  >
+                    <RefreshCw className={`w-3 h-3 ${testing ? "animate-spin" : ""}`} />
+                    {testing ? "检测中..." : "已启动，重新检测"}
+                  </button>
+                </div>
               </div>
             )}
 
