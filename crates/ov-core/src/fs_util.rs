@@ -48,7 +48,8 @@ pub(crate) fn atomic_write_with_mode(
     tmp.as_file().sync_all()?;
 
     let mut current_tmp = Some(tmp);
-    for attempt in 0..4 {
+    const MAX_ATTEMPTS: usize = 8;
+    for attempt in 0..MAX_ATTEMPTS {
         let file = current_tmp.take().unwrap();
         match file.persist(target) {
             Ok(_) => return Ok(()),
@@ -78,28 +79,28 @@ pub(crate) fn atomic_write_with_mode(
                             }
                             Err(retry_err) => {
                                 let _ = fs::rename(&stale, target);
-                                if attempt == 3 {
+                                if attempt + 1 == MAX_ATTEMPTS {
                                     return Err(FsUtilError::Persist {
                                         path: target.to_path_buf(),
                                         reason: retry_err.error.to_string(),
                                     });
                                 }
                                 current_tmp = Some(retry_err.file);
-                                thread::sleep(Duration::from_millis(60 * (attempt as u64 + 1)));
+                                thread::sleep(Duration::from_millis(100 * (attempt as u64 + 1)));
                                 continue;
                             }
                         }
                     }
                 }
 
-                if attempt == 3 {
+                if attempt + 1 == MAX_ATTEMPTS {
                     return Err(FsUtilError::Persist {
                         path: target.to_path_buf(),
                         reason: err.error.to_string(),
                     });
                 }
                 current_tmp = Some(err.file);
-                thread::sleep(Duration::from_millis(60 * (attempt as u64 + 1)));
+                thread::sleep(Duration::from_millis(100 * (attempt as u64 + 1)));
             }
         }
     }
