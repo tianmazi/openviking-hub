@@ -1281,3 +1281,104 @@ async fn e2e_minja_poisoning_isolated_superseded_filtered_and_score_gated() {
     let out = hook::execute_hook("user-prompt-submit", AgentId::Codex, &input, &policy, &client, None).await;
     assert!(out.is_empty(), "Low-score loose match must be suppressed when below min_recall_score");
 }
+
+
+#[tokio::test]
+async fn e2e_ttl_expiry_filtered_from_recall_and_archived_by_dreaming() {
+    let expired_uri = "viking://~/memories/events/temp-meeting.md";
+    let expired_doc = "---\nsource_agent: codex\nstatus: active\nevent_time: 2020-01-01T09:00:00Z\nexpires_at: 2020-01-02T09:00:00Z\n---\nTemporary standup at 3pm tomorrow.";
+    let state = Arc::new(Mutex::new(MockState::default()));
+    {
+        let mut s = state.lock().unwrap();
+        s.files.insert(expired_uri.to_string(), expired_doc.to_string());
+    }
+    let url = start_mock_openviking_server(state.clone()).await;
+    let client = test_client(&url, "ttl-profile");
+    let db = DesktopDb::open_in_memory().unwrap();
+    let policy = PolicyConfig::default();
+
+    // 1. Recall must immediately drop expired TTL candidate
+    let cand = mcp::RecallCandidate {
+        uri: expired_uri.to_string(),
+        title: "Temp Meeting".to_string(),
+        score: 0.95,
+        snippet: expired_doc.to_string(),
+        category: Some(ov_core::policy::model::MemoryCategory::Events),
+    };
+    let budget = policy.budget.resolve_for(AgentId::Codex);
+    let (rendered, _, hits) = mcp::render_recall(
+        &client,
+        vec![cand],
+        &budget,
+        &policy.budget.category_quotas,
+        Some(3),
+    )
+    .await;
+    assert!(rendered.is_empty(), "Expired TTL memory must be excluded from recall");
+    assert!(hits.is_empty());
+
+    // 2. Dreaming must stage and apply TTL archive to archive/expired-* with status: expired
+    let (_run, staged) = run_dreaming(&client, &db, &policy, "e2e-ttl").await.unwrap();
+    let ttl_chg = staged
+        .iter()
+        .find(|c| c.target_uri == expired_uri && c.action == ChangeAction::Archive)
+        .expect("Expected TTL archive proposal");
+    assert_eq!(ttl_chg.risk_level, RiskLevel::Low);
+    assert!(ttl_chg
+        .destination_uri
+        .as_deref()
+        .unwrap_or("")
+        .contains("expired-temp-meeting.md"));
+    db.update_change_decision_for_profile(&client.profile_key(), &ttl_chg.id, ReviewStatus::Accepted, None)
+        .unwrap();
+    let report = apply_accepted_changes(&client, &db, &policy).await.unwrap();
+    assert_eq!(report.applied_ids.len(), 1);
+    let dest = ttl_chg.destination_uri.as_deref().unwrap();
+    let guard = state.lock().unwrap();
+    assert!(!guard.files.contains_key(expired_uri));
+    let archived = guard.files.get(dest).expect("Archived expired file must exist");
+    assert!(ov_core::provenance::is_expired(archived, chrono::Utc::now().timestamp()));
+}
+
+#[tokio::test]
+async fn e2e_demote_from_index_oversized_and_rollback() {
+    let oversized_uri = "viking://~/memories/preferences/oversized-rule.md";
+    let huge_body = "Detailed rule line.\n".repeat(150);
+    let doc = format!(
+        "---\nsource_agent: claude-code\nverified: true\nindex_priority: high\n---\n# Giant Rule\n{}",
+        huge_body
+    );
+    let state = Arc::new(Mutex::new(MockState::default()));
+    {
+        let mut s = state.lock().unwrap();
+        s.files.insert(oversized_uri.to_string(), doc.clone());
+    }
+    let url = start_mock_openviking_server(state.clone()).await;
+    let client = test_client(&url, "demote-profile");
+    let db = DesktopDb::open_in_memory().unwrap();
+    let policy = PolicyConfig::default();
+
+    let (run, staged) = run_dreaming(&client, &db, &policy, "e2e-demote").await.unwrap();
+    let demote = staged
+        .iter()
+        .find(|c| c.target_uri == oversized_uri && c.action == ChangeAction::DemoteFromIndex)
+        .expect("Expected DemoteFromIndex proposal for oversized high-priority index");
+    assert_eq!(demote.risk_level, RiskLevel::Low);
+
+    db.update_change_decision_for_profile(&client.profile_key(), &demote.id, ReviewStatus::Accepted, None)
+        .unwrap();
+    let report = apply_accepted_changes(&client, &db, &policy).await.unwrap();
+    assert_eq!(report.applied_ids.len(), 1);
+    {
+        let guard = state.lock().unwrap();
+        let after = guard.files.get(oversized_uri).unwrap();
+        assert!(!ov_core::provenance::has_index_priority_high(after));
+        assert!(after.contains("index_priority: normal"));
+    }
+
+    // Rollback must restore index_priority: high
+    rollback_dreaming_run(&client, &db, &run.id).await.unwrap();
+    let guard = state.lock().unwrap();
+    let restored = guard.files.get(oversized_uri).unwrap();
+    assert!(ov_core::provenance::has_index_priority_high(restored));
+}

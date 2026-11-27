@@ -22,6 +22,14 @@ pub struct InboxRouteResult {
     pub engine_label: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct TranscriptVerifyResult {
+    pub corrected_content: String,
+    pub rationale: String,
+    pub confidence: f32,
+    pub engine_label: String,
+}
+
 /// Use an optional local CLI agent (`claude -p` / `codex exec`) or an OpenAI-compatible
 /// LLM endpoint (e.g. Ollama / vLLM / OpenAI) to semantically merge two overlapping memories
 /// and resolve contradictions. Returns `None` if deterministic mode is selected or on fallback.
@@ -103,6 +111,61 @@ pub async fn reflect_inbox_route(
     Some(InboxRouteResult {
         destination_uri: format!("{}{}", normalized_dir, file_name),
         rationale,
+        engine_label: label,
+    })
+}
+
+/// Cross-check a recently written/updated memory note against committed local session transcripts.
+/// Returns `Some(TranscriptVerifyResult)` only when the reflector detects a factual contradiction.
+pub async fn reflect_transcript_verify(
+    policy: &DreamingPolicy,
+    note_uri: &str,
+    note_raw: &str,
+    transcript_excerpt: &str,
+) -> Option<TranscriptVerifyResult> {
+    if policy.reflector_mode == ReflectorMode::Deterministic || transcript_excerpt.trim().is_empty() {
+        return None;
+    }
+
+    let prompt = format!(
+        "You are a memory fact-checker. Compare the memory note below against the ground-truth recent session transcripts.\n\
+         Only flag a contradiction if the note states a concrete fact, path, command, or preference that directly conflicts with the transcripts.\n\
+         Respond with ONLY a valid JSON object:\n\
+         {{\"contradicted\": true|false, \"corrected_content\": \"Corrected Markdown body without YAML frontmatter (empty if not contradicted)\", \"rationale\": \"short explanation citing the transcript\", \"confidence\": 0.85}}\n\n\
+         [Memory Note URI: {}]\n{}\n\n\
+         [Recent Committed Transcripts (Ground Truth)]\n{}\n",
+        note_uri,
+        truncate_chars(note_raw, 2500),
+        truncate_chars(transcript_excerpt, 3500)
+    );
+
+    let (raw_out, label) = invoke_reflector(policy, &prompt).await?;
+    let parsed = extract_json_object(&raw_out)?;
+    if !parsed.get("contradicted").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    let corrected = parsed
+        .get("corrected_content")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let rationale = parsed
+        .get("rationale")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("对照本地原始会话记录发现笔记事实偏差，建议修正。")
+        .to_string();
+    let confidence = parsed
+        .get("confidence")
+        .and_then(Value::as_f64)
+        .map(|v| (v as f32).clamp(0.0, 1.0))
+        .unwrap_or(0.8);
+    Some(TranscriptVerifyResult {
+        corrected_content: corrected,
+        rationale,
+        confidence,
         engine_label: label,
     })
 }

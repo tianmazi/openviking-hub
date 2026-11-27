@@ -1,5 +1,5 @@
 use crate::dreaming::db::{DesktopDb, DreamingRun};
-use crate::dreaming::reflector::{reflect_inbox_route, reflect_merge};
+use crate::dreaming::reflector::{reflect_inbox_route, reflect_merge, reflect_transcript_verify};
 use crate::fs_util::sha256_hex;
 use crate::ov_client::{snapshot_commit_id, FindRequest, OvClient, OvClientError};
 use crate::policy::model::{
@@ -7,7 +7,9 @@ use crate::policy::model::{
 };
 use crate::policy::router::{is_protected_rule_path, USER_MEMORIES_URI};
 use crate::provenance::{
-    is_write_gate_verified, render_frontmatter, split_frontmatter, stamp_superseded, MemoryProvenance,
+    has_index_priority_high, is_expired, is_write_gate_verified, parse_frontmatter,
+    render_frontmatter, split_frontmatter, stamp_expired, stamp_index_priority_normal,
+    stamp_superseded, MemoryProvenance,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -42,14 +44,41 @@ pub async fn run_dreaming(
     db.create_run_for_profile(&profile_key, &run_id, trigger_source)?;
     let now = Utc::now().timestamp();
     let stale_cutoff = now - (policy.lifecycle.archival.stale_days as i64 * 86_400);
+    let demote_cutoff = now - (policy.lifecycle.dreaming.demote_stale_days as i64 * 86_400);
+    let last_run_at_key = format!("dreaming_last_run_at:{profile_key}");
+    let last_outbox_seq_key = format!("dreaming_last_outbox_seq:{profile_key}");
+    let last_run_at: i64 = db
+        .get_kv(&last_run_at_key)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let last_outbox_seq: i64 = db
+        .get_kv(&last_outbox_seq_key)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let recent_transcripts = if policy.lifecycle.dreaming.verify_against_transcripts {
+        db.recent_committed_transcripts_for_profile(&profile_key, last_outbox_seq, 30)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let transcript_excerpt = build_transcript_excerpt(&recent_transcripts, 3500);
+    let mut verified_against_transcripts_count = 0usize;
 
     let mut staged: Vec<PendingMemoryChange> = Vec::new();
     let mut counts = json!({
         "inbox": 0,
         "merge": 0,
         "promote": 0,
+        "demote": 0,
         "archive": 0,
-        "wiki_compile": 0
+        "ttl_expired": 0,
+        "transcript_verify": 0,
+        "wiki_compile": 0,
+        "incremental": policy.lifecycle.dreaming.incremental_mode
     });
 
     let project_root = format!(
@@ -144,10 +173,154 @@ pub async fn run_dreaming(
             let hit_count = stat.map(|s| s.hit_count).unwrap_or(0);
             let last_hit = stat.map(|s| s.last_hit_at).unwrap_or(0);
             let agents = stat.map(|s| s.agents.clone()).unwrap_or_default();
+            let mod_time_ts = item
+                .get("modTime")
+                .and_then(Value::as_str)
+                .and_then(|time| DateTime::parse_from_rfc3339(time).ok())
+                .map(|time| time.timestamp());
+            let is_recently_changed_or_hit = !policy.lifecycle.dreaming.incremental_mode
+                || last_run_at == 0
+                || mod_time_ts.is_none_or(|ts| ts >= last_run_at)
+                || last_hit >= last_run_at;
+            let cached_content = read_text(client, uri).await.ok();
+
+            // 3d. Event TTL expiry check (archive expired memories immediately without waiting stale_days)
+            if policy.lifecycle.archival.enabled && policy.lifecycle.archival.respect_ttl_expiry {
+                if let Some(ref raw) = cached_content {
+                    let explicit_expired = is_expired(raw, now);
+                    let episode_ttl_expired = !explicit_expired
+                        && category == MemoryCategory::Events
+                        && policy.lifecycle.archival.episode_default_ttl_days > 0
+                        && {
+                            let ttl_cutoff = now
+                                - (policy.lifecycle.archival.episode_default_ttl_days as i64
+                                    * 86_400);
+                            let event_ts = parse_frontmatter(raw)
+                                .0
+                                .and_then(|p| p.event_time.or(Some(p.created_at)))
+                                .and_then(|ts| DateTime::parse_from_rfc3339(&ts).ok())
+                                .map(|dt| dt.timestamp())
+                                .or(mod_time_ts);
+                            event_ts.is_some_and(|ts| ts < ttl_cutoff)
+                        };
+                    if explicit_expired || episode_ttl_expired {
+                        let base_hash = Some(sha256_hex(raw));
+                        let file_name = uri.rsplit('/').next().unwrap_or("memory.md");
+                        let dest = format!(
+                            "{}/expired-{}",
+                            policy.lifecycle.archival.archive_uri.trim_end_matches('/'),
+                            file_name
+                        );
+                        let expires_at = parse_frontmatter(raw).0.and_then(|p| p.expires_at);
+                        let rationale = if explicit_expired {
+                            format!(
+                                "事件记忆已超过有效期（expires_at: {}），建议立即归档并标记为 expired。",
+                                expires_at.as_deref().unwrap_or("status: expired")
+                            )
+                        } else {
+                            format!(
+                                "Events 类别记忆超过默认 TTL（{} 天），建议自动归档并标记为 expired。",
+                                policy.lifecycle.archival.episode_default_ttl_days
+                            )
+                        };
+                        let change = PendingMemoryChange {
+                            id: format!("chg-{}", Uuid::new_v4().simple()),
+                            run_id: run_id.clone(),
+                            snapshot_id: None,
+                            created_at: now,
+                            action: ChangeAction::Archive,
+                            risk_level: RiskLevel::Low,
+                            target_uri: uri.to_string(),
+                            destination_uri: Some(dest),
+                            category,
+                            base_hash,
+                            before_content: Some(raw.clone()),
+                            after_content: Some(stamp_expired(raw)),
+                            rationale,
+                            evidence_json: json!({
+                                "source": "ttl_expired",
+                                "explicit_expired": explicit_expired,
+                                "expires_at": expires_at,
+                                "episode_default_ttl_days": policy.lifecycle.archival.episode_default_ttl_days,
+                                "mod_time": mod_time_ts
+                            })
+                            .to_string(),
+                            status: ReviewStatus::Pending,
+                        };
+                        db.insert_pending_change_for_profile(&profile_key, &change)?;
+                        staged.push(change);
+                        counts["archive"] = json!(counts["archive"].as_u64().unwrap_or(0) + 1);
+                        counts["ttl_expired"] =
+                            json!(counts["ttl_expired"].as_u64().unwrap_or(0) + 1);
+                        continue;
+                    }
+                }
+            }
+
+            // 3c. Cold or oversized top-level index demotion (DemoteFromIndex)
+            if policy.lifecycle.dreaming.demote_cold_index {
+                if let Some(ref raw) = cached_content {
+                    if has_index_priority_high(raw) {
+                        let body_bytes = split_frontmatter(raw).1.len();
+                        let is_cold = (hit_count > 0 && last_hit < demote_cutoff)
+                            || (hit_count == 0 && mod_time_ts.is_some_and(|ts| ts < demote_cutoff));
+                        let is_oversized = policy.lifecycle.dreaming.max_index_entry_bytes > 0
+                            && body_bytes > policy.lifecycle.dreaming.max_index_entry_bytes;
+                        if is_cold || is_oversized {
+                            let reason = match (is_cold, is_oversized) {
+                                (true, true) => format!(
+                                    "已晋升索引超过 {} 天未命中且正文达 {} 字节（上限 {}），建议降级以保持顶层精简。",
+                                    policy.lifecycle.dreaming.demote_stale_days,
+                                    body_bytes,
+                                    policy.lifecycle.dreaming.max_index_entry_bytes
+                                ),
+                                (true, false) => format!(
+                                    "已晋升索引超过 {} 天未命中（历史命中 {} 次），建议从顶层启动索引降级为 normal。",
+                                    policy.lifecycle.dreaming.demote_stale_days, hit_count
+                                ),
+                                (false, true) => format!(
+                                    "已晋升索引正文达 {} 字节（超过上限 {} 字节），建议降级并下沉正文以保持启动层精简。",
+                                    body_bytes, policy.lifecycle.dreaming.max_index_entry_bytes
+                                ),
+                                (false, false) => unreachable!(),
+                            };
+                            let change = PendingMemoryChange {
+                                id: format!("chg-{}", Uuid::new_v4().simple()),
+                                run_id: run_id.clone(),
+                                snapshot_id: None,
+                                created_at: now,
+                                action: ChangeAction::DemoteFromIndex,
+                                risk_level: RiskLevel::Low,
+                                target_uri: uri.to_string(),
+                                destination_uri: None,
+                                category,
+                                base_hash: Some(sha256_hex(raw)),
+                                before_content: Some(raw.clone()),
+                                after_content: Some(stamp_index_priority_normal(raw)),
+                                rationale: reason,
+                                evidence_json: json!({
+                                    "source": "index_demoter",
+                                    "is_cold": is_cold,
+                                    "is_oversized": is_oversized,
+                                    "body_bytes": body_bytes,
+                                    "max_index_entry_bytes": policy.lifecycle.dreaming.max_index_entry_bytes,
+                                    "hit_count": hit_count,
+                                    "last_hit_at": last_hit
+                                })
+                                .to_string(),
+                                status: ReviewStatus::Pending,
+                            };
+                            db.insert_pending_change_for_profile(&profile_key, &change)?;
+                            staged.push(change);
+                            counts["demote"] = json!(counts["demote"].as_u64().unwrap_or(0) + 1);
+                        }
+                    }
+                }
+            }
 
             // 3a. Hot memory promotion with Anti-Contagion Write-Gate
             if policy.lifecycle.dreaming.promote_hot_notes && hit_count >= 5 && agents.len() >= 2 {
-                let content = read_text(client, uri).await.ok();
+                let content = cached_content.clone();
                 let gate_ok = content
                     .as_deref()
                     .map(|raw| is_write_gate_verified(raw, i64::from(hit_count), agents.len()))
@@ -189,17 +362,12 @@ pub async fn run_dreaming(
             }
 
             // 3b. Cold memory archival check
-            let mod_time_ts = item
-                .get("modTime")
-                .and_then(Value::as_str)
-                .and_then(|time| DateTime::parse_from_rfc3339(time).ok())
-                .map(|time| time.timestamp());
             if policy.lifecycle.archival.enabled
                 && hit_count < policy.lifecycle.archival.min_hit_count
                 && ((hit_count > 0 && last_hit < stale_cutoff)
                     || (hit_count == 0 && mod_time_ts.is_some_and(|ts| ts < stale_cutoff)))
             {
-                let content = read_text(client, uri).await.ok();
+                let content = cached_content.clone();
                 let base_hash = content.as_deref().map(sha256_hex);
                 let file_name = uri.rsplit('/').next().unwrap_or("memory.md");
                 let dest = format!(
@@ -238,9 +406,76 @@ pub async fn run_dreaming(
                 counts["archive"] = json!(counts["archive"].as_u64().unwrap_or(0) + 1);
             }
 
-            // 2. Semantic conflict & dedupe merger (strictly mutable categories only)
-            if policy.lifecycle.dreaming.dedupe_and_merge && policy.lifecycle.is_mutable(category) {
-                if let Ok(content) = read_text(client, uri).await {
+            // 2b. Ground-truth verification against recent committed local transcripts
+            if policy.lifecycle.dreaming.verify_against_transcripts
+                && is_recently_changed_or_hit
+                && !transcript_excerpt.is_empty()
+                && verified_against_transcripts_count < 5
+            {
+                if let Some(ref content) = cached_content {
+                    let (frontmatter, primary_body) = split_frontmatter(content);
+                    if primary_body.trim().len() >= 20 {
+                        verified_against_transcripts_count += 1;
+                        if let Some(res) = reflect_transcript_verify(
+                            &policy.lifecycle.dreaming,
+                            uri,
+                            primary_body,
+                            &transcript_excerpt,
+                        )
+                        .await
+                        {
+                            let mut prov = MemoryProvenance::new(
+                                "dreaming",
+                                "shared",
+                                false,
+                                res.confidence,
+                            );
+                            prov.updated_by =
+                                format!("dreaming:transcript_verify:{}", res.engine_label);
+                            prov.evidence_uris = vec![uri.to_string()];
+                            let corrected_with_prov =
+                                render_frontmatter(frontmatter, &res.corrected_content, &prov);
+                            let change = PendingMemoryChange {
+                                id: format!("chg-{}", Uuid::new_v4().simple()),
+                                run_id: run_id.clone(),
+                                snapshot_id: None,
+                                created_at: now,
+                                action: ChangeAction::Merge,
+                                risk_level: RiskLevel::Medium,
+                                target_uri: uri.to_string(),
+                                destination_uri: None,
+                                category,
+                                base_hash: Some(sha256_hex(content)),
+                                before_content: Some(content.clone()),
+                                after_content: Some(corrected_with_prov),
+                                rationale: format!(
+                                    "[TRANSCRIPT_VERIFY] {}（{}）",
+                                    res.rationale, res.engine_label
+                                ),
+                                evidence_json: json!({
+                                    "source": "transcript_verify",
+                                    "reflector": res.engine_label,
+                                    "confidence": res.confidence,
+                                    "transcript_excerpt": transcript_excerpt.chars().take(600).collect::<String>(),
+                                })
+                                .to_string(),
+                                status: ReviewStatus::Pending,
+                            };
+                            db.insert_pending_change_for_profile(&profile_key, &change)?;
+                            staged.push(change);
+                            counts["transcript_verify"] =
+                                json!(counts["transcript_verify"].as_u64().unwrap_or(0) + 1);
+                        }
+                    }
+                }
+            }
+
+            // 2. Semantic conflict & dedupe merger (strictly mutable categories only; incremental when enabled)
+            if policy.lifecycle.dreaming.dedupe_and_merge
+                && policy.lifecycle.is_mutable(category)
+                && is_recently_changed_or_hit
+            {
+                if let Some(content) = cached_content.clone() {
                     let snippet: String = content.chars().take(240).collect();
                     if snippet.trim().len() >= 20 {
                         let scope = format!("{USER_MEMORIES_URI}{}/", category.as_str());
@@ -443,6 +678,12 @@ pub async fn run_dreaming(
         }
     }
     counts["auto_applied"] = json!(auto_applied_count);
+    let _ = db.set_kv(&last_run_at_key, &now.to_string());
+    if let Ok(max_seq) = db.max_committed_outbox_seq_for_profile(&profile_key) {
+        if max_seq > last_outbox_seq {
+            let _ = db.set_kv(&last_outbox_seq_key, &max_seq.to_string());
+        }
+    }
     db.finalize_dreaming_run(&profile_key, &run_id, &counts.to_string())
 }
 
@@ -713,7 +954,17 @@ async fn execute_change(
                 .destination_uri
                 .as_deref()
                 .ok_or("missing destination_uri")?;
-            client.mv(&change.target_uri, dest).await
+            match client.mv(&change.target_uri, dest).await {
+                Ok(response) => {
+                    if change.action == ChangeAction::Archive {
+                        if let Some(stamped) = change.after_content.as_deref() {
+                            let _ = client.write_content(dest, stamped).await;
+                        }
+                    }
+                    Ok(response)
+                }
+                Err(err) => Err(err),
+            }
         }
         ChangeAction::WikiCompile => {
             let dest = change
@@ -1003,4 +1254,19 @@ fn stamp_index_priority_high(raw: &str) -> String {
         }
     }
     format!("---\nindex_priority: high\n---\n{}", raw)
+}
+
+fn build_transcript_excerpt(
+    rows: &[crate::dreaming::db::CommittedTranscriptRow],
+    max_chars: usize,
+) -> String {
+    let mut out = String::new();
+    for row in rows {
+        let line = format!("[{}:{}] {}\n", row.session_key.chars().take(8).collect::<String>(), row.role, row.content.trim());
+        if out.chars().count() + line.chars().count() > max_chars {
+            break;
+        }
+        out.push_str(&line);
+    }
+    out
 }

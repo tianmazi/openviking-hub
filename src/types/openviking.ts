@@ -124,6 +124,8 @@ export interface PolicyConfig {
       stale_days: number;
       min_hit_count: number;
       archive_uri: string;
+      respect_ttl_expiry?: boolean;
+      episode_default_ttl_days?: number;
     };
     dreaming: {
       enabled: boolean;
@@ -132,6 +134,11 @@ export interface PolicyConfig {
       session_threshold: number;
       dedupe_and_merge: boolean;
       promote_hot_notes: boolean;
+      demote_cold_index?: boolean;
+      demote_stale_days?: number;
+      max_index_entry_bytes?: number;
+      incremental_mode?: boolean;
+      verify_against_transcripts?: boolean;
       compile_wiki: boolean;
       auto_snapshot_before_run: boolean;
       require_human_review: boolean;

@@ -48,12 +48,42 @@ const RELATION_LABELS: Record<string, string> = {
   DERIVES: "推导结论",
 };
 
-function parseRelation(evidenceJson: string): string | null {
+const SOURCE_BADGES: Record<string, { label: string; cls: string }> = {
+  transcript_verify: {
+    label: "转录核验",
+    cls: "bg-sky-500/15 text-sky-300 border border-sky-500/25",
+  },
+  ttl_expired: {
+    label: "TTL 到期",
+    cls: "bg-orange-500/15 text-orange-300 border border-orange-500/25",
+  },
+  index_demoter: {
+    label: "索引瘦身",
+    cls: "bg-teal-500/15 text-teal-300 border border-teal-500/25",
+  },
+};
+
+function parseEvidenceMeta(evidenceJson: string): {
+  relation: string | null;
+  source: string | null;
+  transcriptExcerpt: string | null;
+  expiresAt: string | null;
+} {
   try {
-    const parsed = JSON.parse(evidenceJson) as { relation?: string };
-    return parsed.relation ?? null;
+    const parsed = JSON.parse(evidenceJson) as {
+      relation?: string;
+      source?: string;
+      transcript_excerpt?: string;
+      expires_at?: string;
+    };
+    return {
+      relation: parsed.relation ?? null,
+      source: parsed.source ?? null,
+      transcriptExcerpt: parsed.transcript_excerpt ?? null,
+      expiresAt: parsed.expires_at ?? null,
+    };
   } catch {
-    return null;
+    return { relation: null, source: null, transcriptExcerpt: null, expiresAt: null };
   }
 }
 
@@ -283,7 +313,8 @@ export function DreamingWorkbench({
             { id: "merge", label: "冲突合并" },
             { id: "move_from_inbox", label: "Inbox 分拣" },
             { id: "promote_to_index", label: "热记忆晋升" },
-            { id: "archive", label: "冷记忆归档" },
+            { id: "demote_from_index", label: "索引降级" },
+            { id: "archive", label: "冷记忆/TTL归档" },
             { id: "wiki_compile", label: "Wiki 编译" },
           ].map((f) => (
             <button
@@ -375,12 +406,22 @@ export function DreamingWorkbench({
                       {RISK_BADGES[item.risk_level]?.label ?? item.risk_level}
                     </span>
                     {(() => {
-                      const rel = parseRelation(item.evidence_json);
-                      return rel ? (
-                        <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-violet-500/15 text-violet-300">
-                          {RELATION_LABELS[rel] ?? rel}
-                        </span>
-                      ) : null;
+                      const meta = parseEvidenceMeta(item.evidence_json);
+                      const srcBadge = meta.source ? SOURCE_BADGES[meta.source] : null;
+                      return (
+                        <>
+                          {meta.relation && (
+                            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-violet-500/15 text-violet-300">
+                              {RELATION_LABELS[meta.relation] ?? meta.relation}
+                            </span>
+                          )}
+                          {srcBadge && (
+                            <span className={`text-[10px] px-1.5 py-0.5 rounded ${srcBadge.cls}`}>
+                              {srcBadge.label}
+                            </span>
+                          )}
+                        </>
+                      );
                     })()}
                   </div>
                   <span
@@ -446,6 +487,24 @@ export function DreamingWorkbench({
                   </div>
                 </div>
                 <p className="text-xs text-zinc-400">{selected.rationale}</p>
+                {(() => {
+                  const meta = parseEvidenceMeta(selected.evidence_json);
+                  return (
+                    <>
+                      {meta.expiresAt && (
+                        <div className="text-[11px] font-mono text-orange-300/90 bg-orange-500/10 border border-orange-500/20 rounded-md px-2.5 py-1">
+                          TTL 到期时间：{meta.expiresAt}
+                        </div>
+                      )}
+                      {meta.transcriptExcerpt && (
+                        <div className="text-[11px] font-mono text-sky-200/90 bg-sky-500/10 border border-sky-500/20 rounded-md px-2.5 py-1.5 whitespace-pre-wrap max-h-24 overflow-y-auto">
+                          关联本地转录证据：{"\n"}
+                          {meta.transcriptExcerpt}
+                        </div>
+                      )}
+                    </>
+                  );
+                })()}
               </div>
 
               <div className="flex-1 overflow-y-auto p-5">

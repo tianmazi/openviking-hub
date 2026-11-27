@@ -360,6 +360,8 @@ pub struct ArchivalPolicy {
     pub stale_days: u32,
     pub min_hit_count: u32,
     pub archive_uri: String,
+    pub respect_ttl_expiry: bool,
+    pub episode_default_ttl_days: u32,
 }
 
 impl Default for ArchivalPolicy {
@@ -369,6 +371,8 @@ impl Default for ArchivalPolicy {
             stale_days: 45,
             min_hit_count: 1,
             archive_uri: "viking://~/archive/".to_string(),
+            respect_ttl_expiry: true,
+            episode_default_ttl_days: 0,
         }
     }
 }
@@ -390,6 +394,11 @@ pub struct DreamingPolicy {
     pub session_threshold: u32,
     pub dedupe_and_merge: bool,
     pub promote_hot_notes: bool,
+    pub demote_cold_index: bool,
+    pub demote_stale_days: u32,
+    pub max_index_entry_bytes: usize,
+    pub incremental_mode: bool,
+    pub verify_against_transcripts: bool,
     pub compile_wiki: bool,
     pub auto_snapshot_before_run: bool,
     pub require_human_review: bool,
@@ -410,6 +419,11 @@ impl Default for DreamingPolicy {
             session_threshold: 10,
             dedupe_and_merge: true,
             promote_hot_notes: true,
+            demote_cold_index: true,
+            demote_stale_days: 21,
+            max_index_entry_bytes: 2048,
+            incremental_mode: true,
+            verify_against_transcripts: true,
             compile_wiki: true,
             auto_snapshot_before_run: true,
             require_human_review: true,

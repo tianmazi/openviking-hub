@@ -188,20 +188,31 @@ pub(crate) async fn execute_hook(
             }
             sections.push(toc);
 
-            // 3. Recent Context (only included when actual peer memory exists)
-            if !recent_peer_l0.trim().is_empty() {
-                sections.push(format!(
-                    "## [Recent Project Context]\n{}",
-                    recent_peer_l0.trim()
-                ));
+            let now_ts = chrono::Utc::now().timestamp();
+            // 3. Recent Context (only included when actual active peer memory exists)
+            if !recent_peer_l0.trim().is_empty()
+                && !ov_core::provenance::is_superseded(&recent_peer_l0)
+                && !ov_core::provenance::is_expired(&recent_peer_l0, now_ts)
+            {
+                let rendered = compact_startup_entry(
+                    &recent_peer_l0,
+                    peer_mem_uri.as_deref().unwrap_or("peer"),
+                    policy.lifecycle.dreaming.max_index_entry_bytes,
+                );
+                sections.push(format!("## [Recent Project Context]\n{}", rendered));
             }
 
             // 4. User Profile (Recency Advantage)
-            if !user_mem_l0.trim().is_empty() {
-                sections.push(format!(
-                    "## [User Profile & Preferences]\n{}",
-                    user_mem_l0.trim()
-                ));
+            if !user_mem_l0.trim().is_empty()
+                && !ov_core::provenance::is_superseded(&user_mem_l0)
+                && !ov_core::provenance::is_expired(&user_mem_l0, now_ts)
+            {
+                let rendered = compact_startup_entry(
+                    &user_mem_l0,
+                    &route.target_memory_uri,
+                    policy.lifecycle.dreaming.max_index_entry_bytes,
+                );
+                sections.push(format!("## [User Profile & Preferences]\n{}", rendered));
             }
 
             let combined = sections.join("\n\n");
@@ -380,4 +391,18 @@ fn build_session_aware_query(
     }
     let capped_ctx: String = ctx.chars().take(300).collect();
     format!("{capped_ctx}\n{trimmed}")
+}
+
+fn compact_startup_entry(raw: &str, uri: &str, max_entry_bytes: usize) -> String {
+    let trimmed = raw.trim();
+    if max_entry_bytes == 0 || trimmed.len() <= max_entry_bytes {
+        return trimmed.to_string();
+    }
+    let first_line = trimmed
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && *line != "---")
+        .unwrap_or("Memory summary");
+    let preview: String = first_line.chars().take(120).collect();
+    format!("- {} (index link: `{}` — use `read_uri` for full details)", preview, uri)
 }

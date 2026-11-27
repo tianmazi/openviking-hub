@@ -37,6 +37,14 @@ pub struct RecallEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommittedTranscriptRow {
+    pub seq: i64,
+    pub session_key: String,
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UriHitStat {
     pub uri: String,
     pub hit_count: u32,
@@ -713,6 +721,49 @@ impl DesktopDb {
         Ok(())
     }
 
+    pub fn recent_committed_transcripts_for_profile(
+        &self,
+        profile_key: &str,
+        since_seq: i64,
+        limit: usize,
+    ) -> Result<Vec<CommittedTranscriptRow>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT seq, session_key, role, content
+                 FROM capture_outbox
+                 WHERE profile_key = ?1 AND state = 'committed' AND seq > ?2 AND content != ''
+                 ORDER BY seq ASC
+                 LIMIT ?3",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![profile_key, since_seq, limit as i64], |r| {
+                Ok(CommittedTranscriptRow {
+                    seq: r.get(0)?,
+                    session_key: r.get(1)?,
+                    role: r.get(2)?,
+                    content: r.get(3)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| e.to_string())?);
+        }
+        Ok(out)
+    }
+
+    pub fn max_committed_outbox_seq_for_profile(&self, profile_key: &str) -> Result<i64, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM capture_outbox WHERE profile_key = ?1 AND state = 'committed'",
+            params![profile_key],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())
+    }
+
     /// Recover claims left stuck in `applying` after an unexpected app exit.
     pub fn recover_stale_claims(&self) -> Result<usize, String> {
         let mut conn = self.lock_conn()?;
@@ -1045,5 +1096,29 @@ mod tests {
         assert!(db.claim_schedule_slot("a", 101).unwrap());
         db.set_kv("example", "value").unwrap();
         assert_eq!(db.get_kv("example").unwrap().as_deref(), Some("value"));
+    }
+
+    #[test]
+    fn recent_committed_transcripts_excludes_skipped_privacy_rows() {
+        let db = DesktopDb::open_in_memory().unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO capture_outbox (profile_key, session_key, event_key, role, content, state) VALUES
+                 ('p1', 'sess-1', 'e1', 'user', 'We switched to Rust 1.85', 'committed'),
+                 ('p1', 'sess-1', 'e2', 'user', 'Private secret turn', 'skipped'),
+                 ('p1', 'sess-1', 'e3', 'assistant', 'Confirmed Cargo.toml uses 1.85', 'committed'),
+                 ('p2', 'sess-2', 'e4', 'user', 'Other profile message', 'committed')",
+                [],
+            )
+            .unwrap();
+        }
+        let rows = db.recent_committed_transcripts_for_profile("p1", 0, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| !r.content.contains("Private")));
+        let max_seq = db.max_committed_outbox_seq_for_profile("p1").unwrap();
+        assert_eq!(max_seq, rows.last().unwrap().seq);
+        let next = db.recent_committed_transcripts_for_profile("p1", max_seq, 10).unwrap();
+        assert!(next.is_empty());
     }
 }

@@ -659,6 +659,140 @@ export function PolicyView({ policy, onSave }: PolicyViewProps) {
             />
             定期触发 Wiki 编译（POST /api/v1/compile）
           </label>
+          <label className="inline-flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={draft.lifecycle.dreaming.demote_cold_index ?? true}
+              onChange={(e) =>
+                setDraft({
+                  ...draft,
+                  lifecycle: {
+                    ...draft.lifecycle,
+                    dreaming: { ...draft.lifecycle.dreaming, demote_cold_index: e.target.checked },
+                  },
+                })
+              }
+            />
+            自动降级冷/超长顶层索引（DemoteFromIndex）
+          </label>
+          <label className="inline-flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={draft.lifecycle.dreaming.incremental_mode ?? true}
+              onChange={(e) =>
+                setDraft({
+                  ...draft,
+                  lifecycle: {
+                    ...draft.lifecycle,
+                    dreaming: { ...draft.lifecycle.dreaming, incremental_mode: e.target.checked },
+                  },
+                })
+              }
+            />
+            增量 Dreaming 扫描（仅比对近期变动或命中笔记）
+          </label>
+          <label className="inline-flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={draft.lifecycle.dreaming.verify_against_transcripts ?? true}
+              onChange={(e) =>
+                setDraft({
+                  ...draft,
+                  lifecycle: {
+                    ...draft.lifecycle,
+                    dreaming: {
+                      ...draft.lifecycle.dreaming,
+                      verify_against_transcripts: e.target.checked,
+                    },
+                  },
+                })
+              }
+            />
+            对照本地已提交对话日志做事实验证（Ground-Truth 纠错）
+          </label>
+          <label className="inline-flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={draft.lifecycle.archival.respect_ttl_expiry ?? true}
+              onChange={(e) =>
+                setDraft({
+                  ...draft,
+                  lifecycle: {
+                    ...draft.lifecycle,
+                    archival: { ...draft.lifecycle.archival, respect_ttl_expiry: e.target.checked },
+                  },
+                })
+              }
+            />
+            启用事件 TTL 到期立即拦截与归档（expires_at）
+          </label>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
+          <div className="space-y-1.5">
+            <label className="text-zinc-400">索引降级未命中天数</label>
+            <input
+              type="number"
+              min={3}
+              value={draft.lifecycle.dreaming.demote_stale_days ?? 21}
+              onChange={(e) =>
+                setDraft({
+                  ...draft,
+                  lifecycle: {
+                    ...draft.lifecycle,
+                    dreaming: {
+                      ...draft.lifecycle.dreaming,
+                      demote_stale_days: Math.max(1, Number(e.target.value)),
+                    },
+                  },
+                })
+              }
+              className="w-full bg-surface-2 border border-border-subtle rounded-lg px-3 py-2 font-mono text-zinc-200"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <label className="text-zinc-400">顶层单条索引字节上限</label>
+            <input
+              type="number"
+              min={256}
+              step={256}
+              value={draft.lifecycle.dreaming.max_index_entry_bytes ?? 2048}
+              onChange={(e) =>
+                setDraft({
+                  ...draft,
+                  lifecycle: {
+                    ...draft.lifecycle,
+                    dreaming: {
+                      ...draft.lifecycle.dreaming,
+                      max_index_entry_bytes: Math.max(0, Number(e.target.value)),
+                    },
+                  },
+                })
+              }
+              className="w-full bg-surface-2 border border-border-subtle rounded-lg px-3 py-2 font-mono text-zinc-200"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <label className="text-zinc-400">Events 默认 TTL 天数（0=不强制）</label>
+            <input
+              type="number"
+              min={0}
+              value={draft.lifecycle.archival.episode_default_ttl_days ?? 0}
+              onChange={(e) =>
+                setDraft({
+                  ...draft,
+                  lifecycle: {
+                    ...draft.lifecycle,
+                    archival: {
+                      ...draft.lifecycle.archival,
+                      episode_default_ttl_days: Math.max(0, Number(e.target.value)),
+                    },
+                  },
+                })
+              }
+              className="w-full bg-surface-2 border border-border-subtle rounded-lg px-3 py-2 font-mono text-zinc-200"
+            />
+          </div>
         </div>
 
         <div className="pt-3 border-t border-border-subtle space-y-3">

@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -14,6 +14,10 @@ pub struct MemoryProvenance {
     pub scope: String,
     pub status: String,
     pub superseded_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
     pub evidence_uris: Vec<String>,
 }
 
@@ -30,6 +34,8 @@ impl MemoryProvenance {
             scope: scope.to_string(),
             status: "active".to_string(),
             superseded_by: None,
+            event_time: None,
+            expires_at: None,
             evidence_uris: Vec::new(),
         }
     }
@@ -142,6 +148,18 @@ fn parse_provenance(yaml_block: &str) -> Option<MemoryProvenance> {
                 }
                 found_any = true;
             }
+            "event_time" => {
+                if !val.is_empty() {
+                    prov.event_time = Some(val);
+                }
+                found_any = true;
+            }
+            "expires_at" => {
+                if !val.is_empty() {
+                    prov.expires_at = Some(val);
+                }
+                found_any = true;
+            }
             "evidence_uris" => {
                 found_any = true;
                 if val.is_empty() {
@@ -177,6 +195,12 @@ pub(crate) fn render_frontmatter(yaml: Option<&str>, body: &str, next: &MemoryPr
         if !existing.created_at.is_empty() && existing.created_at != "unknown" {
             merged.created_at = existing.created_at;
         }
+        if merged.event_time.is_none() {
+            merged.event_time = existing.event_time;
+        }
+        if merged.expires_at.is_none() {
+            merged.expires_at = existing.expires_at;
+        }
         let mut set: BTreeSet<String> = existing.evidence_uris.into_iter().collect();
         for u in next.evidence_uris.iter() {
             set.insert(u.clone());
@@ -196,6 +220,12 @@ pub(crate) fn render_frontmatter(yaml: Option<&str>, body: &str, next: &MemoryPr
     out.push_str(&format!("status: {}\n", yaml_scalar(&merged.status)));
     if let Some(ref sup) = merged.superseded_by {
         out.push_str(&format!("superseded_by: {}\n", yaml_scalar(sup)));
+    }
+    if let Some(ref event_time) = merged.event_time {
+        out.push_str(&format!("event_time: {}\n", yaml_scalar(event_time)));
+    }
+    if let Some(ref expires_at) = merged.expires_at {
+        out.push_str(&format!("expires_at: {}\n", yaml_scalar(expires_at)));
     }
     if merged.evidence_uris.is_empty() {
         out.push_str("evidence_uris: []\n");
@@ -225,6 +255,8 @@ pub(crate) fn render_frontmatter(yaml: Option<&str>, body: &str, next: &MemoryPr
                         | "scope"
                         | "status"
                         | "superseded_by"
+                        | "event_time"
+                        | "expires_at"
                         | "evidence_uris"
                 )
             });
@@ -253,6 +285,83 @@ pub fn stamp_superseded(raw: &str, superseded_by_uri: &str) -> String {
 
 pub fn is_superseded(raw: &str) -> bool {
     matches!(parse_frontmatter(raw), (Some(prov), _) if prov.status.eq_ignore_ascii_case("superseded"))
+}
+
+/// Check whether a memory is expired via explicit `status: expired` or an RFC3339 `expires_at` timestamp <= `now_ts`.
+pub fn is_expired(raw: &str, now_ts: i64) -> bool {
+    let (Some(prov), _) = parse_frontmatter(raw) else {
+        return false;
+    };
+    if prov.status.eq_ignore_ascii_case("expired") {
+        return true;
+    }
+    prov.expires_at
+        .as_deref()
+        .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+        .is_some_and(|dt| dt.timestamp() <= now_ts)
+}
+
+/// Mark an expired episodic memory with `status: expired` while preserving provenance & custom frontmatter.
+pub fn stamp_expired(raw: &str) -> String {
+    let (existing_opt, _) = parse_frontmatter(raw);
+    let mut prov =
+        existing_opt.unwrap_or_else(|| MemoryProvenance::new("dreaming", "shared", false, 0.5));
+    prov.status = "expired".to_string();
+    prov.updated_at = Utc::now().to_rfc3339();
+    prov.updated_by = "dreaming:ttl_expiry".to_string();
+    render_with_provenance(raw, &prov)
+}
+
+/// Check whether a memory's YAML frontmatter carries `index_priority: high`.
+pub fn has_index_priority_high(raw: &str) -> bool {
+    let (Some(yaml), _) = split_frontmatter(raw) else {
+        return false;
+    };
+    yaml.lines().any(|line| {
+        if line != line.trim_start() {
+            return false;
+        }
+        line.split_once(':').is_some_and(|(k, v)| {
+            unquote(k).eq_ignore_ascii_case("index_priority")
+                && unquote(v).eq_ignore_ascii_case("high")
+        })
+    })
+}
+
+/// Demote a memory's `index_priority` from `high` to `normal` while updating provenance timestamp.
+pub fn stamp_index_priority_normal(raw: &str) -> String {
+    let (existing_opt, _) = parse_frontmatter(raw);
+    let mut prov =
+        existing_opt.unwrap_or_else(|| MemoryProvenance::new("dreaming", "shared", false, 0.5));
+    prov.updated_at = Utc::now().to_rfc3339();
+    prov.updated_by = "dreaming:demote".to_string();
+
+    let (yaml_opt, body) = split_frontmatter(raw);
+    let updated_yaml = match yaml_opt {
+        Some(yaml) => {
+            let mut replaced = false;
+            let mut lines: Vec<String> = Vec::new();
+            for line in yaml.lines() {
+                if line == line.trim_start()
+                    && line
+                        .split_once(':')
+                        .is_some_and(|(k, _)| unquote(k).eq_ignore_ascii_case("index_priority"))
+                {
+                    lines.push("index_priority: normal".to_string());
+                    replaced = true;
+                } else {
+                    lines.push(line.to_string());
+                }
+            }
+            if !replaced {
+                lines.push("index_priority: normal".to_string());
+            }
+            Some(lines.join("
+"))
+        }
+        None => Some("index_priority: normal".to_string()),
+    };
+    render_frontmatter(updated_yaml.as_deref(), body, &prov)
 }
 
 /// Write-Gate check: only memories explicitly marked `verified: true` in provenance
@@ -407,5 +516,51 @@ mod tests {
         assert!(wrapped.contains("readonly=\"true\""));
         assert!(wrapped.contains("DATA-PLANE BOUNDARY"));
         assert!(wrapped.ends_with("</openviking_memory_reference>"));
+    }
+
+    #[test]
+    fn test_ttl_expiry_and_stamp_expired() {
+        let past_doc = "---
+source_agent: codex
+status: active
+event_time: 2026-01-01T09:00:00Z
+expires_at: 2026-01-02T09:00:00Z
+---
+Meeting at 3pm tomorrow.";
+        let now_ts = chrono::DateTime::parse_from_rfc3339("2026-01-03T00:00:00Z")
+            .unwrap()
+            .timestamp();
+        let before_ts = chrono::DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
+            .unwrap()
+            .timestamp();
+        assert!(is_expired(past_doc, now_ts));
+        assert!(!is_expired(past_doc, before_ts));
+
+        let stamped = stamp_expired(past_doc);
+        assert!(is_expired(&stamped, before_ts));
+        let (prov, body) = parse_frontmatter(&stamped);
+        let prov = prov.unwrap();
+        assert_eq!(prov.status, "expired");
+        assert_eq!(prov.event_time.as_deref(), Some("2026-01-01T09:00:00Z"));
+        assert_eq!(prov.expires_at.as_deref(), Some("2026-01-02T09:00:00Z"));
+        assert_eq!(body.trim(), "Meeting at 3pm tomorrow.");
+    }
+
+    #[test]
+    fn test_index_priority_high_and_demote_normal() {
+        let promoted = "---
+source_agent: claude-code
+verified: true
+index_priority: high
+---
+# Core Rule
+Always run tests.";
+        assert!(has_index_priority_high(promoted));
+        let demoted = stamp_index_priority_normal(promoted);
+        assert!(!has_index_priority_high(&demoted));
+        assert!(demoted.contains("index_priority: normal"));
+        let (prov, body) = parse_frontmatter(&demoted);
+        assert_eq!(prov.unwrap().updated_by, "dreaming:demote");
+        assert!(body.contains("Always run tests."));
     }
 }

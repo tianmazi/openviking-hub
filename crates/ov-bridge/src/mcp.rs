@@ -393,10 +393,10 @@ pub(crate) async fn call_tool(
 #[derive(Debug)]
 pub(crate) struct RecallCandidate {
     pub(crate) uri: String,
-    score: f64,
-    title: String,
-    category: Option<MemoryCategory>,
-    snippet: String,
+    pub(crate) score: f64,
+    pub(crate) title: String,
+    pub(crate) category: Option<MemoryCategory>,
+    pub(crate) snippet: String,
 }
 
 fn filter_private_entries(value: &mut Value, policy: &PolicyConfig, agent: AgentId) {
@@ -587,11 +587,16 @@ pub(crate) async fn render_recall(
     category_quotas: &std::collections::HashMap<MemoryCategory, usize>,
     limit: Option<usize>,
 ) -> (String, String, Vec<(String, f64, bool)>) {
+    let now_ts = chrono::Utc::now().timestamp();
     let ranked: Vec<RecallCandidate> = rank_candidates(candidates)
         .into_iter()
         .filter(|item| {
+            let lower = item.snippet.to_ascii_lowercase();
             item.score >= budget.min_recall_score as f64
-                && !item.snippet.to_ascii_lowercase().contains("status: superseded")
+                && !lower.contains("status: superseded")
+                && !lower.contains("status: expired")
+                && !ov_core::provenance::is_superseded(&item.snippet)
+                && !ov_core::provenance::is_expired(&item.snippet, now_ts)
         })
         .collect();
     let ifc_overhead = 240usize;
@@ -621,7 +626,10 @@ pub(crate) async fn render_recall(
                     .or_else(|| value["text"].as_str())
                     .unwrap_or_default()
                     .trim();
-                if !content.is_empty() {
+                if !content.is_empty()
+                    && !ov_core::provenance::is_superseded(content)
+                    && !ov_core::provenance::is_expired(content, now_ts)
+                {
                     let heading = if selected == ContextLayer::L1 {
                         "Auto-Expanded L1 Overview"
                     } else {
