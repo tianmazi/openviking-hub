@@ -1,4 +1,4 @@
-use crate::fs_util::atomic_write_with_mode;
+use crate::fs_util::{atomic_write_with_mode, cleanup_stale_old_files};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::env;
@@ -71,6 +71,9 @@ impl PlatformPaths {
     /// an already-installed binary exists.
     pub fn ensure_bridge_installed(&self, explicit_source: Option<&Path>) -> Result<PathBuf, String> {
         let dest = self.bridge_binary();
+        if let (Some(bin_dir), Some(name)) = (dest.parent(), dest.file_name().and_then(|n| n.to_str())) {
+            cleanup_stale_old_files(bin_dir, &format!("{name}."));
+        }
         let source = explicit_source
             .map(PathBuf::from)
             .or_else(find_bundled_bridge_binary);

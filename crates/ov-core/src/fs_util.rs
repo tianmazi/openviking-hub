@@ -14,12 +14,13 @@ pub enum FsUtilError {
     InvalidParent,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("failed to persist atomic file: {0}")]
-    Persist(String),
+    #[error("failed to persist atomic file {path}: {reason}")]
+    Persist { path: PathBuf, reason: String },
 }
 
 /// Cross-platform atomic file write with short retry backoff on Windows
-/// (protects against transient antivirus/IDE file locks) and optional 0o600 permissions on Unix.
+/// (protects against transient antivirus/IDE file locks and running-binary replacement)
+/// and optional 0o600 permissions on Unix.
 pub fn atomic_write(target: &Path, content: &[u8], secret_mode: bool) -> Result<(), FsUtilError> {
     atomic_write_with_mode(target, content, secret_mode.then_some(0o600))
 }
@@ -52,8 +53,50 @@ pub(crate) fn atomic_write_with_mode(
         match file.persist(target) {
             Ok(_) => return Ok(()),
             Err(err) => {
+                // On Windows, replacing a running executable (e.g. `ov-bridge.exe` held open
+                // by an active MCP client) or a read-only file returns ERROR_ACCESS_DENIED (os error 5).
+                // Clear read-only flags and try the Windows rename-aside swap (`target` -> `target.<id>.old`).
+                #[cfg(windows)]
+                if err.error.kind() == std::io::ErrorKind::PermissionDenied && target.is_file() {
+                    if let Ok(meta) = fs::metadata(target) {
+                        let mut perms = meta.permissions();
+                        if perms.readonly() {
+                            perms.set_readonly(false);
+                            let _ = fs::set_permissions(target, perms);
+                        }
+                    }
+                    let file_name = target
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("file");
+                    let stale = parent.join(format!("{file_name}.{}.old", Uuid::new_v4().simple()));
+                    if fs::rename(target, &stale).is_ok() {
+                        match err.file.persist(target) {
+                            Ok(_) => {
+                                let _ = fs::remove_file(&stale);
+                                return Ok(());
+                            }
+                            Err(retry_err) => {
+                                let _ = fs::rename(&stale, target);
+                                if attempt == 3 {
+                                    return Err(FsUtilError::Persist {
+                                        path: target.to_path_buf(),
+                                        reason: retry_err.error.to_string(),
+                                    });
+                                }
+                                current_tmp = Some(retry_err.file);
+                                thread::sleep(Duration::from_millis(60 * (attempt as u64 + 1)));
+                                continue;
+                            }
+                        }
+                    }
+                }
+
                 if attempt == 3 {
-                    return Err(FsUtilError::Persist(err.error.to_string()));
+                    return Err(FsUtilError::Persist {
+                        path: target.to_path_buf(),
+                        reason: err.error.to_string(),
+                    });
                 }
                 current_tmp = Some(err.file);
                 thread::sleep(Duration::from_millis(60 * (attempt as u64 + 1)));
@@ -61,6 +104,21 @@ pub(crate) fn atomic_write_with_mode(
         }
     }
     Ok(())
+}
+
+/// Remove leftover `*.old` files created during Windows running-binary swaps (best-effort).
+pub(crate) fn cleanup_stale_old_files(dir: &Path, prefix: &str) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with(prefix) && name.ends_with(".old") {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
 }
 
 /// Create a timestamped backup under `~/.openviking/backups/<agent_id>/` before mutating any config file.
@@ -124,6 +182,18 @@ mod tests {
         let read = fs::read_to_string(&path).unwrap();
         assert_eq!(read, "hello = \"world\"\n");
         assert_eq!(sha256_hex(&read).len(), 64);
+    }
+
+    #[test]
+    fn test_cleanup_stale_old_files() {
+        let dir = tempdir().unwrap();
+        let stale = dir.path().join("ov-bridge.exe.abc123.old");
+        let keep = dir.path().join("ov-bridge.exe");
+        fs::write(&stale, "old").unwrap();
+        fs::write(&keep, "live").unwrap();
+        cleanup_stale_old_files(dir.path(), "ov-bridge.exe.");
+        assert!(!stale.exists());
+        assert!(keep.exists());
     }
 
     #[test]
