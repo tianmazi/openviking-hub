@@ -2666,7 +2666,7 @@ dependencies = [
 
 [[package]]
 name = "openviking-desktop"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "chrono",
  "cron",
@@ -2714,7 +2714,7 @@ dependencies = [
 
 [[package]]
 name = "ov-bridge"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2729,7 +2729,7 @@ dependencies = [
 
 [[package]]
 name = "ov-core"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "chrono",
  "cron",

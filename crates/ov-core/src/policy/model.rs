@@ -111,6 +111,8 @@ pub struct BudgetPolicy {
     pub default_recall_layer: ContextLayer,
     pub auto_expand_l1_threshold: f32,
     pub max_recall_tokens: usize,
+    pub min_recall_score: f32,
+    pub max_recall_items: usize,
     pub category_quotas: HashMap<MemoryCategory, usize>,
     pub agent_overrides: HashMap<AgentId, AgentBudgetOverride>,
 }
@@ -169,6 +171,8 @@ impl Default for BudgetPolicy {
             default_recall_layer: ContextLayer::L0,
             auto_expand_l1_threshold: 0.80,
             max_recall_tokens: 2000,
+            min_recall_score: 0.60,
+            max_recall_items: 3,
             category_quotas,
             agent_overrides,
         }
@@ -278,6 +282,8 @@ pub struct EffectiveBudget {
     pub startup_max_bytes: usize,
     pub default_recall_layer: ContextLayer,
     pub max_recall_tokens: usize,
+    pub min_recall_score: f32,
+    pub max_recall_items: usize,
     pub auto_expand_l1_threshold: f32,
 }
 
@@ -298,6 +304,8 @@ impl BudgetPolicy {
                 .and_then(|o| o.max_recall_tokens)
                 .unwrap_or(self.max_recall_tokens),
             auto_expand_l1_threshold: self.auto_expand_l1_threshold,
+            min_recall_score: self.min_recall_score,
+            max_recall_items: self.max_recall_items,
         }
     }
 }

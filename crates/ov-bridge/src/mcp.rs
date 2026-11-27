@@ -587,7 +587,13 @@ pub(crate) async fn render_recall(
     category_quotas: &std::collections::HashMap<MemoryCategory, usize>,
     limit: Option<usize>,
 ) -> (String, String, Vec<(String, f64, bool)>) {
-    let ranked = rank_candidates(candidates);
+    let ranked: Vec<RecallCandidate> = rank_candidates(candidates)
+        .into_iter()
+        .filter(|item| {
+            item.score >= budget.min_recall_score as f64
+                && !item.snippet.to_ascii_lowercase().contains("status: superseded")
+        })
+        .collect();
     let ifc_overhead = 240usize;
     let total_max = budget.max_recall_tokens.saturating_mul(4).saturating_sub(ifc_overhead);
 
@@ -659,9 +665,10 @@ pub(crate) async fn render_recall(
 
     let mut text = String::new();
     let mut hits = Vec::new();
-    let mut injected_count = 0usize;
     let mut cat_used: std::collections::HashMap<MemoryCategory, usize> =
         std::collections::HashMap::new();
+    let mut injected_count = 0usize;
+    let max_items = budget.max_recall_items.max(1);
 
     for (index, item) in ranked.into_iter().enumerate() {
         let formatted = format_candidate(&item, index != 0 || !top_summary_only);
@@ -679,7 +686,7 @@ pub(crate) async fn render_recall(
             }
             None => true,
         };
-        let injected = within_limit && within_category_quota && text.len() + entry_len <= list_budget;
+        let injected = within_limit && injected_count < max_items && within_category_quota && text.len() + entry_len <= list_budget;
         if injected {
             injected_count += 1;
             if !text.is_empty() {

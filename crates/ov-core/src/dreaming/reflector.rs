@@ -43,6 +43,7 @@ pub async fn reflect_merge(
          - EXTENDS: complementary facts; combine both without discarding existing valid rules.\n\
          - CONFLICTS: direct contradiction that requires human review; keep BOTH positions clearly labeled under a conflict note.\n\
          - DERIVES: higher-level inferred pattern from both notes.\n\
+         Also discard ephemeral one-off states (temporary counters, single-run error line numbers) and distill reusable procedural steps & rules.\n\
          Respond with ONLY a valid JSON object:\n\
          {{\"relation\": \"DUPLICATES|UPDATES|EXTENDS|CONFLICTS|DERIVES\", \"merged_content\": \"Markdown body without YAML frontmatter\", \"rationale\": \"short explanation in input language\", \"confidence\": 0.90}}\n\n\
          [Primary URI: {}]\n{}\n\n\

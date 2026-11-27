@@ -74,6 +74,8 @@ let previewPolicy: PolicyConfig = {
     default_recall_layer: "l0",
     auto_expand_l1_threshold: 0.8,
     max_recall_tokens: 2000,
+    min_recall_score: 0.6,
+    max_recall_items: 3,
     category_quotas: {
       profile: 200,
       preferences: 500,

@@ -7,7 +7,7 @@ use crate::policy::model::{
 };
 use crate::policy::router::{is_protected_rule_path, USER_MEMORIES_URI};
 use crate::provenance::{
-    is_write_gate_verified, render_frontmatter, split_frontmatter, MemoryProvenance,
+    is_write_gate_verified, render_frontmatter, split_frontmatter, stamp_superseded, MemoryProvenance,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -690,6 +690,12 @@ async fn execute_change(
                         )),
                     };
                 }
+                if let Ok(ev) = serde_json::from_str::<Value>(&change.evidence_json) {
+                    if let Some(peer_before) = ev.get("peer_before_content").and_then(Value::as_str) {
+                        let superseded = stamp_superseded(peer_before, &change.target_uri);
+                        let _ = client.write_content(archive, &superseded).await;
+                    }
+                }
                 Ok(response)
             } else {
                 client.write_content(&change.target_uri, &body).await
@@ -783,13 +789,20 @@ async fn rollback_change(
             if primary_res.is_ok() {
                 let evidence = serde_json::from_str(&change.evidence_json).unwrap_or(Value::Null);
                 if let Some((peer_uri, archive_uri)) = archived_peer(change, &evidence) {
-                    if let Err(error) = client.mv(archive_uri, peer_uri).await {
-                        let content = evidence["peer_before_content"].as_str().ok_or_else(|| error.to_string())?;
-                        client.write_content(peer_uri, content).await
-                            .map_err(|e| format!("Could not restore merge peer {peer_uri}: {e}"))?;
-                        match client.delete_fs(archive_uri, false).await {
-                            Err(error) if !is_not_found(&error) => return Err(error.to_string()),
-                            _ => {}
+                    match client.mv(archive_uri, peer_uri).await {
+                        Ok(_) => {
+                            if let Some(content) = evidence["peer_before_content"].as_str() {
+                                let _ = client.write_content(peer_uri, content).await;
+                            }
+                        }
+                        Err(error) => {
+                            let content = evidence["peer_before_content"].as_str().ok_or_else(|| error.to_string())?;
+                            client.write_content(peer_uri, content).await
+                                .map_err(|e| format!("Could not restore merge peer {peer_uri}: {e}"))?;
+                            match client.delete_fs(archive_uri, false).await {
+                                Err(error) if !is_not_found(&error) => return Err(error.to_string()),
+                                _ => {}
+                            }
                         }
                     }
                 }

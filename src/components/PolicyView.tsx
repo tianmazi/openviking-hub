@@ -316,6 +316,48 @@ export function PolicyView({ policy, onSave }: PolicyViewProps) {
       {/* 2. Tiered Token Budget + Six-Category Quotas & Mutability */}
       <section className="rounded-xl bg-surface-1 border border-border-subtle p-5 space-y-5">
         <h2 className="text-sm font-semibold text-zinc-100">2. 分层注入与按 Agent Token 预算</h2>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+          <div className="p-3 rounded-lg bg-surface-2 border border-border-subtle flex items-center justify-between gap-3">
+            <div>
+              <div className="font-medium text-zinc-200">最低召回相似度门控（宁缺毋滥）</div>
+              <div className="text-[11px] text-zinc-400">低于此分数的松散匹配直接跳过，避免上下文噪音</div>
+            </div>
+            <input
+              type="number"
+              min={0}
+              max={1}
+              step={0.05}
+              value={draft.budget.min_recall_score ?? 0.6}
+              onChange={(e) =>
+                setDraft({
+                  ...draft,
+                  budget: { ...draft.budget, min_recall_score: Number(e.target.value) },
+                })
+              }
+              className="w-20 bg-surface-1 border border-border-subtle rounded px-2 py-1 font-mono text-zinc-200"
+            />
+          </div>
+          <div className="p-3 rounded-lg bg-surface-2 border border-border-subtle flex items-center justify-between gap-3">
+            <div>
+              <div className="font-medium text-zinc-200">单次召回最大条数上限</div>
+              <div className="text-[11px] text-zinc-400">行动型 Agent 建议 1–3 条精准规程，避免多例干扰</div>
+            </div>
+            <input
+              type="number"
+              min={1}
+              max={10}
+              step={1}
+              value={draft.budget.max_recall_items ?? 3}
+              onChange={(e) =>
+                setDraft({
+                  ...draft,
+                  budget: { ...draft.budget, max_recall_items: Math.max(1, Number(e.target.value)) },
+                })
+              }
+              className="w-20 bg-surface-1 border border-border-subtle rounded px-2 py-1 font-mono text-zinc-200"
+            />
+          </div>
+        </div>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           {(Object.keys(AGENT_LABELS) as AgentId[]).map((agentId) => {
             const ov = draft.budget.agent_overrides[agentId] ?? {};
@@ -625,7 +667,7 @@ export function PolicyView({ policy, onSave }: PolicyViewProps) {
               Dreaming 语义反思器（睡眠期提纯引擎）
             </span>
             <span className="text-[11px] text-zinc-500">
-              用于 Inbox 智能项目归类与语义冲突消解（失败时自动降级纯程序模式）
+              建议优先复用本机强模型 CLI（claude / codex）提纯规程记忆；小参数端侧模型建议保持关闭低风险自动执行
             </span>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">

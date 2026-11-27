@@ -12,6 +12,8 @@ pub struct MemoryProvenance {
     pub verified: bool,
     pub confidence: f32,
     pub scope: String,
+    pub status: String,
+    pub superseded_by: Option<String>,
     pub evidence_uris: Vec<String>,
 }
 
@@ -26,6 +28,8 @@ impl MemoryProvenance {
             verified,
             confidence: confidence.clamp(0.0, 1.0),
             scope: scope.to_string(),
+            status: "active".to_string(),
+            superseded_by: None,
             evidence_uris: Vec::new(),
         }
     }
@@ -128,6 +132,16 @@ fn parse_provenance(yaml_block: &str) -> Option<MemoryProvenance> {
                 prov.scope = val;
                 found_any = true;
             }
+            "status" => {
+                prov.status = val;
+                found_any = true;
+            }
+            "superseded_by" => {
+                if !val.is_empty() {
+                    prov.superseded_by = Some(val);
+                }
+                found_any = true;
+            }
             "evidence_uris" => {
                 found_any = true;
                 if val.is_empty() {
@@ -179,6 +193,10 @@ pub(crate) fn render_frontmatter(yaml: Option<&str>, body: &str, next: &MemoryPr
     out.push_str(&format!("verified: {}\n", merged.verified));
     out.push_str(&format!("confidence: {:.2}\n", merged.confidence));
     out.push_str(&format!("scope: {}\n", yaml_scalar(&merged.scope)));
+    out.push_str(&format!("status: {}\n", yaml_scalar(&merged.status)));
+    if let Some(ref sup) = merged.superseded_by {
+        out.push_str(&format!("superseded_by: {}\n", yaml_scalar(sup)));
+    }
     if merged.evidence_uris.is_empty() {
         out.push_str("evidence_uris: []\n");
     } else {
@@ -205,6 +223,8 @@ pub(crate) fn render_frontmatter(yaml: Option<&str>, body: &str, next: &MemoryPr
                         | "verified"
                         | "confidence"
                         | "scope"
+                        | "status"
+                        | "superseded_by"
                         | "evidence_uris"
                 )
             });
@@ -217,6 +237,22 @@ pub(crate) fn render_frontmatter(yaml: Option<&str>, body: &str, next: &MemoryPr
     out.push_str("---\n");
     out.push_str(body.trim_start_matches(['\r', '\n']));
     out
+}
+
+
+/// Mark an older memory as superseded by a newer URI, preserving full causal lineage.
+pub fn stamp_superseded(raw: &str, superseded_by_uri: &str) -> String {
+    let (existing_opt, body) = parse_frontmatter(raw);
+    let mut prov = existing_opt.unwrap_or_else(|| MemoryProvenance::new("dreaming", "shared", false, 0.5));
+    prov.status = "superseded".to_string();
+    prov.superseded_by = Some(superseded_by_uri.to_string());
+    prov.updated_at = Utc::now().to_rfc3339();
+    prov.updated_by = "dreaming:supersede".to_string();
+    render_with_provenance(body, &prov)
+}
+
+pub fn is_superseded(raw: &str) -> bool {
+    matches!(parse_frontmatter(raw), (Some(prov), _) if prov.status.eq_ignore_ascii_case("superseded"))
 }
 
 /// Write-Gate check: only memories explicitly marked `verified: true` in provenance

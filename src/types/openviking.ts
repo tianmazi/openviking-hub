@@ -112,6 +112,8 @@ export interface PolicyConfig {
     default_recall_layer: ContextLayer;
     auto_expand_l1_threshold: number;
     max_recall_tokens: number;
+    min_recall_score: number;
+    max_recall_items: number;
     category_quotas: Record<MemoryCategory, number>;
     agent_overrides: Partial<Record<AgentId, AgentBudgetOverride>>;
   };
