@@ -1232,7 +1232,7 @@ async fn e2e_auto_apply_low_risk_applies_low_and_keeps_medium_high_pending() {
     assert_eq!(merge.status, ReviewStatus::Pending);
 
     state.lock().unwrap().merge_reflector_response =
-        Some(r#"{"relation":"DUPLICATES","merged_content":"# Classified merged note"}"#);
+        Some(r##"{"relation":"DUPLICATES","merged_content":"# Classified merged note"}"##);
     state.lock().unwrap().fail_move_from = Some(PEER);
     let (run, failed) = run_dreaming(&client, &db, &policy, "e2e").await.unwrap();
     let failed_merge = failed.iter().find(|c| c.action == ChangeAction::Merge).unwrap();
