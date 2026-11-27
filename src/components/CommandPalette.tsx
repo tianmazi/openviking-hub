@@ -18,16 +18,7 @@ export function CommandPalette({
   onTogglePrivacy,
 }: CommandPaletteProps) {
   const [query, setQuery] = useState("");
-
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && open) onClose();
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [open, onClose]);
-
-  if (!open) return null;
+  const [activeIndex, setActiveIndex] = useState(0);
 
   const actions = [
     { id: "agents", title: "切换到：本地 Agent 接入（Claude / Codex / pi / Antigravity）", run: () => onSelectTab("agents") },
@@ -38,6 +29,46 @@ export function CommandPalette({
     { id: "run-dream", title: "立即执行一次 Dreaming 后台整理", run: onTriggerDreaming },
     { id: "privacy", title: "切换隐私模式（暂停/恢复自动捕获）", run: onTogglePrivacy },
   ].filter((a) => a.title.toLowerCase().includes(query.toLowerCase()));
+
+  useEffect(() => {
+    setActiveIndex(0);
+  }, [query, open]);
+
+  useEffect(() => {
+    if (!open) {
+      setQuery("");
+      return;
+    }
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  const handleInputKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+    if (e.key === "ArrowDown" && actions.length > 0) {
+      e.preventDefault();
+      setActiveIndex((prev) => (prev + 1) % actions.length);
+    } else if (e.key === "ArrowUp" && actions.length > 0) {
+      e.preventDefault();
+      setActiveIndex((prev) => (prev - 1 + actions.length) % actions.length);
+    } else if (e.key === "Enter" && actions.length > 0) {
+      e.preventDefault();
+      const chosen = actions[Math.min(activeIndex, actions.length - 1)];
+      if (chosen) {
+        chosen.run();
+        onClose();
+      }
+    }
+  };
 
   return (
     <div
@@ -54,6 +85,7 @@ export function CommandPalette({
             autoFocus
             value={query}
             onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={handleInputKeyDown}
             placeholder="输入命令或页面名称..."
             className="w-full bg-transparent text-sm text-zinc-100 placeholder:text-zinc-500 focus:outline-none"
           />
@@ -62,14 +94,20 @@ export function CommandPalette({
           </kbd>
         </div>
         <div className="max-h-72 overflow-y-auto p-1.5">
-          {actions.map((item) => (
+          {actions.map((item, idx) => (
             <button
               key={item.id}
+              onMouseEnter={() => setActiveIndex(idx)}
+              onFocus={() => setActiveIndex(idx)}
               onClick={() => {
                 item.run();
                 onClose();
               }}
-              className="w-full text-left px-3 py-2 rounded-lg text-xs text-zinc-200 hover:bg-indigo-500/15 hover:text-indigo-200 transition-colors"
+              className={`w-full text-left px-3 py-2 rounded-lg text-xs transition-colors ${
+                idx === activeIndex
+                  ? "bg-indigo-500/15 text-indigo-200"
+                  : "text-zinc-200 hover:bg-indigo-500/15 hover:text-indigo-200"
+              }`}
             >
               {item.title}
             </button>

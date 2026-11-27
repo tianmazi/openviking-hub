@@ -165,10 +165,13 @@ impl AgentAdapter for AntigravityAdapter {
             binary_path: desktop_app.or(cli_bin),
             config_path: Some(Self::mcp_config_path(paths)),
             version,
-            warning: Some(
-                "已同步注入全局 mcp_config.json 与 hooks.json（Desktop App / IDE / CLI 共用）。接入后请在 Antigravity App 的 Customizations → Installed → MCP Servers 中点击 Refresh 生效。"
-                    .to_string(),
-            ),
+            warning: Some(if connected {
+                "已同步注入全局 mcp_config.json 与 hooks.json（Desktop App / IDE / CLI 共用）。请在 Antigravity App 的 Customizations → Installed → MCP Servers 中点击 Refresh 生效。"
+                    .to_string()
+            } else {
+                "接入后将自动注入全局 mcp_config.json 与 hooks.json（Desktop App / IDE / CLI 共用）；完成后请在 Antigravity App 的 Customizations → Installed → MCP Servers 中点击 Refresh 生效。"
+                    .to_string()
+            }),
             legacy_memory_files: self.scan_legacy_memories(paths),
         }
     }
@@ -235,7 +238,9 @@ mod tests {
         fs::write(&mcp_path, r#"{"mcpServers":{"user":{"command":"user-mcp"}}}"#).unwrap();
 
         for _ in 0..2 {
-            assert!(adapter.connect(&paths, &opts).unwrap().connected);
+            let status = adapter.connect(&paths, &opts).unwrap();
+            assert!(status.connected);
+            assert!(status.warning.as_deref().unwrap_or_default().contains("已同步注入"));
         }
         let read_hooks = || serde_json::from_str::<Value>(&fs::read_to_string(&path).unwrap()).unwrap();
         let retained = json!({
@@ -253,6 +258,7 @@ mod tests {
 
         let after = adapter.disconnect(&paths).unwrap();
         assert!(!after.connected);
+        assert!(after.warning.as_deref().unwrap_or_default().contains("接入后将自动注入"));
         assert_eq!(read_hooks(), retained);
         assert!(json_path_exists(mcp_path, &["mcpServers", "user"]));
     }

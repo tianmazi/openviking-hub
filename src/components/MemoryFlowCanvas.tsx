@@ -53,7 +53,7 @@ export function MemoryFlowCanvas({
               ? "blocked"
               : latestEvent?.blocked_by_privacy
                 ? "blocked"
-                : latestEvent?.event_type === "capture" || latestEvent?.event_type === "hook_stop"
+                : latestEvent?.event_type.startsWith("capture") || latestEvent?.event_type === "hook_stop"
                   ? "capture"
                   : "recall";
 
@@ -65,7 +65,7 @@ export function MemoryFlowCanvas({
   const rightY = 109;
 
   return (
-    <div className="rounded-xl bg-surface-1 border border-border-subtle p-4 space-y-3 overflow-hidden">
+    <div className="shrink-0 rounded-xl bg-surface-1 border border-border-subtle p-4 space-y-3 overflow-hidden">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <Sparkles className="w-3.5 h-3.5 text-indigo-400" />

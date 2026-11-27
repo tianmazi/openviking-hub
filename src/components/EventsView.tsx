@@ -51,7 +51,7 @@ export function EventsView({ agents, captureEnabled }: EventsViewProps) {
   const totalTokens = events.reduce((acc, e) => acc + e.tokens_used, 0);
 
   return (
-    <div className="h-full flex flex-col p-6 space-y-4 overflow-y-auto">
+    <div className="h-full overflow-y-auto p-6 space-y-4">
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-lg font-semibold text-zinc-100">实时召回事件流与远端观测</h1>

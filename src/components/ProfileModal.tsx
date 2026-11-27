@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { CheckCircle2, Plus, Trash2, Wifi, X, XCircle } from "lucide-react";
 import { api } from "../lib/tauri";
 import type { OvProfile, ProfileStore, ServerStatus } from "../types/openviking";
@@ -19,6 +19,26 @@ export function ProfileModal({ open, store, onClose, onSaveStore }: ProfileModal
   const [user, setUser] = useState("");
   const [testResult, setTestResult] = useState<ServerStatus | null>(null);
   const [testing, setTesting] = useState(false);
+  const openerRef = useRef<HTMLElement | null>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  useEffect(() => {
+    if (!open) return;
+    openerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onCloseRef.current();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      openerRef.current?.focus();
+    };
+  }, [open]);
 
   if (!open || !store) return null;
 

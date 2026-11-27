@@ -39,6 +39,10 @@ export function Sidebar({
   pendingDreamCount,
   onOpenPalette,
 }: SidebarProps) {
+  const isMac =
+    typeof navigator !== "undefined" &&
+    /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent);
+  const shortcutLabel = isMac ? "⌘K" : "Ctrl+K";
   const navItems: Array<{
     id: NavTab;
     label: string;
@@ -94,7 +98,7 @@ export function Sidebar({
             快速跳转 / 搜索...
           </span>
           <kbd className="px-1.5 py-0.5 rounded bg-surface-0 text-[10px] text-zinc-500 font-mono">
-            ⌘K
+            {shortcutLabel}
           </kbd>
         </button>
 

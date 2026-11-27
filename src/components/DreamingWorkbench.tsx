@@ -357,28 +357,34 @@ export function DreamingWorkbench({
             Dreaming 运行历史与 Snapshot 一键回滚
           </div>
           <div className="space-y-1.5 max-h-36 overflow-y-auto">
-            {runs.map((r) => (
-              <div
-                key={r.id}
-                className="flex items-center justify-between px-3 py-1.5 rounded-lg bg-surface-1 border border-border-subtle text-xs"
-              >
-                <div className="flex items-center gap-3 font-mono text-[11px]">
-                  <span className="text-zinc-200">{r.id}</span>
-                  <span className="text-zinc-500">{r.trigger_source}</span>
-                  <span className="text-indigo-300">{r.status}</span>
-                  {r.snapshot_id && <span className="text-zinc-400">snap: {r.snapshot_id}</span>}
-                </div>
-                {r.snapshot_id && r.status !== "rolled_back" && (
-                  <button
-                    onClick={() => onRollbackRun(r.id)}
-                    className="inline-flex items-center gap-1 px-2 py-1 rounded bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 text-[11px]"
-                  >
-                    <RotateCcw className="w-3 h-3" />
-                    回滚快照
-                  </button>
-                )}
+            {runs.length === 0 ? (
+              <div className="px-3 py-3 rounded-lg bg-surface-1 border border-border-subtle text-xs text-zinc-500 text-center">
+                暂无运行记录
               </div>
-            ))}
+            ) : (
+              runs.map((r) => (
+                <div
+                  key={r.id}
+                  className="flex items-center justify-between px-3 py-1.5 rounded-lg bg-surface-1 border border-border-subtle text-xs"
+                >
+                  <div className="flex items-center gap-3 font-mono text-[11px]">
+                    <span className="text-zinc-200">{r.id}</span>
+                    <span className="text-zinc-500">{r.trigger_source}</span>
+                    <span className="text-indigo-300">{r.status}</span>
+                    {r.snapshot_id && <span className="text-zinc-400">snap: {r.snapshot_id}</span>}
+                  </div>
+                  {r.snapshot_id && r.status !== "rolled_back" && (
+                    <button
+                      onClick={() => onRollbackRun(r.id)}
+                      className="inline-flex items-center gap-1 px-2 py-1 rounded bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 text-[11px]"
+                    >
+                      <RotateCcw className="w-3 h-3" />
+                      回滚快照
+                    </button>
+                  )}
+                </div>
+              ))
+            )}
           </div>
         </div>
       )}

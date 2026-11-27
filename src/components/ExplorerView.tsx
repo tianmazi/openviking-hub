@@ -1,5 +1,16 @@
 import { useEffect, useRef, useState } from "react";
-import { FilePlus2, FileText, Folder, Inbox, Save, Search, Trash2 } from "lucide-react";
+import {
+  CornerLeftUp,
+  FilePlus2,
+  FileText,
+  Folder,
+  Inbox,
+  Info,
+  RefreshCw,
+  Save,
+  Search,
+  Trash2,
+} from "lucide-react";
 import { api } from "../lib/tauri";
 import type { ContextLayer, LayeredContent } from "../types/openviking";
 
@@ -10,11 +21,34 @@ const ROOT_SCOPES = [
   { label: "Agent 私有空间", uri: "viking://agent/" },
 ];
 
+function normalizeDirUri(uri: string): string {
+  return uri.endsWith("/") ? uri : `${uri}/`;
+}
+
+function parentDirUri(uri: string): string {
+  const clean = uri.replace(/\/+$/, "");
+  const idx = clean.lastIndexOf("/");
+  if (idx <= "viking://".length) return normalizeDirUri(clean);
+  return `${clean.slice(0, idx + 1)}`;
+}
+
+function relativeDisplayPath(uri: string, baseUri: string): string {
+  const normBase = normalizeDirUri(baseUri);
+  if (uri.startsWith(normBase)) return uri.slice(normBase.length);
+  return uri.replace(/^viking:\/\//, "");
+}
+
 export function ExplorerView() {
+  const [rootScopeUri, setRootScopeUri] = useState(ROOT_SCOPES[0].uri);
   const [scopeUri, setScopeUri] = useState(ROOT_SCOPES[0].uri);
+  const [dirStack, setDirStack] = useState<string[]>([]);
   const [entries, setEntries] = useState<
     Array<{ name: string; uri: string; isDir?: boolean; size?: number }>
   >([]);
+  const [submittedSearch, setSubmittedSearch] = useState<string | null>(null);
+  const [listError, setListError] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshNonce, setRefreshNonce] = useState(0);
   const [selectedUri, setSelectedUri] = useState<string | null>(null);
   const [loadedUri, setLoadedUri] = useState<string | null>(null);
   const [loadingLayer, setLoadingLayer] = useState(false);
@@ -29,12 +63,25 @@ export function ExplorerView() {
   const [newFileName, setNewFileName] = useState("");
   const [showNewInput, setShowNewInput] = useState(false);
   const readReqIdRef = useRef(0);
+  const listReqIdRef = useRef(0);
+
+  const canGoUp = dirStack.length > 0;
+  const isDirtyL2 = Boolean(layers && loadedUri === selectedUri && draftL2 !== layers.l2);
 
   const loadList = async (uri: string) => {
-    const list = await api.fsLs(uri);
-    setEntries(list);
-    const firstFile = list.find((i) => !i.isDir);
-    if (firstFile && !selectedUri) setSelectedUri(firstFile.uri);
+    const reqId = ++listReqIdRef.current;
+    setSubmittedSearch(null);
+    setListError(null);
+    try {
+      const list = await api.fsLs(uri);
+      if (listReqIdRef.current !== reqId) return;
+      setEntries(list);
+      const firstFile = list.find((i) => !i.isDir);
+      if (firstFile && !selectedUri) setSelectedUri(firstFile.uri);
+    } catch (err) {
+      if (listReqIdRef.current !== reqId) return;
+      setListError(`目录加载失败：${String(err)}`);
+    }
   };
 
   useEffect(() => {
@@ -77,7 +124,7 @@ export function ExplorerView() {
       .finally(() => {
         if (readReqIdRef.current === reqId) setLoadingLayer(false);
       });
-  }, [selectedUri]);
+  }, [selectedUri, refreshNonce]);
 
   const canSaveL2 =
     Boolean(selectedUri) && loadedUri === selectedUri && !loadingLayer && !loadError && !saving;
@@ -100,13 +147,56 @@ export function ExplorerView() {
     }
   };
 
+  const runSearch = async (query: string, targetScope: string) => {
+    const reqId = ++listReqIdRef.current;
+    setSubmittedSearch(query);
+    setListError(null);
+    try {
+      const found = await api.searchFind(query, targetScope);
+      if (listReqIdRef.current !== reqId) return;
+      setEntries(found);
+    } catch (err) {
+      if (listReqIdRef.current !== reqId) return;
+      setListError(`搜索失败：${String(err)}`);
+    }
+  };
+
   const handleSearch = async () => {
-    if (!searchQuery.trim()) {
-      void loadList(scopeUri);
+    const clean = searchQuery.trim();
+    if (!clean) {
+      await loadList(scopeUri);
       return;
     }
-    const found = await api.searchFind(searchQuery.trim(), scopeUri);
-    setEntries(found);
+    await runSearch(clean, scopeUri);
+  };
+
+  const handleRefreshInPlace = async () => {
+    setRefreshing(true);
+    try {
+      if (submittedSearch !== null) {
+        await runSearch(submittedSearch, scopeUri);
+      } else {
+        await loadList(scopeUri);
+      }
+      if (selectedUri) {
+        if (isDirtyL2) {
+          setSavedNotice("已刷新列表；当前文件有未保存的 L2 修改，已保留草稿。");
+        } else {
+          setRefreshNonce((n) => n + 1);
+        }
+      }
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  const handleGoUp = () => {
+    if (dirStack.length === 0) return;
+    const prev = dirStack[dirStack.length - 1];
+    setDirStack((stack) => stack.slice(0, -1));
+    setSearchQuery("");
+    setSubmittedSearch(null);
+    setScopeUri(prev);
   };
 
   const handleCreateNote = async () => {
@@ -189,10 +279,17 @@ export function ExplorerView() {
                 key={s.uri}
                 onClick={() => {
                   setSearchQuery("");
-                  setScopeUri(s.uri);
+                  setSubmittedSearch(null);
+                  setRootScopeUri(s.uri);
+                  setDirStack([]);
+                  if (scopeUri === s.uri) {
+                    void loadList(s.uri);
+                  } else {
+                    setScopeUri(s.uri);
+                  }
                 }}
                 className={`inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] border transition-colors ${
-                  scopeUri === s.uri
+                  rootScopeUri === s.uri
                     ? "bg-indigo-500/15 text-indigo-300 border-indigo-500/30"
                     : "bg-surface-2 text-zinc-400 border-border-subtle hover:text-zinc-200"
                 }`}
@@ -202,40 +299,91 @@ export function ExplorerView() {
               </button>
             ))}
           </div>
+
+          <div className="flex items-center gap-1.5 pt-0.5">
+            <button
+              onClick={handleGoUp}
+              disabled={!canGoUp}
+              className="p-1 rounded-md bg-surface-2 hover:bg-surface-3 border border-border-subtle text-zinc-300 disabled:opacity-35 disabled:hover:bg-surface-2 shrink-0"
+              title="返回上一级目录"
+            >
+              <CornerLeftUp className="w-3.5 h-3.5" />
+            </button>
+            <div
+              className="flex-1 min-w-0 px-2 py-1 rounded-md bg-surface-0 border border-border-subtle font-mono text-[10px] text-zinc-400 truncate"
+              title={scopeUri}
+            >
+              {scopeUri}
+            </div>
+            <button
+              onClick={() => void handleRefreshInPlace()}
+              disabled={refreshing}
+              className="p-1 rounded-md bg-surface-2 hover:bg-surface-3 border border-border-subtle text-zinc-300 disabled:opacity-40 shrink-0"
+              title="就地刷新当前目录与预览"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? "animate-spin" : ""}`} />
+            </button>
+          </div>
+          {listError && (
+            <div className="px-2 py-1.5 rounded-md bg-rose-500/10 border border-rose-500/25 text-[10px] text-rose-300">
+              {listError}
+            </div>
+          )}
         </div>
 
         <div className="flex-1 overflow-y-auto p-2 space-y-1">
-          {entries.map((item) => (
-            <div
-              key={item.uri}
-              className={`group flex items-center justify-between px-2.5 py-2 rounded-lg text-xs transition-colors ${
-                selectedUri === item.uri
-                  ? "bg-indigo-500/15 text-indigo-200 border border-indigo-500/25"
-                  : "text-zinc-300 hover:bg-surface-2 border border-transparent"
-              }`}
-            >
-              <button
-                onClick={() => (item.isDir ? setScopeUri(item.uri) : setSelectedUri(item.uri))}
-                className="flex items-center gap-2 truncate flex-1 text-left"
+          {entries.map((item) => {
+            const relPath = relativeDisplayPath(item.uri, scopeUri);
+            const showSubpath = submittedSearch !== null || relPath !== item.name;
+            return (
+              <div
+                key={item.uri}
+                className={`group flex items-center justify-between px-2.5 py-2 rounded-lg text-xs transition-colors ${
+                  selectedUri === item.uri
+                    ? "bg-indigo-500/15 text-indigo-200 border border-indigo-500/25"
+                    : "text-zinc-300 hover:bg-surface-2 border border-transparent"
+                }`}
               >
-                {item.isDir ? (
-                  <Folder className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                ) : (
-                  <FileText className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
-                )}
-                <span className="truncate font-mono text-[11px]">{item.name}</span>
-              </button>
-              {!item.isDir && (
                 <button
-                  onClick={() => void handleDelete(item.uri)}
-                  className="opacity-0 group-hover:opacity-100 p-0.5 text-zinc-500 hover:text-rose-400 transition-opacity"
-                  title="删除条目"
+                  onClick={() => {
+                    if (item.isDir) {
+                      setDirStack((stack) => [...stack, scopeUri]);
+                      setSearchQuery("");
+                      setSubmittedSearch(null);
+                      setScopeUri(normalizeDirUri(item.uri));
+                    } else {
+                      setSelectedUri(item.uri);
+                    }
+                  }}
+                  title={item.uri}
+                  className="flex items-center gap-2 min-w-0 flex-1 text-left"
                 >
-                  <Trash2 className="w-3 h-3" />
+                  {item.isDir ? (
+                    <Folder className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                  ) : (
+                    <FileText className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
+                  )}
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate font-mono text-[11px]">{item.name}</div>
+                    {showSubpath && (
+                      <div className="truncate font-mono text-[10px] text-zinc-500">
+                        {relPath}
+                      </div>
+                    )}
+                  </div>
                 </button>
-              )}
-            </div>
-          ))}
+                {!item.isDir && (
+                  <button
+                    onClick={() => void handleDelete(item.uri)}
+                    className="opacity-0 group-hover:opacity-100 p-0.5 text-zinc-500 hover:text-rose-400 transition-opacity shrink-0"
+                    title="删除条目"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                  </button>
+                )}
+              </div>
+            );
+          })}
         </div>
       </div>
 
@@ -299,9 +447,21 @@ export function ExplorerView() {
               className="w-full h-full min-h-[420px] bg-surface-1 border border-border-subtle rounded-xl p-4 font-mono text-xs text-zinc-200 leading-relaxed focus:outline-none focus:border-indigo-500/40 resize-none disabled:opacity-60"
             />
           ) : (
-            <pre className="w-full bg-surface-1 border border-border-subtle rounded-xl p-4 font-mono text-xs text-zinc-300 whitespace-pre-wrap leading-relaxed">
-              {activeLayer === "l0" ? layers?.l0 || "暂无 L0 摘要" : layers?.l1 || "暂无 L1 概览"}
-            </pre>
+            <div className="space-y-2.5">
+              {selectedUri && !selectedUri.endsWith("/") && (
+                <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-sky-500/10 border border-sky-500/20 text-[11px] text-sky-200/90">
+                  <Info className="w-3.5 h-3.5 shrink-0 mt-0.5 text-sky-400" />
+                  <span>
+                    OpenViking 的 {activeLayer.toUpperCase()} 摘要按目录生成，当前展示所属目录{" "}
+                    <code className="font-mono text-sky-100">{parentDirUri(selectedUri)}</code>{" "}
+                    的摘要；查看单文件原文请切换至 <strong className="font-mono">L2</strong>。
+                  </span>
+                </div>
+              )}
+              <pre className="w-full bg-surface-1 border border-border-subtle rounded-xl p-4 font-mono text-xs text-zinc-300 whitespace-pre-wrap leading-relaxed">
+                {activeLayer === "l0" ? layers?.l0 || "暂无 L0 摘要" : layers?.l1 || "暂无 L1 概览"}
+              </pre>
+            </div>
           )}
         </div>
       </div>
