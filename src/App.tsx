@@ -210,6 +210,9 @@ export default function App() {
         captureEnabled={policy?.global.capture_enabled ?? true}
         onTogglePrivacy={handleTogglePrivacy}
         pendingDreamCount={pendingDreamCount}
+        connectedAgentsCount={agents.filter((a) => a.connected).length}
+        totalAgentsCount={agents.length}
+        maxRecallTokens={policy?.budget.max_recall_tokens ?? 2000}
         onOpenPalette={() => setPaletteOpen(true)}
       />
 

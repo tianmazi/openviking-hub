@@ -6,19 +6,23 @@ export default {
     extend: {
       colors: {
         surface: {
-          0: "#0a0b0e",
-          1: "#111318",
-          2: "#171a21",
-          3: "#1f242e",
+          0: "#09090b",
+          1: "#0e0f13",
+          2: "#15171e",
+          3: "#1d202a",
         },
         border: {
-          subtle: "rgba(255, 255, 255, 0.08)",
+          subtle: "rgba(255, 255, 255, 0.075)",
           strong: "rgba(255, 255, 255, 0.16)",
         },
         accent: {
           DEFAULT: "#6366f1",
           hover: "#818cf8",
         },
+      },
+      boxShadow: {
+        facet: "inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 10px 28px -16px rgba(0, 0, 0, 0.8)",
+        keycap: "inset 0 1px 0 rgba(255, 255, 255, 0.1), 0 1.5px 0 rgba(0, 0, 0, 0.75)",
       },
       fontFamily: {
         sans: ["Inter", "-apple-system", "BlinkMacSystemFont", "Segoe UI", "sans-serif"],
